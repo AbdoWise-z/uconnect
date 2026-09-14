@@ -1,0 +1,38 @@
+# Fly.io deployment.
+#
+#   fly launch --no-deploy --copy-config
+#   fly ips allocate-v4          # a DEDICATED v4 address is required for UDP
+#   fly deploy
+#
+# Fly is one of the few PaaS platforms that carries raw UDP at all. Two things
+# make it different from a plain VPS, and both will silently produce a server
+# that looks healthy and answers nothing:
+#
+#  1. UDP requires a DEDICATED IPv4 address. The shared v4 address Fly hands out
+#     by default is HTTP-only.
+#  2. The process must bind to the special `fly-global-services` address for
+#     UDP, not to 0.0.0.0. That is what the --bind flag in CMD below is for.
+
+app = "uconnect-rendezvous"
+primary_region = "ams"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[[services]]
+  protocol     = "udp"
+  internal_port = 4433
+
+  [[services.ports]]
+    port = 4433
+
+# The server keeps every record in memory with a 90-second expiry, so there is
+# no volume, no database and nothing to migrate. A restart just means every live
+# device re-registers within one keepalive interval.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Fly routes UDP only to this address, not to 0.0.0.0.
+[experimental]
+  cmd = ["--port", "4433", "--bind", "fly-global-services"]

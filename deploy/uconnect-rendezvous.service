@@ -1,0 +1,53 @@
+# systemd unit for a VPS deployment.
+#
+#   sudo cp uconnect-rendezvous /usr/local/bin/
+#   sudo cp uconnect-rendezvous.service /etc/systemd/system/
+#   sudo systemctl enable --now uconnect-rendezvous
+#
+# Then open the port. This is the step people forget, and the failure mode is a
+# server that starts cleanly and is unreachable:
+#
+#   ufw:       sudo ufw allow 4433/udp
+#   firewalld: sudo firewall-cmd --add-port=4433/udp --permanent && sudo firewall-cmd --reload
+#   AWS/GCP:   add an inbound UDP rule to the security group -- the OS firewall
+#              is not the only one in the path.
+
+[Unit]
+Description=uConnect rendezvous server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/uconnect-rendezvous --port 4433
+Restart=always
+RestartSec=2
+
+# The server holds no keys, opens no files and writes nothing to disk, so it can
+# be locked down hard.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_UNIX and AF_NETLINK are not optional here even though the server only
+# speaks UDP: glibc's resolver talks to nscd/systemd-resolved over a unix
+# socket, and getifaddrs() uses netlink. Restricting to AF_INET/AF_INET6 alone
+# makes the STUN hostname lookup fail with a misleading "no reply".
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Generous but bounded. Roughly 200 bytes per record, so 10k live devices is a
+# few MB; this cap exists to make a runaway obvious rather than to constrain
+# normal operation.
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

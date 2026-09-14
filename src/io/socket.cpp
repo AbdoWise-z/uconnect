@@ -239,14 +239,30 @@ UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
     return *this;
 }
 
-bool UdpSocket::open(uint16_t port) {
+bool UdpSocket::open(uint16_t port, const std::string& bind_host) {
     close();
+
+    // A specific bind address pins the family; resolve it before choosing one.
+    std::optional<Endpoint> bind_ep;
+    if (!bind_host.empty()) {
+        bind_ep = resolve(bind_host + ":" + std::to_string(port));
+        if (!bind_ep) {
+            err_ = "cannot resolve bind address: " + bind_host;
+            return false;
+        }
+    }
 
     // Try dual-stack v6 first so a single socket serves both families -- which
     // matters because the whole design assumes ONE socket carries signaling,
     // probes and data.
-    auto s = ::socket(AF_INET6, SOCK_DGRAM, 0);
-    v6_    = true;
+    const bool want_v6 = !bind_ep || bind_ep->ip.family == IpAddr::Family::V6;
+
+    auto s = UC_INVALID;
+    v6_    = false;
+    if (want_v6) {
+        s   = ::socket(AF_INET6, SOCK_DGRAM, 0);
+        v6_ = s != UC_INVALID;
+    }
     if (s == UC_INVALID) {
         s   = ::socket(AF_INET, SOCK_DGRAM, 0);
         v6_ = false;
@@ -264,18 +280,20 @@ bool UdpSocket::open(uint16_t port) {
 
     sockaddr_storage ss{};
     socklen_type     len;
-    if (v6_) {
+    if (bind_ep) {
+        len = to_sockaddr(*bind_ep, v6_, ss);
+    } else if (v6_) {
         auto* a        = reinterpret_cast<sockaddr_in6*>(&ss);
         a->sin6_family = AF_INET6;
         a->sin6_addr   = in6addr_any;
         a->sin6_port   = htons(port);
         len            = sizeof(sockaddr_in6);
     } else {
-        auto* a          = reinterpret_cast<sockaddr_in*>(&ss);
-        a->sin_family    = AF_INET;
+        auto* a            = reinterpret_cast<sockaddr_in*>(&ss);
+        a->sin_family      = AF_INET;
         a->sin_addr.s_addr = INADDR_ANY;
-        a->sin_port      = htons(port);
-        len              = sizeof(sockaddr_in);
+        a->sin_port        = htons(port);
+        len                = sizeof(sockaddr_in);
     }
 
     if (::bind(s, reinterpret_cast<sockaddr*>(&ss), len) != 0) {

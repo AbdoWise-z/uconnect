@@ -34,7 +34,11 @@ public:
 
     // Binds a dual-stack v6 socket when possible so one socket serves both
     // families; falls back to v4. port 0 picks an ephemeral port.
-    bool open(uint16_t port);
+    //
+    // bind_host empty means "all interfaces", which is right almost everywhere.
+    // Some hosts require binding a specific address instead -- Fly.io routes UDP
+    // only to `fly-global-services`, and a multi-homed box may want one NIC.
+    bool open(uint16_t port, const std::string& bind_host = {});
     void close();
 
     bool     is_open() const { return fd_ >= 0 || fd_ == kInvalid + 1; }

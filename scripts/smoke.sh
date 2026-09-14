@@ -6,8 +6,8 @@ set -u
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
-SERVER=./build/server/uconnect-rendezvous.exe
-DEMO=./build/examples/uconn-demo.exe
+SERVER="./build/server/uconnect-rendezvous$EXE"
+DEMO="./build/examples/uconn-demo$EXE"
 UC_PORT=${UC_PORT:-14433}
 
 cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; }

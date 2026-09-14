@@ -218,7 +218,32 @@ deterministically in microseconds.
 
 ## Building
 
-Requires CMake 3.28+ and a C++20 compiler. No external dependencies.
+Requires CMake 3.28+, a C++20 compiler and Ninja. **No external dependencies** —
+no libsodium, no package manager, nothing to install.
+
+### Windows with CLion
+
+CLion bundles everything needed (CMake 4.3, GCC 15.2 MinGW, Ninja), but **none
+of it is on PATH in a normal shell**. Use one of:
+
+```powershell
+.\scripts\build.ps1              # PowerShell: configure + build + unit tests
+.\scripts\build.ps1 -All         # also run the end-to-end smoke test
+.\scripts\build.ps1 -Clean       # wipe build/ first
+```
+
+```sh
+bash scripts/build.sh            # Git Bash: same thing
+```
+
+Or just open the folder in CLion and hit build — it uses its own toolchain and
+needs no setup at all.
+
+If your CLion is somewhere unusual, set `UCONNECT_TOOLCHAIN` to its install
+directory. If you have your own CMake/GCC/Ninja on PATH, the plain commands
+below work and you can ignore the scripts entirely.
+
+### Anywhere else
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -226,8 +251,15 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-On Windows with CLion's bundled toolchain, `scripts/build.sh` puts it on PATH
-for you.
+### Running the built binaries
+
+They need no environment at all — run them from any shell, or double-click them.
+`libstdc++` and `libgcc` are linked statically, and `libwinpthread-1.dll` is
+copied next to each executable at build time. Without that last step they exit
+**127 with no diagnostic**, which is a confusing failure to debug.
+
+(Bare `-static` is not usable on this toolchain: it fails to link with an
+undefined `__ms_vsnprintf` out of `libmsvcrt`. Hence the copy.)
 
 ### Trying it
 

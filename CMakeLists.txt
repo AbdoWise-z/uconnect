@@ -15,6 +15,40 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
+# Static-link the MinGW runtime so the binaries run anywhere, not just in a
+# shell that has the toolchain on PATH. Without this they exit 127 looking for
+# libstdc++-6.dll.
+#
+# This MUST appear before the add_subdirectory() calls below: add_link_options
+# only affects targets created after it, so putting it at the end of the file
+# silently applies it to nothing.
+if (MINGW)
+    # These two remove the libstdc++-6.dll and libgcc_s_seh-1.dll dependencies.
+    #
+    # Bare -static is NOT usable here: it fails to link with an undefined
+    # __ms_vsnprintf out of libmsvcrt. Forcing libwinpthread static does not
+    # work either -- CMake appends its own dynamic -lwinpthread after our
+    # options -- so that last DLL is copied next to the executables instead.
+    add_link_options(-static-libgcc -static-libstdc++)
+
+    get_filename_component(_mingw_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    file(GLOB _mingw_runtime_dlls "${_mingw_bin}/libwinpthread-1.dll")
+endif()
+
+# Copy any remaining runtime DLLs beside an executable, so it runs from a plain
+# shell or Explorer rather than only from one that has the toolchain on PATH.
+# Without this the binaries exit 127 with no diagnostic.
+function(uconnect_bundle_runtime target)
+    if (MINGW)
+        foreach(_dll ${_mingw_runtime_dlls})
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_dll}" "$<TARGET_FILE_DIR:${target}>"
+                VERBATIM)
+        endforeach()
+    endif()
+endfunction()
+
 # ---------------------------------------------------------------------------
 # Layering. Each target declares what it may link. If a lower layer ever needs
 # to link a higher one, that is a layering violation and the build says so.
@@ -45,8 +79,3 @@ if (UCONNECT_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-# Static-link the MinGW runtime so the binaries run without libstdc++-6.dll and
-# friends on PATH -- otherwise they exit 127 outside the toolchain shell.
-if (MINGW)
-    add_link_options(-static-libgcc -static-libstdc++ -static)
-endif()

@@ -201,6 +201,9 @@ struct Node::Impl {
     std::unordered_map<wire::ProbeTxn, AnsweredProbe, ArrayHash> answered;
     std::unordered_map<wire::ConnId, std::pair<TopicId, DevId>>  conns;
 
+    // Callbacks queued while `mu` is held, invoked after it is released.
+    std::vector<std::function<void()>> deferred;
+
     std::thread       thread;
     std::atomic<bool> running{false};
     std::atomic<bool> stop{false};
@@ -290,17 +293,23 @@ void Node::Impl::loop() {
     while (!stop) {
         sock.wait_readable(20ms);
 
-        for (int i = 0; i < 256; ++i) {
-            auto got = sock.recv_from(buf);
-            if (!got) break;
-            auto now = std::chrono::steady_clock::now();
+        std::vector<std::function<void()>> callbacks;
+        {
             std::lock_guard<std::mutex> lk(mu);
-            dispatch(got->from, std::span(buf).first(got->len), now);
+            for (int i = 0; i < 256; ++i) {
+                auto got = sock.recv_from(buf);
+                if (!got) break;
+                dispatch(got->from, std::span(buf).first(got->len),
+                         std::chrono::steady_clock::now());
+            }
+            pump(std::chrono::steady_clock::now());
+            callbacks.swap(deferred);
         }
 
-        auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lk(mu);
-        pump(now);
+        // Invoked with the lock released, so a callback may call straight back
+        // into the library -- send a reply, look up peers, disconnect someone --
+        // which is the natural thing to want to do and would otherwise deadlock.
+        for (auto& fn : callbacks) fn();
     }
     running = false;
 }
@@ -653,7 +662,13 @@ void Node::Impl::on_transport_dgram(const Endpoint& from, std::span<const uint8_
 void Node::Impl::set_peer_state(Topic::Impl& ti, Peer& peer, PeerState s) {
     if (peer.state == s) return;
     peer.state = s;
-    if (ti.on_peer) ti.on_peer(peer.dev_id, s);
+    // Deferred, not called inline: callbacks fire with `mu` held otherwise, and
+    // the natural thing to do from on_peer is call back into the library
+    // (send a greeting, look up peers) -- which would deadlock on a
+    // non-recursive mutex.
+    if (ti.on_peer) {
+        deferred.push_back([cb = ti.on_peer, dev = peer.dev_id, s] { cb(dev, s); });
+    }
 }
 
 void Node::Impl::start_punch(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
@@ -702,7 +717,12 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     set_peer_state(ti, peer, PeerState::Connected);
                     break;
                 case K::Data:
-                    if (ti.on_data) ti.on_data(peer.dev_id, e->data);
+                    if (ti.on_data) {
+                        deferred.push_back([cb = ti.on_data, dev = peer.dev_id,
+                                            bytes = e->data] {
+                            cb(dev, bytes);
+                        });
+                    }
                     break;
                 case K::PathChanged:
                     break;

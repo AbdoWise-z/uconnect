@@ -8,6 +8,7 @@ add_executable(uconnect_tests
 )
 target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session)
 target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+uconnect_bundle_runtime(uconnect_tests)
 add_test(NAME uconnect_tests COMMAND uconnect_tests)
 
 # End-to-end: a real server and two real peers that must punch, handshake and

@@ -1,0 +1,16 @@
+# Normalise text in the repository.
+* text=auto
+
+# Shell scripts MUST stay LF. These run on the Linux server via the repo
+# watcher, and a CRLF shebang fails with "bad interpreter: /usr/bin/env bash^M"
+# -- which is a confusing way to discover a line-ending problem.
+*.sh text eol=lf
+
+# Same reasoning: systemd reads these on Linux.
+*.service text eol=lf
+*.timer   text eol=lf
+Dockerfile text eol=lf
+
+# Never touch binary-ish fixtures.
+*.png binary
+*.key binary

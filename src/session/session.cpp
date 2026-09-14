@@ -7,10 +7,15 @@ namespace {
 
 constexpr std::string_view kPrologueTag = "uconnect:v1";
 
-// Message 1 carries only random padding. Under psk0 its payload is encrypted
-// with a key derived from the PSK alone, before any DH has happened, so it has
-// no forward secrecy. Real data goes in the first transport message.
-constexpr size_t kInitPadding = 32;
+// Message 1's payload is dev_id(16) || random padding(16).
+//
+// Under psk0 this payload is encrypted with a key derived from the PSK alone,
+// before any DH, so it has no forward secrecy -- which is fine for a dev_id,
+// since the rendezvous server hands those out to anyone who can look up the
+// topic. Nothing else goes here; real data waits for the first transport
+// message.
+constexpr size_t kInitPadding = 16;
+constexpr size_t kInitPayload = kDevIdLen + kInitPadding;
 
 std::vector<uint8_t> encode_handshake_init(wire::ConnId conn_id, const wire::ProbeTxn& txn,
                                            std::span<const uint8_t> noise_msg,
@@ -93,8 +98,8 @@ std::vector<uint8_t> Session::make_prologue(const TopicId& topic, uint8_t key_ep
 }
 
 Session Session::initiate(SessionConfig cfg, const TopicId& topic, uint8_t key_epoch,
-                          const crypto::SymKey* psk, const DevId& peer, Endpoint path,
-                          const wire::ProbeTxn& probe_txn, Instant now) {
+                          const crypto::SymKey* psk, const DevId& self, const DevId& peer,
+                          Endpoint path, const wire::ProbeTxn& probe_txn, Instant now) {
     auto id_bytes = crypto::random_array<4>();
     wire::ConnId conn_id = static_cast<wire::ConnId>(id_bytes[0]) << 24 |
                            static_cast<wire::ConnId>(id_bytes[1]) << 16 |
@@ -108,11 +113,12 @@ Session Session::initiate(SessionConfig cfg, const TopicId& topic, uint8_t key_e
     s.handshake_  = crypto::HandshakeState::initiator(
         psk ? crypto::Pattern::NNpsk0 : crypto::Pattern::NN, prologue, psk);
 
-    std::vector<uint8_t> padding(kInitPadding);
-    crypto::random_bytes(padding);
+    std::vector<uint8_t> payload(kInitPayload);
+    std::memcpy(payload.data(), self.data(), kDevIdLen);
+    crypto::random_bytes(std::span(payload).subspan(kDevIdLen));
 
     std::vector<uint8_t> msg(256);
-    auto n = s.handshake_->write_message(padding, msg);
+    auto n = s.handshake_->write_message(payload, msg);
     if (!n) {
         s.state_ = SessionState::Closed;
         return s;
@@ -131,7 +137,7 @@ void Session::emit_handshake_init(Instant now) {
 
 std::optional<Session> Session::accept(SessionConfig cfg, const TopicId& topic,
                                        uint8_t key_epoch, const crypto::SymKey* psk,
-                                       const DevId& peer, Endpoint from,
+                                       const DevId& fallback_peer, Endpoint from,
                                        const wire::ProbeTxn& probe_txn,
                                        std::span<const uint8_t> dgram, Instant now) {
     wire::Reader r{dgram};
@@ -146,7 +152,7 @@ std::optional<Session> Session::accept(SessionConfig cfg, const TopicId& topic,
     // can never be built on a transaction it does not match.
     if (!crypto::ct_equal(hi->probe_txn, probe_txn)) return std::nullopt;
 
-    Session s{cfg, peer, from, psk != nullptr, hi->conn_id};
+    Session s{cfg, fallback_peer, from, psk != nullptr, hi->conn_id};
     s.initiator_ = false;
 
     auto prologue = make_prologue(topic, key_epoch, probe_txn);
@@ -154,9 +160,23 @@ std::optional<Session> Session::accept(SessionConfig cfg, const TopicId& topic,
         psk ? crypto::Pattern::NNpsk0 : crypto::Pattern::NN, prologue, psk);
 
     std::vector<uint8_t> payload(256);
-    if (!s.handshake_->read_message(hi->noise_msg, payload)) {
+    auto plen = s.handshake_->read_message(hi->noise_msg, payload);
+    if (!plen) {
         // Wrong PSK, wrong prologue, or tampering. Drop silently.
         return std::nullopt;
+    }
+
+    // The initiator's dev_id, now that the AEAD has verified it. Identifying
+    // the peer by source address does not work behind a symmetric NAT, where
+    // the address a handshake arrives from is not the one it advertised.
+    if (*plen >= kDevIdLen) {
+        DevId claimed{};
+        std::memcpy(claimed.data(), payload.data(), kDevIdLen);
+        bool all_zero = true;
+        for (uint8_t b : claimed) {
+            if (b != 0) { all_zero = false; break; }
+        }
+        if (!all_zero) s.peer_ = claimed;
     }
 
     std::vector<uint8_t> msg(256);

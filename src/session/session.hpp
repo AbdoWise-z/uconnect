@@ -97,15 +97,26 @@ public:
     // psk is null for an open topic (Noise_NN), non-null for keyed
     // (Noise_NNpsk0). A Session constructed with a psk NEVER falls back --
     // silent downgrade is how sound protocols get broken.
+    // `self` is our own dev_id. It travels in message 1's payload -- which was
+    // padding anyway, so it costs nothing on the wire, and on a keyed topic it
+    // is encrypted under the PSK and covered by the AEAD tag.
+    //
+    // The responder needs it because it cannot reliably identify us by source
+    // address: behind a symmetric NAT the address a handshake ARRIVES from is
+    // not the address we ADVERTISED, so address matching silently fails and the
+    // session gets filed under a synthetic identity.
     static Session initiate(SessionConfig cfg, const TopicId&, uint8_t key_epoch,
-                            const crypto::SymKey* psk, const DevId& peer, Endpoint path,
-                            const wire::ProbeTxn& probe_txn, Instant now);
+                            const crypto::SymKey* psk, const DevId& self, const DevId& peer,
+                            Endpoint path, const wire::ProbeTxn& probe_txn, Instant now);
 
     // Responder side. Returns nullopt on any failure -- a bad PSK, an unknown
     // probe_txn, a malformed message. The caller must drop silently and send
     // nothing: any error response makes this an oracle for topic membership.
+    // The peer's dev_id is LEARNED from the authenticated handshake payload and
+    // exposed via peer(); `fallback_peer` is used only if the initiator sent a
+    // zero dev_id (i.e. it had not registered yet).
     static std::optional<Session> accept(SessionConfig cfg, const TopicId&, uint8_t key_epoch,
-                                         const crypto::SymKey* psk, const DevId& peer,
+                                         const crypto::SymKey* psk, const DevId& fallback_peer,
                                          Endpoint from, const wire::ProbeTxn& probe_txn,
                                          std::span<const uint8_t> handshake_init_dgram,
                                          Instant now);

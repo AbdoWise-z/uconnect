@@ -1,2 +1,10 @@
 /build/
+/build2/
 /cmake-build-debug/
+/cmake-build-release/
+/.idea/
+/keys/
+*.key
+*.pem
+id_rsa
+id_ed25519

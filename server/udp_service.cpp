@@ -38,22 +38,6 @@ Reply UdpService::make_error(const Endpoint& to, uint32_t txn_id, ErrorCode code
     return encode(to, wire::MsgType::Error, txn_id, e);
 }
 
-bool UdpService::needs_cookie(wire::MsgType t) const {
-    switch (t) {
-        case wire::MsgType::Register:
-        case wire::MsgType::Lookup:
-        case wire::MsgType::Topics:
-        case wire::MsgType::Resolve:
-        case wire::MsgType::Stats:
-            return true;
-        default:
-            // Keepalive, Update, Unregister and Connect all carry a MAC over a
-            // record whose address was validated at registration, and none
-            // return more than they receive.
-            return false;
-    }
-}
-
 bool UdpService::consume_budget(const Endpoint& from, size_t bytes, Instant now) {
     auto& b = buckets_[from.ip.bytes];
     if (b.last == Instant{}) {
@@ -207,6 +191,10 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
         case wire::MsgType::Resolve: {
             auto m = wire::Resolve::decode(r);
             if (!m) return out;
+            if (!store_.validate_cookie(m->cookie, from, now)) {
+                out.push_back(make_retry(from, h->txn_id, now));
+                return out;
+            }
             auto got = store_.resolve(m->dev_id, now);
             wire::ResolveOk ok;
             if (got) {
@@ -264,6 +252,12 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
         }
 
         case wire::MsgType::Stats: {
+            auto m = wire::Stats::decode(r);
+            if (!m) return out;
+            if (!store_.validate_cookie(m->cookie, from, now)) {
+                out.push_back(make_retry(from, h->txn_id, now));
+                return out;
+            }
             auto st = store_.stats(now);
             // Encoded as a compact fixed record; the HTTP front end renders the
             // same numbers as JSON.

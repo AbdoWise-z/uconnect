@@ -64,8 +64,17 @@ wire::ProbeTag PunchSession::probe_tag(const crypto::SymKey* probe_key,
 // Construction and ranking
 // ---------------------------------------------------------------------------
 PunchSession::PunchSession(PunchConfig cfg, DevId peer, std::vector<Candidate> remote_cands,
-                           LocalView local, const crypto::SymKey* probe_key)
+                           LocalView local, const crypto::SymKey* probe_key,
+                           uint64_t jitter_seed)
     : cfg_(cfg), peer_(peer), local_(local) {
+    if (jitter_seed == 0) {
+        auto     s = crypto::random_array<8>();
+        uint64_t v = 0;
+        for (size_t i = 0; i < 8; ++i) v = v << 8 | s[i];
+        jitter_seed = v;
+    }
+    jitter_.seed(jitter_seed);
+
     if (probe_key) {
         probe_key_ = *probe_key;
         keyed_     = true;
@@ -135,8 +144,11 @@ Duration PunchSession::backoff_for(int attempt) const {
 
     // Jitter +/-25%. Without it, two peers that started together retransmit in
     // lockstep forever, and a pattern of collisions can persist.
-    auto     r      = crypto::random_array<2>();
-    uint32_t raw    = static_cast<uint32_t>(r[0]) << 8 | r[1];
+    //
+    // Drawn from a seeded PRNG, not the CSPRNG: this is scheduling, not
+    // security, and reading real entropy here made every punch test
+    // nondeterministic -- one run in ~50 would fail with no way to reproduce it.
+    uint32_t raw    = static_cast<uint32_t>(jitter_() & 0xFFFF);
     int64_t  spread = ms / 2;
     int64_t  jitter = spread == 0 ? 0 : static_cast<int64_t>(raw % static_cast<uint32_t>(spread + 1)) - spread / 2;
     return Duration{ms + jitter};

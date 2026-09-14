@@ -246,10 +246,21 @@ struct LookupOk {
 
 // --- Resolve ---------------------------------------------------------------
 struct Resolve {
-    DevId dev_id{};
+    DevId                dev_id{};
+    std::vector<uint8_t> cookie;  // required: the reply is ~12x the request
 
     void encode(Writer&) const;
     static std::optional<Resolve> decode(Reader&);
+};
+
+// --- Stats -----------------------------------------------------------------
+// Carries only a cookie. The reply is ~14x the request, so it needs address
+// validation like every other amplifying path.
+struct Stats {
+    std::vector<uint8_t> cookie;
+
+    void encode(Writer&) const;
+    static std::optional<Stats> decode(Reader&);
 };
 
 struct ResolveOk {

@@ -45,10 +45,10 @@ public:
     const Store& store() const { return store_; }
 
 private:
-    // Any response larger than its request needs a validated source address
-    // first, or this server is a UDP amplifier aimed at whoever the attacker
-    // spoofed.
-    bool  needs_cookie(wire::MsgType) const;
+    // Every request whose response is larger than itself validates the source
+    // address in its own handler before replying -- Register, Lookup, Topics,
+    // Resolve and Stats. Without that this server is a UDP amplifier pointed at
+    // whoever the attacker spoofed.
     Reply make_retry(const Endpoint&, uint32_t txn_id, Instant now);
     Reply make_error(const Endpoint&, uint32_t txn_id, ErrorCode);
 

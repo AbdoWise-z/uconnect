@@ -53,7 +53,7 @@ std::optional<Pair> establish(const crypto::SymKey* psk_a, const crypto::SymKey*
                               wire::ProbeTxn txn_a = txn_of(9),
                               wire::ProbeTxn txn_b = txn_of(9), uint8_t epoch_a = 0,
                               uint8_t epoch_b = 0) {
-    auto a = Session::initiate(SessionConfig{}, topic_a, epoch_a, psk_a, dev_of(2),
+    auto a = Session::initiate(SessionConfig{}, topic_a, epoch_a, psk_a, dev_of(1), dev_of(2),
                                ep(5, 5000), txn_a, t0());
     auto init = a.poll_transmit();
     if (!init) return std::nullopt;
@@ -166,7 +166,7 @@ TEST(a_keyed_initiator_cannot_be_downgraded_by_an_open_responder) {
     // Silent downgrade is how sound protocols get broken. A Session built with
     // a PSK must fail closed.
     auto psk = psk_of(0x5A);
-    auto a   = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk, dev_of(2), ep(5, 5000),
+    auto a   = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk, dev_of(1), dev_of(2), ep(5, 5000),
                                  txn_of(9), t0());
     auto init = a.poll_transmit();
     REQUIRE(init.has_value());
@@ -185,7 +185,7 @@ TEST(a_keyed_initiator_cannot_be_downgraded_by_an_open_responder) {
 
 TEST(a_tampered_handshake_init_is_rejected_silently) {
     auto psk = psk_of(0x5A);
-    auto a   = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk, dev_of(2), ep(5, 5000),
+    auto a   = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk, dev_of(1), dev_of(2), ep(5, 5000),
                                  txn_of(9), t0());
     auto init = a.poll_transmit();
     REQUIRE(init.has_value());
@@ -208,7 +208,7 @@ TEST(handshake_retries_then_gives_up) {
     cfg.handshake_retries = 3;
 
     auto psk = psk_of(0x5A);
-    auto a   = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(2), ep(5, 5000), txn_of(9),
+    auto a   = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(1), dev_of(2), ep(5, 5000), txn_of(9),
                                  t0());
 
     int sends = 0;
@@ -404,7 +404,7 @@ TEST(keepalives_are_emitted_on_the_peer_path) {
     cfg.keepalive = 20s;
 
     auto psk = psk_of(0x5A);
-    auto a   = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(2), ep(5, 5000), txn_of(9),
+    auto a   = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(1), dev_of(2), ep(5, 5000), txn_of(9),
                                  t0());
     auto init = a.poll_transmit();
     REQUIRE(init.has_value());
@@ -458,7 +458,7 @@ TEST(a_session_asks_for_a_rehandshake_at_its_lifetime_limit) {
     cfg.idle_timeout = 1h;
 
     auto psk  = psk_of(0x5A);
-    auto a    = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(2), ep(5, 5000), txn_of(9),
+    auto a    = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(1), dev_of(2), ep(5, 5000), txn_of(9),
                                   t0());
     auto init = a.poll_transmit();
     REQUIRE(init.has_value());
@@ -500,4 +500,57 @@ TEST(both_ends_derive_the_same_sas_and_a_mitm_would_not) {
     auto q = establish(&psk, &psk);
     REQUIRE(q.has_value());
     CHECK(p->a.sas() != q->a.sas());
+}
+
+// ---------------------------------------------------------------------------
+// Peer identity
+// ---------------------------------------------------------------------------
+TEST(the_responder_learns_the_initiators_dev_id_from_the_handshake) {
+    // The responder must NOT have to guess who connected from the source
+    // address. Behind a symmetric NAT the handshake arrives from a different
+    // mapping than the peer advertised, so address matching fails and the
+    // session ends up filed under a synthetic identity -- which surfaced as one
+    // peer appearing twice, under its real dev_id and a made-up one.
+    auto psk = psk_of(0x5A);
+
+    auto a = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk,
+                               dev_of(0xAA),  // who we are
+                               dev_of(0xBB), ep(5, 5000), txn_of(9), t0());
+    auto init = a.poll_transmit();
+    REQUIRE(init.has_value());
+
+    // Deliberately accept from an address that matches NO advertised candidate,
+    // and pass a fallback that is deliberately wrong.
+    auto b = Session::accept(SessionConfig{}, topic_of(1), 0, &psk,
+                             dev_of(0xEE),               // wrong fallback
+                             ep(99, 61234),              // unexpected source
+                             txn_of(9), init->data, t0() + 5ms);
+    REQUIRE(b.has_value());
+
+    // It must report the initiator's real dev_id, not the fallback.
+    CHECK(b->peer() == dev_of(0xAA));
+    CHECK(!(b->peer() == dev_of(0xEE)));
+}
+
+TEST(a_forged_dev_id_cannot_be_injected_on_a_keyed_topic) {
+    // The dev_id rides inside the Noise payload, so on a keyed topic it is
+    // encrypted under the PSK and covered by the AEAD tag. Flipping a bit in it
+    // must make the whole handshake fail, not silently change who we think the
+    // peer is.
+    auto psk = psk_of(0x5A);
+    auto a = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk, dev_of(0xAA),
+                               dev_of(0xBB), ep(5, 5000), txn_of(9), t0());
+    auto init = a.poll_transmit();
+    REQUIRE(init.has_value());
+
+    // The payload sits after header + conn_id + probe_txn + the 32-byte
+    // ephemeral; flip a byte there.
+    size_t payload_off = wire::Header::kSize + 4 + wire::kProbeTxnLen + 32;
+    REQUIRE(init->data.size() > payload_off);
+    auto tampered = init->data;
+    tampered[payload_off] ^= 0xFF;
+
+    CHECK(!Session::accept(SessionConfig{}, topic_of(1), 0, &psk, dev_of(0xEE),
+                           ep(5, 5000), txn_of(9), tampered, t0() + 5ms)
+               .has_value());
 }

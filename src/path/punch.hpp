@@ -25,6 +25,7 @@
 //      path that validates 5ms later than a relayed one still wins.
 
 #include <optional>
+#include <random>
 #include <vector>
 
 #include "kdf.hpp"
@@ -93,8 +94,13 @@ public:
     // for an open one. When present, a non-member cannot produce a valid probe
     // and therefore cannot even elicit a response -- you never confirm your
     // existence to a scanner.
+    // jitter_seed makes retransmit timing reproducible. Default 0 means "seed
+    // from the CSPRNG"; tests pass a fixed value so a punch attempt replays
+    // identically. Without this the punch layer reads real entropy and its
+    // tests are not deterministic, which defeats the point of sans-IO.
     PunchSession(PunchConfig cfg, DevId peer, std::vector<Candidate> remote_cands,
-                 LocalView local, const crypto::SymKey* probe_key);
+                 LocalView local, const crypto::SymKey* probe_key,
+                 uint64_t jitter_seed = 0);
 
     void begin(Instant now);
 
@@ -160,6 +166,7 @@ private:
     std::vector<Outgoing>   out_;
     std::vector<PunchEvent> events_;
     uint32_t                txn_counter_ = 1;
+    mutable std::mt19937_64 jitter_;
 };
 
 }  // namespace uconnect::path

@@ -117,7 +117,7 @@ TEST(ranking_prefers_host_over_srflx_over_relay) {
         host(ep4(192, 168, 1, 40, 51820)),
     };
     auto key = a_key();
-    PunchSession s{PunchConfig{}, dev_of(1), cands, LocalView{}, &key};
+    PunchSession s{PunchConfig{}, dev_of(1), cands, LocalView{}, &key, 1234};
     CHECK_EQ(s.pair_count(), 3u);
     // Order is not directly observable, but the first probe emitted goes to the
     // top-ranked candidate.
@@ -139,7 +139,7 @@ TEST(ranking_demotes_srflx_when_the_peer_shares_our_public_ip) {
         host(ep4(192, 168, 1, 41, 51820)),
     };
     auto key = a_key();
-    PunchSession s{PunchConfig{}, dev_of(1), cands, local, &key};
+    PunchSession s{PunchConfig{}, dev_of(1), cands, local, &key, 1234};
     s.begin(t0());
     auto first = s.poll_transmit();
     REQUIRE(first.has_value());
@@ -153,13 +153,13 @@ TEST(loopback_and_zero_port_candidates_are_discarded) {
         srflx(ep4(203, 0, 113, 5, 40000)),   // the only usable one
     };
     auto key = a_key();
-    PunchSession s{PunchConfig{}, dev_of(1), cands, LocalView{}, &key};
+    PunchSession s{PunchConfig{}, dev_of(1), cands, LocalView{}, &key, 1234};
     CHECK_EQ(s.pair_count(), 1u);
 }
 
 TEST(a_session_with_no_usable_candidates_fails_immediately) {
     auto key = a_key();
-    PunchSession s{PunchConfig{}, dev_of(1), {}, LocalView{}, &key};
+    PunchSession s{PunchConfig{}, dev_of(1), {}, LocalView{}, &key, 1234};
     s.begin(t0());
     auto e = s.poll_event();
     REQUIRE(e.has_value());
@@ -236,9 +236,9 @@ TEST(punch_succeeds_between_two_port_restricted_nats) {
     // ports are what the NATs allocated on the registration packet.
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {srflx(ep4(198, 51, 100, 1, 40000))},
-                   LocalView{ep4(203, 0, 113, 1, 40000)}, &key};
+                   LocalView{ep4(203, 0, 113, 1, 40000)}, &key, 1234};
     PunchSession b{PunchConfig{}, dev_of(1), {srflx(ep4(203, 0, 113, 1, 40000))},
-                   LocalView{ep4(198, 51, 100, 1, 40000)}, &key};
+                   LocalView{ep4(198, 51, 100, 1, 40000)}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     CHECK(r.a_ok);
@@ -254,9 +254,9 @@ TEST(punch_succeeds_between_full_cone_nats) {
 
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {srflx(ep4(198, 51, 100, 1, 40000))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     PunchSession b{PunchConfig{}, dev_of(1), {srflx(ep4(203, 0, 113, 1, 40000))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     CHECK(r.a_ok);
@@ -275,9 +275,9 @@ TEST(punch_survives_heavy_packet_loss) {
 
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {srflx(ep4(198, 51, 100, 1, 40000))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     PunchSession b{PunchConfig{}, dev_of(1), {srflx(ep4(203, 0, 113, 1, 40000))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     CHECK(r.a_ok);
@@ -308,8 +308,8 @@ TEST(symmetric_nat_on_both_ends_defeats_punching_as_expected) {
     fast.max_attempts_per_pair = 4;
 
     auto key = a_key();
-    PunchSession a{fast, dev_of(2), {srflx(b_srflx)}, LocalView{a_srflx}, &key};
-    PunchSession b{fast, dev_of(1), {srflx(a_srflx)}, LocalView{b_srflx}, &key};
+    PunchSession a{fast, dev_of(2), {srflx(b_srflx)}, LocalView{a_srflx}, &key, 1234};
+    PunchSession b{fast, dev_of(1), {srflx(a_srflx)}, LocalView{b_srflx}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0() + 1s, 6s);
     CHECK(!r.a_ok);
@@ -337,12 +337,12 @@ TEST(same_nat_peers_connect_via_host_candidates_when_hairpinning_is_unavailable)
                    dev_of(2),
                    {srflx(ep4(203, 0, 113, 1, 40001)), host(ep4(192, 168, 1, 11, 51820))},
                    la,
-                   &key};
+                   &key, 1234};
     PunchSession b{PunchConfig{},
                    dev_of(1),
                    {srflx(ep4(203, 0, 113, 1, 40000)), host(ep4(192, 168, 1, 10, 51820))},
                    lb,
-                   &key};
+                   &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     REQUIRE(r.a_ok);
@@ -377,8 +377,8 @@ TEST(same_nat_peers_with_only_srflx_candidates_cannot_punch_without_hairpinning)
     fast.max_attempts_per_pair = 4;
 
     auto key = a_key();
-    PunchSession a{fast, dev_of(2), {srflx(b_srflx)}, LocalView{a_srflx}, &key};
-    PunchSession b{fast, dev_of(1), {srflx(a_srflx)}, LocalView{b_srflx}, &key};
+    PunchSession a{fast, dev_of(2), {srflx(b_srflx)}, LocalView{a_srflx}, &key, 1234};
+    PunchSession b{fast, dev_of(1), {srflx(a_srflx)}, LocalView{b_srflx}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0() + 1s, 6s);
     CHECK(!r.a_ok);
@@ -394,9 +394,9 @@ TEST(a_peer_with_a_public_address_needs_no_nat_traversal) {
 
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {srflx(ep4(198, 51, 100, 9, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     PunchSession b{PunchConfig{}, dev_of(1), {srflx(ep4(203, 0, 113, 1, 40000))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     CHECK(r.a_ok);
@@ -413,9 +413,9 @@ TEST(the_top_ranked_pair_is_nominated_immediately_without_waiting_out_the_grace)
 
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {host(ep4(198, 51, 100, 9, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     PunchSession b{PunchConfig{}, dev_of(1), {host(ep4(198, 51, 100, 8, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     REQUIRE(r.a_ok);
@@ -434,9 +434,9 @@ TEST(nominated_path_and_txn_are_exposed_for_handshake_binding) {
 
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {host(ep4(198, 51, 100, 9, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     PunchSession b{PunchConfig{}, dev_of(1), {host(ep4(198, 51, 100, 8, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
 
     auto r = run_punch(net, a, b, t0());
     REQUIRE(r.a_ok);
@@ -458,7 +458,7 @@ TEST(nominated_path_and_txn_are_exposed_for_handshake_binding) {
 TEST(a_duplicate_probe_ok_does_not_re_nominate) {
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {host(ep4(198, 51, 100, 9, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     a.begin(t0());
     auto probe = a.poll_transmit();
     REQUIRE(probe.has_value());
@@ -493,7 +493,7 @@ TEST(a_duplicate_probe_ok_does_not_re_nominate) {
 TEST(a_forged_probe_ok_is_ignored_on_a_keyed_topic) {
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {host(ep4(198, 51, 100, 9, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     a.begin(t0());
     auto probe = a.poll_transmit();
     REQUIRE(probe.has_value());
@@ -523,7 +523,7 @@ TEST(a_forged_probe_ok_is_ignored_on_a_keyed_topic) {
 TEST(an_unmatched_transaction_id_is_ignored) {
     auto key = a_key();
     PunchSession a{PunchConfig{}, dev_of(2), {host(ep4(198, 51, 100, 9, 51820))},
-                   LocalView{}, &key};
+                   LocalView{}, &key, 1234};
     a.begin(t0());
     (void)a.poll_transmit();
 
@@ -552,7 +552,7 @@ TEST(probes_are_staggered_rather_than_sent_as_one_burst) {
     auto         key = a_key();
     PunchConfig  cfg;
     cfg.stagger = 20ms;
-    PunchSession s{cfg, dev_of(1), cands, LocalView{}, &key};
+    PunchSession s{cfg, dev_of(1), cands, LocalView{}, &key, 1234};
 
     s.begin(t0());
     int at_start = 0;
@@ -571,7 +571,7 @@ TEST(retransmit_backoff_grows_and_the_attempt_eventually_gives_up) {
     PunchConfig cfg;
     cfg.total_timeout         = 3s;
     cfg.max_attempts_per_pair = 4;
-    PunchSession s{cfg, dev_of(1), {srflx(ep4(198, 51, 100, 9, 40000))}, LocalView{}, &key};
+    PunchSession s{cfg, dev_of(1), {srflx(ep4(198, 51, 100, 9, 40000))}, LocalView{}, &key, 1234};
 
     s.begin(t0());
     int     sends = 0;
@@ -602,7 +602,7 @@ TEST(an_incoming_probe_accelerates_our_next_probe_to_that_address) {
     auto         key = a_key();
     PunchConfig  cfg;
     cfg.first_retransmit = 800ms;
-    PunchSession s{cfg, dev_of(1), {srflx(ep4(198, 51, 100, 9, 40000))}, LocalView{}, &key};
+    PunchSession s{cfg, dev_of(1), {srflx(ep4(198, 51, 100, 9, 40000))}, LocalView{}, &key, 1234};
 
     s.begin(t0());
     while (s.poll_transmit()) {}

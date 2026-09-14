@@ -7,6 +7,7 @@
 // that actually bites in production, is trivial to reproduce.
 
 #include "store.hpp"
+#include "udp_service.hpp"
 #include "testing.hpp"
 
 using namespace uconnect;
@@ -706,4 +707,90 @@ TEST(encoded_size_agrees_with_the_real_encoder_for_every_entry_shape) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Amplification: every response larger than its request must be gated
+// ---------------------------------------------------------------------------
+namespace {
+
+// Encode a request exactly as a client would, optionally with a cookie.
+template <typename T>
+std::vector<uint8_t> req(wire::MsgType type, const T& msg, uint8_t flags = 0) {
+    std::vector<uint8_t> buf(wire::kMaxDatagram);
+    wire::Writer         w{buf};
+    wire::Header{type, wire::kVersion, flags, 1}.encode(w);
+    msg.encode(w);
+    buf.resize(w.size());
+    return buf;
+}
+
+std::optional<wire::MsgType> reply_type(const std::vector<Reply>& out) {
+    if (out.empty() || out[0].data.empty()) return std::nullopt;
+    return wire::peek_type(out[0].data);
+}
+
+}  // namespace
+
+TEST(every_amplifying_request_is_refused_without_a_validated_address) {
+    // An unvalidated request whose reply is bigger than itself turns this server
+    // into a DDoS amplifier aimed at whoever the attacker spoofed. Each of these
+    // must answer with a small Retry, never with the payload.
+    //
+    // Resolve and Stats were NOT gated at one point: needs_cookie() listed them
+    // but was never actually called, so they answered anyone. This test is here
+    // so that cannot come back.
+    auto       s = make_store();
+    UdpService svc{s};
+    auto       src = ep(7, 40000);
+
+    struct Case { const char* name; std::vector<uint8_t> dgram; };
+    std::vector<Case> cases;
+
+    { wire::Register m; m.id = topic_of(1); cases.push_back({"Register", req(wire::MsgType::Register, m)}); }
+    { wire::Lookup   m; m.id = topic_of(1); cases.push_back({"Lookup",   req(wire::MsgType::Lookup, m)}); }
+    { wire::Topics   m;                     cases.push_back({"Topics",   req(wire::MsgType::Topics, m)}); }
+    { wire::Resolve  m; m.dev_id = DevId{}; cases.push_back({"Resolve",  req(wire::MsgType::Resolve, m)}); }
+    { wire::Stats    m;                     cases.push_back({"Stats",    req(wire::MsgType::Stats, m)}); }
+
+    for (auto& c : cases) {
+        auto out = svc.handle(src, c.dgram, t0());
+        auto rt  = reply_type(out);
+        if (!rt || *rt != wire::MsgType::Retry) {
+            ::testing::fail(__FILE__, __LINE__,
+                            std::string(c.name) + " answered without a cookie");
+            continue;
+        }
+        // And the Retry must be no larger than the request that provoked it,
+        // or the defence is itself an amplifier.
+        if (out[0].data.size() > c.dgram.size() + 16) {
+            ::testing::fail(__FILE__, __LINE__,
+                            std::string(c.name) + " Retry is larger than the request");
+        }
+    }
+}
+
+TEST(a_validated_address_gets_the_real_answer) {
+    // The flip side: once the cookie is presented, the same requests work.
+    auto       s = make_store();
+    UdpService svc{s};
+    auto       src    = ep(7, 40000);
+    auto       cookie = s.make_cookie(src, t0());
+
+    wire::Register reg;
+    reg.id     = topic_of(1);
+    reg.cookie = cookie;
+    auto out   = svc.handle(src, req(wire::MsgType::Register, reg), t0());
+    REQUIRE(out.size() == 1);
+    auto rt = reply_type(out);
+    REQUIRE(rt.has_value());
+    CHECK(*rt == wire::MsgType::RegisterOk);
+
+    wire::Stats st;
+    st.cookie = cookie;
+    auto out2 = svc.handle(src, req(wire::MsgType::Stats, st), t0());
+    REQUIRE(out2.size() == 1);
+    auto rt2 = reply_type(out2);
+    REQUIRE(rt2.has_value());
+    CHECK(*rt2 == wire::MsgType::StatsOk);
 }

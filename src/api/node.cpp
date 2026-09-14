@@ -134,6 +134,12 @@ struct Pending {
     // extra round trip and no bookkeeping at the call site.
     std::function<std::vector<uint8_t>(const std::vector<uint8_t>&)> rebuild;
 
+    // Retransmission. A single UDP datagram is lost often enough on a real
+    // internet path that a one-shot request makes discovery flaky: one drop and
+    // peers() returns nothing with no indication why.
+    Instant  last_sent{};
+    int      attempts = 0;
+
     bool done = false;
     std::vector<PeerInfo>     peers;
     uint16_t                  total = 0;
@@ -316,6 +322,23 @@ void Node::Impl::loop() {
 
 void Node::Impl::pump(Instant now) {
     for (auto& [tid, topic] : topics) drive_topic(*topic->impl_, tid, now);
+
+    // Retransmit unanswered requests. One lost datagram otherwise makes peers()
+    // silently return nothing, which looks like "no peers in the topic" rather
+    // than "the question never arrived".
+    constexpr auto kRetransmit  = 400ms;
+    constexpr int  kMaxAttempts = 4;
+    for (auto& [txn, p] : pending) {
+        (void)txn;
+        if (p.done || !p.rebuild) continue;
+        if (p.attempts >= kMaxAttempts) continue;
+        if (p.last_sent != Instant{} && now - p.last_sent < kRetransmit) continue;
+        auto again = p.rebuild(cookie);
+        if (again.empty()) continue;
+        send_raw(server, again);
+        p.last_sent = now;
+        ++p.attempts;
+    }
 
     // Forget stale answered probes so the map does not grow without bound.
     for (auto it = answered.begin(); it != answered.end();) {
@@ -583,18 +606,13 @@ void Node::Impl::on_handshake_dgram(const Endpoint& from, std::span<const uint8_
                                           placeholder, from, hi->probe_txn, dgram, now);
         if (!s) return false;
 
-        // Attach to the peer we were already punching on this path, if any.
-        DevId owner = placeholder;
-        for (auto& [dev, peer] : ti.peers) {
-            if (peer.punch && peer.punch->nominated_path() &&
-                *peer.punch->nominated_path() == from) {
-                owner = dev;
-                break;
-            }
-            for (const auto& c : peer.cands) {
-                if (c.ep == from) { owner = dev; break; }
-            }
-        }
+        // The peer identifies itself inside the authenticated handshake payload,
+        // so we do not have to guess from the source address. Guessing was the
+        // bug: behind a symmetric NAT the handshake arrives from a different
+        // mapping than the peer advertised, matching failed, and the session got
+        // filed under `placeholder` -- making one peer appear twice, once under
+        // its real dev_id from LOOKUP and once under a synthetic one.
+        DevId owner = s->peer();
 
         auto& peer  = ti.peers[owner];
         peer.dev_id = owner;
@@ -690,8 +708,9 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
             if (e->kind == path::PunchEvent::Kind::Nominated) {
                 // Hand the validated path and its transaction to the session
                 // layer; the prologue binds the handshake to both.
-                auto s = session::Session::initiate(session::SessionConfig{}, tid, 0, ti.psk(),
-                                                    peer.dev_id, e->path, e->txn, now);
+                auto s = session::Session::initiate(
+                    session::SessionConfig{}, tid, 0, ti.psk(),
+                    ti.self ? *ti.self : DevId{}, peer.dev_id, e->path, e->txn, now);
                 conns[s.conn_id()] = {tid, peer.dev_id};
                 peer.sess          = std::move(s);
                 peer.punch.reset();
@@ -955,16 +974,25 @@ std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::millisecon
     std::unique_lock<std::mutex> lk(n.mu);
 
     uint32_t txn = n.alloc_txn();
-    std::vector<uint8_t> buf(wire::kMaxDatagram);
-    wire::Writer         w{buf};
-    wire::Header{wire::MsgType::Resolve, wire::kVersion, 0, txn}.encode(w);
-    wire::Resolve{dev}.encode(w);
-    buf.resize(w.size());
+
+    auto build = [dev, txn](const std::vector<uint8_t>& ck) {
+        std::vector<uint8_t> buf(wire::kMaxDatagram);
+        wire::Writer         w{buf};
+        wire::Header{wire::MsgType::Resolve, wire::kVersion, 0, txn}.encode(w);
+        wire::Resolve m;
+        m.dev_id = dev;
+        m.cookie = ck;
+        m.encode(w);
+        if (!w.ok()) return std::vector<uint8_t>{};
+        buf.resize(w.size());
+        return buf;
+    };
 
     Pending p;
     p.expect       = wire::MsgType::ResolveOk;
+    p.rebuild      = build;
     n.pending[txn] = std::move(p);
-    n.send_raw(n.server, buf);
+    n.send_raw(n.server, build(n.cookie));
 
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -1220,15 +1248,23 @@ std::optional<ServerStats> Node::stats(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(impl_->mu);
     uint32_t                     txn = impl_->alloc_txn();
 
-    std::vector<uint8_t> buf(wire::kMaxDatagram);
-    wire::Writer         w{buf};
-    wire::Header{wire::MsgType::Stats, wire::kVersion, 0, txn}.encode(w);
-    buf.resize(w.size());
+    auto build = [txn](const std::vector<uint8_t>& ck) {
+        std::vector<uint8_t> buf(wire::kMaxDatagram);
+        wire::Writer         w{buf};
+        wire::Header{wire::MsgType::Stats, wire::kVersion, 0, txn}.encode(w);
+        wire::Stats m;
+        m.cookie = ck;
+        m.encode(w);
+        if (!w.ok()) return std::vector<uint8_t>{};
+        buf.resize(w.size());
+        return buf;
+    };
 
     Pending p;
     p.expect            = wire::MsgType::StatsOk;
+    p.rebuild           = build;
     impl_->pending[txn] = std::move(p);
-    impl_->send_raw(impl_->server, buf);
+    impl_->send_raw(impl_->server, build(impl_->cookie));
 
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {

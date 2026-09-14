@@ -220,12 +220,28 @@ std::optional<LookupOk> LookupOk::decode(Reader& r) {
 }
 
 // --- Resolve ---------------------------------------------------------------
-void Resolve::encode(Writer& w) const { w.array(dev_id); }
+void Resolve::encode(Writer& w) const {
+    w.array(dev_id);
+    w.blob8(cookie);
+}
 
 std::optional<Resolve> Resolve::decode(Reader& r) {
     Resolve m;
     m.dev_id = r.array<kDevIdLen>();
-    if (!r.ok()) return std::nullopt;
+    auto c   = r.blob8();
+    if (!r.ok() || c.size() > kMaxCookieLen) return std::nullopt;
+    m.cookie.assign(c.begin(), c.end());
+    return m;
+}
+
+// --- Stats -----------------------------------------------------------------
+void Stats::encode(Writer& w) const { w.blob8(cookie); }
+
+std::optional<Stats> Stats::decode(Reader& r) {
+    Stats m;
+    auto  c = r.blob8();
+    if (!r.ok() || c.size() > kMaxCookieLen) return std::nullopt;
+    m.cookie.assign(c.begin(), c.end());
     return m;
 }
 

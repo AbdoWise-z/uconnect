@@ -1,20 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ClaudeCodeEditorTabs">
-    <option name="activeSessionId" value="4f000ce9-e62b-467f-9c70-39aff9ec86dc" />
+    <option name="activeSessionId" value="a33003b0-47f8-47a9-8ce2-9456cd0fdaf6" />
     <option name="openSessionIds">
       <list>
-        <option value="4f000ce9-e62b-467f-9c70-39aff9ec86dc" />
+        <option value="9550bb91-72a2-4d53-924d-9e726f7a76b9" />
+        <option value="a33003b0-47f8-47a9-8ce2-9456cd0fdaf6" />
       </list>
     </option>
     <option name="sessionPaths">
       <map>
-        <entry key="4f000ce9-e62b-467f-9c70-39aff9ec86dc" value="/sessions/665a5a50-cd42-4b25-92ec-f95eb8ea298b" />
+        <entry key="9550bb91-72a2-4d53-924d-9e726f7a76b9" value="/sessions/new" />
+        <entry key="a33003b0-47f8-47a9-8ce2-9456cd0fdaf6" value="/sessions/665a5a50-cd42-4b25-92ec-f95eb8ea298b" />
       </map>
     </option>
     <option name="sessionTitles">
       <map>
-        <entry key="4f000ce9-e62b-467f-9c70-39aff9ec86dc" value="I'm in the process of designing a networking libra" />
+        <entry key="9550bb91-72a2-4d53-924d-9e726f7a76b9" value="Claude Code" />
+        <entry key="a33003b0-47f8-47a9-8ce2-9456cd0fdaf6" value="I'm in the process of designing a networking libra" />
       </map>
     </option>
   </component>

@@ -5,8 +5,9 @@ add_executable(uconnect_tests
     test_store.cpp
     test_punch.cpp
     test_session.cpp
+    test_stream.cpp
 )
-target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session)
+target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect_stream)
 target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 uconnect_bundle_runtime(uconnect_tests)
 add_test(NAME uconnect_tests COMMAND uconnect_tests)

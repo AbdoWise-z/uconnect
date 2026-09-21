@@ -48,6 +48,37 @@ public:
     template <size_t N>
     void array(const std::array<uint8_t, N>& a) { bytes(a.data(), N); }
 
+    // QUIC-style variable-length integer (RFC 9000 s16). The top two bits of
+    // the first byte give the encoded length, so small values are cheap:
+    //
+    //   00xxxxxx                    1 byte   0 .. 63
+    //   01xxxxxx +1                 2 bytes  0 .. 16383
+    //   10xxxxxx +3                 4 bytes  0 .. 2^30-1
+    //   11xxxxxx +7                 8 bytes  0 .. 2^62-1
+    //
+    // This matters for stream frames: an offset early in a stream costs one
+    // byte rather than eight, and a frame header is mostly offsets.
+    void varint(uint64_t v) {
+        if (v <= 63) {
+            u8(static_cast<uint8_t>(v));
+        } else if (v <= 16383) {
+            u16(static_cast<uint16_t>(v) | 0x4000u);
+        } else if (v <= 0x3FFFFFFFu) {
+            u32(static_cast<uint32_t>(v) | 0x80000000u);
+        } else if (v <= 0x3FFFFFFFFFFFFFFFull) {
+            u64(v | 0xC000000000000000ull);
+        } else {
+            ok_ = false;  // not representable; refuse rather than truncate
+        }
+    }
+
+    static constexpr size_t varint_size(uint64_t v) {
+        if (v <= 63) return 1;
+        if (v <= 16383) return 2;
+        if (v <= 0x3FFFFFFFu) return 4;
+        return 8;
+    }
+
     // Length-prefixed blobs. u8 prefix caps at 255, u16 at 65535.
     void blob8(std::span<const uint8_t> s) {
         if (s.size() > 0xFF) { ok_ = false; return; }
@@ -138,6 +169,22 @@ public:
         auto s = bytes(N);
         if (s.size() == N) std::memcpy(out.data(), s.data(), N);
         return out;
+    }
+
+    // QUIC-style varint. See Writer::varint for the encoding.
+    uint64_t varint() {
+        if (!have(1)) return 0;
+        uint8_t first = buf_[pos_];
+        switch (first >> 6) {
+            case 0:
+                return u8();
+            case 1:
+                return u16() & 0x3FFFull;
+            case 2:
+                return u32() & 0x3FFFFFFFull;
+            default:
+                return u64() & 0x3FFFFFFFFFFFFFFFull;
+        }
     }
 
     std::span<const uint8_t> blob8()  { return bytes(u8()); }

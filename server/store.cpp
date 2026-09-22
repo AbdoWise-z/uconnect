@@ -478,6 +478,115 @@ std::optional<Endpoint> Store::relay_target(const DevId& from, const DevId& to, 
 // ---------------------------------------------------------------------------
 // maintenance
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// relay
+// ---------------------------------------------------------------------------
+Store::RelayResult Store::relay_alloc(const DevId& from, const DevId& peer,
+                                      const Endpoint& src, Instant now) {
+    RelayResult out;
+
+    if (!cfg_.relay_enabled) {
+        out.code = ErrorCode::Unsupported;
+        return out;
+    }
+
+    auto fit = by_dev_.find(from);
+    auto pit = by_dev_.find(peer);
+    if (fit == by_dev_.end() || pit == by_dev_.end()) {
+        ++stats_.rej_bad_request;
+        out.code = ErrorCode::NotFound;
+        return out;
+    }
+    // Relay only within a topic, for the same reason CONNECT does: the server
+    // must not become a general purpose tunnel between arbitrary registrants.
+    if (!(fit->second.topic_id == pit->second.topic_id)) {
+        ++stats_.rej_bad_request;
+        out.code = ErrorCode::BadRequest;
+        return out;
+    }
+
+    auto ik = ip_key(src);
+    if (relays_.size() >= cfg_.max_relays ||
+        (relays_per_ip_.count(ik) && relays_per_ip_[ik] >= cfg_.max_relays_per_ip)) {
+        ++stats_.rej_relay_quota;
+        out.code = ErrorCode::QuotaExceeded;
+        return out;
+    }
+
+    // Reuse an existing binding for the same pair rather than stacking new
+    // ones: a retried allocation after a lost reply must not leak a binding.
+    for (auto& [id, b] : relays_) {
+        if (b.a_dev == from && b.b_dev == peer) {
+            b.last_seen = now;
+            b.a_addr    = src;
+            out.relay_id = id;
+            out.max_kib  = static_cast<uint32_t>(cfg_.relay_max_bytes / 1024);
+            return out;
+        }
+    }
+
+    RelayBinding b;
+    // 64 random bits. The id is the only thing gating who may claim slot B, so
+    // it must be unguessable; it travels to the peer inside the authenticated
+    // CONNECT relay.
+    auto rb = crypto::random_array<8>();
+    for (size_t i = 0; i < 8; ++i) b.id = b.id << 8 | rb[i];
+    if (b.id == 0) b.id = 1;
+
+    b.topic     = fit->second.topic_id;
+    b.a_dev     = from;
+    b.b_dev     = peer;
+    b.a_addr    = src;
+    b.created   = now;
+    b.last_seen = now;
+
+    relays_[b.id] = b;
+    relays_per_ip_[ik]++;
+    ++stats_.relays_allocated;
+
+    out.relay_id = b.id;
+    out.max_kib  = static_cast<uint32_t>(cfg_.relay_max_bytes / 1024);
+    return out;
+}
+
+std::optional<Endpoint> Store::relay_forward(wire::RelayId id, const Endpoint& src,
+                                             size_t bytes, Instant now) {
+    auto it = relays_.find(id);
+    if (it == relays_.end()) {
+        ++stats_.rej_relay_unknown;
+        return std::nullopt;
+    }
+    auto& b = it->second;
+
+    if (b.bytes + bytes > cfg_.relay_max_bytes) {
+        ++stats_.rej_relay_quota;
+        return std::nullopt;
+    }
+
+    b.last_seen = now;
+    b.bytes += bytes;
+    stats_.relay_bytes += bytes;
+
+    if (src == b.a_addr) {
+        if (!b.b_bound) return std::nullopt;  // nobody on the far side yet
+        return b.b_addr;
+    }
+    if (b.b_bound && src == b.b_addr) return b.a_addr;
+
+    // First datagram from a second address claims slot B. Knowing the relay id
+    // is what authorises this; it reached the peer over an authenticated
+    // CONNECT relay and is 64 unguessable bits.
+    //
+    // Worst case if an id leaks is denial of service on this one binding: the
+    // payload is Noise-protected, so an impostor cannot read or inject traffic.
+    if (!b.b_bound) {
+        b.b_bound = true;
+        b.b_addr  = src;
+        return b.a_addr;
+    }
+    return std::nullopt;
+}
+
 size_t Store::sweep(Instant now) {
     std::vector<DevId> dead;
     for (const auto& [id, r] : by_dev_) {
@@ -485,6 +594,23 @@ size_t Store::sweep(Instant now) {
     }
     for (const auto& id : dead) erase_record(id);
     stats_.expired += dead.size();
+
+    // Idle relay bindings evaporate on the same principle as records: the
+    // server holds no long-lived state it does not have to.
+    for (auto it = relays_.begin(); it != relays_.end();) {
+        if (now - it->second.last_seen >= cfg_.relay_expiry) {
+            auto ik  = ip_key(it->second.a_addr);
+            auto pit = relays_per_ip_.find(ik);
+            if (pit != relays_per_ip_.end()) {
+                if (pit->second <= 1) relays_per_ip_.erase(pit);
+                else --pit->second;
+            }
+            it = relays_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     return dead.size();
 }
 
@@ -506,6 +632,7 @@ Stats Store::stats(Instant now) const {
         if (is_fresh(r, now)) ++fresh;
     }
     s.entries_fresh = fresh;
+    s.relays_open   = relays_.size();
     return s;
 }
 

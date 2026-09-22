@@ -72,6 +72,11 @@ struct SessionEvent {
     Kind                 kind{};
     std::vector<uint8_t> data;      // Kind::Data
     Endpoint             path{};    // Kind::PathChanged
+
+    // The session packet number this datagram arrived in. The stream layer
+    // above needs it to acknowledge the datagram; the session has already
+    // guaranteed it is free of duplicates, so it is trustworthy for that.
+    uint64_t packet_number = 0;
 };
 
 // Anti-replay, IPsec style: a high-water mark plus a bitmap of the 64 counters
@@ -124,8 +129,11 @@ public:
     void on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, Instant now);
     void on_timeout(Instant now);
 
-    // Queues an encrypted transport datagram. Returns false if not established.
-    bool send(std::span<const uint8_t> payload, Instant now);
+    // Returns the packet number used, or nullopt if not established. The
+    // caller must know the number BEFORE building a payload that references
+    // it, so next_send_counter() lets it peek first.
+    std::optional<uint64_t> send(std::span<const uint8_t> payload, Instant now);
+    uint64_t next_send_counter() const { return send_counter_; }
     void close(Instant now);
 
     std::optional<Outgoing>     poll_transmit();

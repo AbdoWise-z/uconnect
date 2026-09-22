@@ -355,6 +355,48 @@ std::optional<Relayed> Relayed::decode(Reader& r) {
     return m;
 }
 
+// --- Relay -----------------------------------------------------------------
+void RelayAlloc::encode_prefix(Writer& w) const {
+    w.array(from_dev);
+    w.array(peer_dev);
+    write_auth_prefix(w, auth);
+}
+
+std::optional<RelayAlloc> RelayAlloc::decode(Reader& r) {
+    RelayAlloc m;
+    m.from_dev = r.array<kDevIdLen>();
+    m.peer_dev = r.array<kDevIdLen>();
+    if (!read_auth(r, m.auth)) return std::nullopt;
+    return m;
+}
+
+void RelayAllocOk::encode(Writer& w) const {
+    w.u64(relay_id);
+    w.u16(expires_in);
+    w.u32(max_kib);
+}
+
+std::optional<RelayAllocOk> RelayAllocOk::decode(Reader& r) {
+    RelayAllocOk m;
+    m.relay_id   = r.u64();
+    m.expires_in = r.u16();
+    m.max_kib    = r.u32();
+    if (!r.ok()) return std::nullopt;
+    return m;
+}
+
+void RelayData::encode(Writer& w) const {
+    w.u64(relay_id);
+    write_blob16_capped(w, payload, kMaxDatagram);
+}
+
+std::optional<RelayData> RelayData::decode(Reader& r) {
+    RelayData m;
+    m.relay_id = r.u64();
+    if (!read_blob16_capped(r, m.payload, kMaxDatagram)) return std::nullopt;
+    return m;
+}
+
 // --- Retry / Error ---------------------------------------------------------
 void Retry::encode(Writer& w) const { w.blob8(cookie); }
 

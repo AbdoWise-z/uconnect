@@ -26,6 +26,7 @@
 #include "noise.hpp"
 #include "primitives.hpp"
 #include "punch.hpp"
+#include "connection.hpp"
 #include "session.hpp"
 #include "socket.hpp"
 
@@ -120,11 +121,24 @@ std::string TopicCreds::to_uri() const {
 namespace {
 
 struct Peer {
-    DevId                                dev_id{};
-    std::vector<Candidate>               cands;
-    std::optional<path::PunchSession>    punch;
-    std::optional<session::Session>      sess;
-    PeerState                            state = PeerState::Unknown;
+    DevId                             dev_id{};
+    std::vector<Candidate>            cands;
+    std::optional<path::PunchSession> punch;
+    std::optional<session::Session>   sess;
+    PeerState                         state = PeerState::Unknown;
+
+    // Relay fallback. When punching fails -- which in practice means symmetric
+    // NAT on both ends -- datagrams for this peer are wrapped in RelayData and
+    // sent to the rendezvous server, which forwards them. The session above is
+    // unchanged and unaware: it still sees an opaque path, and the relay still
+    // cannot read a byte of what it carries.
+    bool          relayed     = false;
+    wire::RelayId relay_id    = 0;
+    bool          relay_asked = false;
+
+    // Reliable, ordered, congestion-controlled streams over this peer's
+    // session. Created once the handshake completes.
+    std::optional<stream::StreamConnection> streams;
 };
 
 // A pending server request awaiting its reply.
@@ -181,8 +195,11 @@ struct Topic::Impl {
     size_t                                     max_peers    = 8;
     bool                                       auto_connect = false;
 
-    std::function<void(DevId, PeerState)>                       on_peer;
-    std::function<void(DevId, std::span<const uint8_t>)>        on_data;
+    std::function<void(DevId, PeerState)>                on_peer;
+    std::function<void(DevId, std::span<const uint8_t>)> on_data;
+    std::function<void(DevId, uint64_t)>                 on_stream;
+    std::function<void(DevId, uint64_t)>                 on_stream_readable;
+    std::function<void(DevId, uint64_t)>                 on_stream_finished;
 
     const crypto::SymKey* psk() const { return keyed ? &keys.psk : nullptr; }
     const crypto::SymKey* probe_key() const { return keyed ? &keys.probe : nullptr; }
@@ -233,6 +250,14 @@ struct Node::Impl {
 
     void     drive_topic(Topic::Impl&, const TopicId&, Instant now);
     void     drive_peer(Topic::Impl&, const TopicId&, Peer&, Instant now);
+    void     drive_streams(Topic::Impl&, const TopicId&, Peer&, Instant now);
+
+    // Sends to a peer, wrapping in RelayData when that peer is on the relay
+    // path. Every peer-bound datagram goes through here so the relay decision
+    // lives in exactly one place.
+    void     send_to_peer(Peer&, const Endpoint& to, std::span<const uint8_t> d);
+    void     request_relay(Topic::Impl&, const TopicId&, Peer&, Instant now);
+    void     start_relay_session(Topic::Impl&, const TopicId&, Peer&, Instant now);
     void     set_peer_state(Topic::Impl&, Peer&, PeerState);
     void     start_punch(Topic::Impl&, const TopicId&, Peer&, Instant now);
     void     send_connect_relay(Topic::Impl&, const TopicId&, const DevId& to, Instant now);
@@ -252,11 +277,20 @@ wire::Mac compute_mac(const wire::LeaseToken& token, std::span<const uint8_t> pr
 
 // Relay payload: topic_id so the receiver knows which topic is punching it,
 // then the sender's candidates so it can punch back immediately.
+// The CONNECT relay payload: which topic is punching you, the sender's
+// candidates so you can punch back, and -- when punching has already failed --
+// the relay binding to use instead.
+//
+// A nonzero relay_id is how the far side learns to stop probing and switch to
+// the relay. It travels inside a CONNECT, which is MAC'd with the sender's
+// lease token, so the id is not something a bystander can inject.
 std::vector<uint8_t> encode_relay_payload(const TopicId& topic,
-                                          const std::vector<Candidate>& cands) {
+                                          const std::vector<Candidate>& cands,
+                                          wire::RelayId relay_id) {
     std::vector<uint8_t> buf(wire::kMaxRelayPayload);
     wire::Writer         w{buf};
     w.array(topic);
+    w.u64(relay_id);
     size_t n = std::min<size_t>(cands.size(), wire::kMaxCandidates);
     w.u8(static_cast<uint8_t>(n));
     for (size_t i = 0; i < n; ++i) w.candidate(cands[i]);
@@ -266,9 +300,10 @@ std::vector<uint8_t> encode_relay_payload(const TopicId& topic,
 }
 
 bool decode_relay_payload(std::span<const uint8_t> p, TopicId& topic,
-                          std::vector<Candidate>& cands) {
+                          std::vector<Candidate>& cands, wire::RelayId& relay_id) {
     wire::Reader r{p};
     topic    = r.array<kTopicIdLen>();
+    relay_id = r.u64();
     size_t n = r.u8();
     if (!r.ok() || n > wire::kMaxCandidates) return false;
     for (size_t i = 0; i < n; ++i) cands.push_back(r.candidate());
@@ -369,6 +404,16 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
     auto         h = wire::Header::decode(r);
     if (!h) return;
 
+    // A relayed datagram: unwrap and dispatch exactly as though it had arrived
+    // directly. The session demultiplexes on conn_id rather than the 4-tuple,
+    // so it neither knows nor cares that the bytes came via the server.
+    if (h->type == wire::MsgType::RelayData) {
+        auto rd = wire::RelayData::decode(r);
+        if (!rd || rd->payload.empty()) return;
+        dispatch(server, rd->payload, now);
+        return;
+    }
+
     // Relayed arrives from the server but is not a reply to anything we sent.
     if (h->type == wire::MsgType::Relayed) {
         auto rel = wire::Relayed::decode(r);
@@ -376,18 +421,44 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
 
         TopicId                topic{};
         std::vector<Candidate> cands;
-        if (!decode_relay_payload(rel->payload, topic, cands)) return;
+        wire::RelayId          offered_relay = 0;
+        if (!decode_relay_payload(rel->payload, topic, cands, offered_relay)) return;
 
         auto tit = topics.find(topic);
         if (tit == topics.end()) return;
         auto& ti = *tit->second->impl_;
 
-        // The peer is about to punch us. Punch back now -- this is the
-        // simultaneity the whole thing depends on.
         auto& peer  = ti.peers[rel->from_dev];
         peer.dev_id = rel->from_dev;
         if (!peer.cands.empty()) peer.cands.clear();
         peer.cands = cands;
+
+        if (offered_relay != 0) {
+            // The peer gave up on punching and opened a relay. Stop probing
+            // and meet it there -- it is the designated initiator, so it will
+            // drive the handshake and we only need the binding recorded.
+            peer.relayed  = true;
+            peer.relay_id = offered_relay;
+            peer.punch.reset();
+            if (!peer.sess) {
+                // Record the transaction the initiator will bind its handshake
+                // to, derived from the relay id so both ends compute the same
+                // value without another round trip.
+                wire::ProbeTxn txn{};
+                for (size_t i = 0; i < 8; ++i) {
+                    txn[i]     = static_cast<uint8_t>(offered_relay >> (8 * (7 - i)));
+                    txn[i + 8] = txn[i];
+                }
+                answered[txn] = AnsweredProbe{server, now,
+                                              ti.keyed ? std::optional<TopicId>(topic)
+                                                       : std::nullopt};
+                set_peer_state(ti, peer, PeerState::Handshaking);
+            }
+            return;
+        }
+
+        // The peer is about to punch us. Punch back now -- this is the
+        // simultaneity the whole thing depends on.
         if (!peer.punch && !peer.sess) start_punch(ti, topic, peer, now);
         return;
     }
@@ -412,6 +483,28 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
             auto e = wire::Error::decode(r);
             p.error = e ? e->code : ErrorCode::BadRequest;
             p.done  = true;
+            cv.notify_all();
+            return;
+        }
+
+        case wire::MsgType::RelayAllocOk: {
+            auto ok = wire::RelayAllocOk::decode(r);
+            if (!ok) return;
+
+            // Switch every peer that was waiting on this allocation onto the
+            // relay path, tell it the relay id over the authenticated CONNECT
+            // relay, and start the handshake across it.
+            for (auto& [tid2, topic] : topics) {
+                auto& ti2 = *topic->impl_;
+                for (auto& [dev, peer] : ti2.peers) {
+                    if (!peer.relay_asked || peer.relayed) continue;
+                    peer.relayed  = true;
+                    peer.relay_id = ok->relay_id;
+                    send_connect_relay(ti2, tid2, dev, now);
+                    start_relay_session(ti2, tid2, peer, now);
+                }
+            }
+            p.done = true;
             cv.notify_all();
             return;
         }
@@ -517,6 +610,9 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
             s.rej_bad_auth     = r.u64();
             s.rej_quota        = r.u64();
             s.rej_rate_limited = r.u64();
+            s.relays_open      = r.u64();
+            s.relays_allocated = r.u64();
+            s.relay_bytes      = r.u64();
             if (r.ok()) p.stats = s;
             p.done = true;
             cv.notify_all();
@@ -689,6 +785,83 @@ void Node::Impl::set_peer_state(Topic::Impl& ti, Peer& peer, PeerState s) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Relay fallback
+// ---------------------------------------------------------------------------
+void Node::Impl::send_to_peer(Peer& peer, const Endpoint& to, std::span<const uint8_t> d) {
+    if (!peer.relayed) {
+        send_raw(to, d);
+        return;
+    }
+
+    // Wrap and hand to the server. The payload is a Noise handshake message or
+    // an AEAD-sealed transport frame either way, so the relay forwards bytes it
+    // cannot read.
+    std::vector<uint8_t> buf(wire::kMaxDatagram + 64);
+    wire::Writer         w{buf};
+    wire::Header{wire::MsgType::RelayData, wire::kVersion, 0, 0}.encode(w);
+    wire::RelayData rd;
+    rd.relay_id = peer.relay_id;
+    rd.payload.assign(d.begin(), d.end());
+    rd.encode(w);
+    if (!w.ok()) return;
+    buf.resize(w.size());
+    send_raw(server, buf);
+}
+
+void Node::Impl::request_relay(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
+    (void)tid;
+    if (peer.relay_asked || !ti.self) return;
+    peer.relay_asked = true;
+
+    uint32_t txn = alloc_txn();
+    std::vector<uint8_t> buf(wire::kMaxDatagram);
+    wire::Writer         w{buf};
+    wire::Header{wire::MsgType::RelayAlloc, wire::kVersion, 0, txn}.encode(w);
+    wire::RelayAlloc m;
+    m.from_dev   = *ti.self;
+    m.peer_dev   = peer.dev_id;
+    m.auth.seq   = ++ti.seq;
+    m.encode_prefix(w);
+    w.array(compute_mac(ti.lease, w.written()));
+    if (!w.ok()) return;
+    buf.resize(w.size());
+
+    Pending p;
+    p.expect     = wire::MsgType::RelayAllocOk;
+    pending[txn] = std::move(p);
+    send_raw(server, buf);
+    (void)now;
+}
+
+void Node::Impl::start_relay_session(Topic::Impl& ti, const TopicId& tid, Peer& peer,
+                                     Instant now) {
+    if (peer.sess || peer.relay_id == 0) return;
+
+    // A relayed path needs no probing: the server is reachable by definition,
+    // and it is the server that validates both ends. So there is no probe
+    // transaction to bind the handshake to -- derive a deterministic one from
+    // the relay id instead, which both peers can compute identically.
+    wire::ProbeTxn txn{};
+    for (size_t i = 0; i < 8; ++i) {
+        txn[i]     = static_cast<uint8_t>(peer.relay_id >> (8 * (7 - i)));
+        txn[i + 8] = txn[i];
+    }
+
+    auto s = session::Session::initiate(session::SessionConfig{}, tid, 0, ti.psk(),
+                                        ti.self ? *ti.self : DevId{}, peer.dev_id,
+                                        server, txn, now);
+    conns[s.conn_id()] = {tid, peer.dev_id};
+    peer.sess          = std::move(s);
+    peer.punch.reset();
+
+    // The responder must accept a handshake bound to this transaction, so
+    // record it as though we had answered a probe for it.
+    answered[txn] = AnsweredProbe{server, now, ti.keyed ? std::optional<TopicId>(tid)
+                                                        : std::nullopt};
+    set_peer_state(ti, peer, PeerState::Handshaking);
+}
+
 void Node::Impl::start_punch(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
     path::LocalView lv;
     lv.our_srflx = srflx;
@@ -719,7 +892,25 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
             }
             if (e->kind == path::PunchEvent::Kind::Failed) {
                 peer.punch.reset();
-                set_peer_state(ti, peer, PeerState::Failed);
+
+                // Punching failed. On a real network that overwhelmingly means
+                // symmetric NAT on both ends: each allocates a fresh external
+                // port per destination, so the address the rendezvous server
+                // observed is not the address the peer must hit, and no amount
+                // of further probing finds one that works.
+                //
+                // Fall back to relaying through the server. Only the designated
+                // initiator asks for the binding -- the same dev_id tie-break
+                // that settles handshake glare -- so the two ends cannot
+                // allocate two relays for one pair.
+                const bool we_allocate =
+                    ti.self && std::memcmp(ti.self->data(), peer.dev_id.data(),
+                                           kDevIdLen) < 0;
+                if (we_allocate && !peer.relay_asked) {
+                    request_relay(ti, tid, peer, now);
+                } else if (!peer.relayed) {
+                    set_peer_state(ti, peer, PeerState::Failed);
+                }
                 break;
             }
         }
@@ -727,16 +918,33 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
 
     if (peer.sess) {
         peer.sess->on_timeout(now);
-        while (auto o = peer.sess->poll_transmit()) send_raw(o->to, o->data);
+        while (auto o = peer.sess->poll_transmit()) send_to_peer(peer, o->to, o->data);
 
         while (auto e = peer.sess->poll_event()) {
             using K = session::SessionEvent::Kind;
             switch (e->kind) {
-                case K::Established:
+                case K::Established: {
+                    // Bring up the reliable stream layer over this session.
+                    // Roles must differ between the two ends so concurrently
+                    // opened stream ids never collide; reuse the dev_id
+                    // ordering that already decides the initiator.
+                    if (!peer.streams) {
+                        const bool a =
+                            ti.self && std::memcmp(ti.self->data(), peer.dev_id.data(),
+                                                   kDevIdLen) < 0;
+                        stream::StreamConfig scfg;
+                        peer.streams.emplace(scfg, a ? stream::Role::A : stream::Role::B);
+                    }
                     set_peer_state(ti, peer, PeerState::Connected);
                     break;
+                }
                 case K::Data:
-                    if (ti.on_data) {
+                    // A datagram carries stream frames when the stream layer is
+                    // up; otherwise it is a raw application message. Both are
+                    // supported so send() keeps working unchanged.
+                    if (peer.streams && !e->data.empty()) {
+                        peer.streams->on_datagram(e->packet_number, e->data, now);
+                    } else if (ti.on_data) {
                         deferred.push_back([cb = ti.on_data, dev = peer.dev_id,
                                             bytes = e->data] {
                             cb(dev, bytes);
@@ -746,23 +954,86 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                 case K::PathChanged:
                     break;
                 case K::NeedsRehandshake:
-                    // The path is still good; re-punch and handshake afresh.
+                    // The path is still good; re-establish on it.
                     conns.erase(peer.sess->conn_id());
                     peer.sess.reset();
-                    if (!peer.cands.empty()) start_punch(ti, tid, peer, now);
+                    peer.streams.reset();
+                    if (peer.relayed) start_relay_session(ti, tid, peer, now);
+                    else if (!peer.cands.empty()) start_punch(ti, tid, peer, now);
                     break;
                 case K::Closed:
                     conns.erase(peer.sess->conn_id());
                     peer.sess.reset();
+                    peer.streams.reset();
                     set_peer_state(ti, peer, PeerState::Closed);
                     break;
             }
             if (!peer.sess) break;
         }
+
+        if (peer.sess) drive_streams(ti, tid, peer, now);
         if (peer.sess) {
-            while (auto o = peer.sess->poll_transmit()) send_raw(o->to, o->data);
+            while (auto o = peer.sess->poll_transmit()) send_to_peer(peer, o->to, o->data);
         }
     }
+}
+
+// Pump the stream layer: hand it the session packet number it is about to use,
+// let it build a payload, then send that payload as one session datagram.
+void Node::Impl::drive_streams(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
+    if (!peer.streams || !peer.sess) return;
+    if (peer.sess->state() != session::SessionState::Established) return;
+
+    peer.streams->on_timeout(now);
+
+    // Bounded per pass so one busy peer cannot starve the others on this loop
+    // iteration; the congestion window is the real limit.
+    std::vector<uint8_t> buf(1200);
+    for (int i = 0; i < 32; ++i) {
+        // The stream layer records the packet number in its loss-recovery
+        // tables, so it must know the number BEFORE building the payload that
+        // will be acknowledged under it.
+        const uint64_t pn = peer.sess->next_send_counter();
+        size_t n = peer.streams->poll_datagram(pn, buf, now);
+        if (n == 0) break;
+        if (!peer.sess->send(std::span(buf).first(n), now)) break;
+        while (auto o = peer.sess->poll_transmit()) send_to_peer(peer, o->to, o->data);
+    }
+
+    while (auto e = peer.streams->poll_event()) {
+        using K = stream::StreamEventKind;
+        switch (e->kind) {
+            case K::Opened:
+                if (ti.on_stream) {
+                    deferred.push_back([cb = ti.on_stream, dev = peer.dev_id, id = e->id] {
+                        cb(dev, id);
+                    });
+                }
+                break;
+            case K::Readable:
+                if (ti.on_stream_readable) {
+                    deferred.push_back(
+                        [cb = ti.on_stream_readable, dev = peer.dev_id, id = e->id] {
+                            cb(dev, id);
+                        });
+                }
+                break;
+            case K::Finished:
+                if (ti.on_stream_finished) {
+                    deferred.push_back(
+                        [cb = ti.on_stream_finished, dev = peer.dev_id, id = e->id] {
+                            cb(dev, id);
+                        });
+                }
+                break;
+            case K::ConnDead:
+                if (peer.sess) peer.sess->close(now);
+                break;
+            default:
+                break;
+        }
+    }
+    (void)tid;
 }
 
 void Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, Instant now) {
@@ -832,7 +1103,11 @@ void Node::Impl::send_connect_relay(Topic::Impl& ti, const TopicId& tid, const D
     wire::Connect c;
     c.from_dev   = *ti.self;
     c.to_dev     = to;
-    c.payload    = encode_relay_payload(tid, cands);
+    wire::RelayId offer = 0;
+    if (auto pit = ti.peers.find(to); pit != ti.peers.end() && pit->second.relayed) {
+        offer = pit->second.relay_id;
+    }
+    c.payload    = encode_relay_payload(tid, cands, offer);
     c.auth.seq   = ++ti.seq;
     c.encode_prefix(w);
     auto mac = compute_mac(ti.lease, w.written());
@@ -1327,4 +1602,142 @@ std::optional<Endpoint> Node::reflexive() const {
     return impl_->srflx;
 }
 
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+namespace {
+
+// Every Stream operation funnels through here: find the peer, confirm the
+// stream layer is up, then run `fn`. A handle to a peer that has since
+// disconnected simply reports nothing rather than dangling.
+using PeerMap = std::unordered_map<DevId, Peer, ArrayHash>;
+
+template <typename R, typename F>
+R with_stream(PeerMap& peers, const DevId& dev, R fallback, F&& fn) {
+    auto it = peers.find(dev);
+    if (it == peers.end() || !it->second.streams) return fallback;
+    return fn(*it->second.streams);
+}
+
+}  // namespace
+
+size_t Stream::write(std::span<const uint8_t> data) {
+    if (!topic_) return 0;
+    auto& ti = *topic_->impl_;
+    auto& n  = *ti.node;
+    std::lock_guard<std::mutex> lk(n.mu);
+
+    size_t wrote = with_stream<size_t>(ti.peers, peer_, size_t{0},
+                                       [&](auto& sc) { return sc.write(id_, data); });
+
+    // Push it out now rather than waiting for the next loop tick, so a small
+    // request/response exchange does not pay an extra 20ms of latency.
+    if (wrote > 0) {
+        auto it = ti.peers.find(peer_);
+        if (it != ti.peers.end()) {
+            n.drive_streams(ti, ti.creds.id, it->second, std::chrono::steady_clock::now());
+        }
+    }
+    return wrote;
+}
+
+size_t Stream::read(std::span<uint8_t> out) {
+    if (!topic_) return 0;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    return with_stream<size_t>(topic_->impl_->peers, peer_, size_t{0},
+                               [&](auto& sc) { return sc.read(id_, out); });
+}
+
+void Stream::finish() {
+    if (!topic_) return;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    with_stream<int>(topic_->impl_->peers, peer_, 0, [&](auto& sc) {
+        sc.finish(id_);
+        return 0;
+    });
+}
+
+void Stream::reset(uint64_t code) {
+    if (!topic_) return;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    with_stream<int>(topic_->impl_->peers, peer_, 0, [&](auto& sc) {
+        sc.reset(id_, code);
+        return 0;
+    });
+}
+
+bool Stream::readable() const {
+    if (!topic_) return false;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    return with_stream<bool>(topic_->impl_->peers, peer_, false,
+                             [&](auto& sc) { return sc.readable(id_); });
+}
+
+size_t Stream::readable_bytes() const {
+    if (!topic_) return 0;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    return with_stream<size_t>(topic_->impl_->peers, peer_, size_t{0},
+                               [&](auto& sc) { return sc.readable_bytes(id_); });
+}
+
+bool Stream::writable() const {
+    if (!topic_) return false;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    return with_stream<bool>(topic_->impl_->peers, peer_, false,
+                             [&](auto& sc) { return sc.writable(id_); });
+}
+
+bool Stream::finished() const {
+    if (!topic_) return false;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    return with_stream<bool>(topic_->impl_->peers, peer_, false,
+                             [&](auto& sc) { return sc.finished(id_); });
+}
+
+Stream Topic::open_stream(const DevId& dev, bool bidirectional) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    auto it = impl_->peers.find(dev);
+    // Streams need an established session: the stream layer is created when the
+    // handshake completes, because its role depends on which side initiated.
+    if (it == impl_->peers.end() || !it->second.streams) return Stream{};
+    StreamId id = it->second.streams->open(bidirectional);
+    return Stream{this, dev, id};
+}
+
+Stream Topic::stream(const DevId& dev, StreamId id) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    auto it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.streams) return Stream{};
+    if (!it->second.streams->exists(id)) return Stream{};
+    return Stream{this, dev, id};
+}
+
+std::vector<StreamId> Topic::streams(const DevId& dev) const {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    auto it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.streams) return {};
+    return it->second.streams->active_streams();
+}
+
+void Topic::on_stream(std::function<void(Stream)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_stream = [this, cb = std::move(cb)](DevId dev, uint64_t id) {
+        cb(Stream{this, dev, id});
+    };
+}
+
+void Topic::on_stream_readable(std::function<void(Stream)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_stream_readable = [this, cb = std::move(cb)](DevId dev, uint64_t id) {
+        cb(Stream{this, dev, id});
+    };
+}
+
+void Topic::on_stream_finished(std::function<void(Stream)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_stream_finished = [this, cb = std::move(cb)](DevId dev, uint64_t id) {
+        cb(Stream{this, dev, id});
+    };
+}
 }  // namespace uconnect

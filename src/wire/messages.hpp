@@ -62,6 +62,8 @@ enum class MsgType : uint8_t {
     Stats         = 0x0F, StatsOk       = 0x10,
     Connect       = 0x11, Relayed       = 0x12,
     Retry         = 0x13, Error         = 0x14,
+    RelayAlloc    = 0x15, RelayAllocOk  = 0x16,
+    RelayData     = 0x17,
     // --- peer probe ---
     Probe         = 0x20, ProbeOk       = 0x21,
     // --- noise ---
@@ -322,6 +324,53 @@ struct Relayed {
 
     void encode(Writer&) const;
     static std::optional<Relayed> decode(Reader&);
+};
+
+// --- Relay -----------------------------------------------------------------
+// The fallback for pairs that cannot hole punch, which in practice means
+// symmetric NAT on both ends: such a NAT allocates a fresh external port per
+// destination, so the address the rendezvous server observed is not the
+// address a peer must hit, and no amount of probing finds one that works.
+//
+// The relay forwards OPAQUE BYTES. It sits below the crypto layer, so what it
+// carries is a Noise handshake message or an AEAD-sealed transport frame. The
+// server learns metadata -- who talks to whom, when, how much -- and nothing
+// else. It cannot read a keyed topic's traffic or inject into it, exactly as
+// it cannot on a directly punched path.
+//
+// This is the one place the server stays in the path after introducing two
+// peers, so it is deliberately separate from the punching flow: bandwidth is
+// metered per binding, and a relay is only requested once punching has failed.
+using RelayId = uint64_t;
+
+struct RelayAlloc {
+    DevId  from_dev{};
+    DevId  peer_dev{};
+    Authed auth{};
+
+    void encode_prefix(Writer&) const;
+    static std::optional<RelayAlloc> decode(Reader&);
+};
+
+struct RelayAllocOk {
+    RelayId  relay_id   = 0;
+    uint16_t expires_in = 0;
+    uint32_t max_kib    = 0;  // bandwidth ceiling for this binding
+
+    void encode(Writer&) const;
+    static std::optional<RelayAllocOk> decode(Reader&);
+};
+
+// Carries one wrapped datagram in either direction. Unauthenticated at this
+// layer on purpose: adding a MAC here would buy nothing, because the payload
+// is already authenticated end to end and a forged wrapper can only waste the
+// relay's bandwidth -- which the per-binding quota already bounds.
+struct RelayData {
+    RelayId              relay_id = 0;
+    std::vector<uint8_t> payload;
+
+    void encode(Writer&) const;
+    static std::optional<RelayData> decode(Reader&);
 };
 
 // --- Retry / Error ---------------------------------------------------------

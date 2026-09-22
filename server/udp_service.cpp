@@ -251,6 +251,51 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             return out;
         }
 
+        case wire::MsgType::RelayAlloc: {
+            auto m = wire::RelayAlloc::decode(r);
+            if (!m) return out;
+            // Authenticated with the requester's lease token, exactly like
+            // CONNECT: only a registered peer may open a relay, and only for
+            // someone in its own topic.
+            auto target = store_.relay_target(m->from_dev, m->peer_dev, m->auth.seq,
+                                              m->auth.authed, m->auth.mac, from, now);
+            if (!target) {
+                out.push_back(make_error(from, h->txn_id, ErrorCode::BadAuth));
+                return out;
+            }
+            auto res = store_.relay_alloc(m->from_dev, m->peer_dev, from, now);
+            if (res.code != ErrorCode::None) {
+                out.push_back(make_error(from, h->txn_id, res.code));
+                return out;
+            }
+            wire::RelayAllocOk ok;
+            ok.relay_id   = res.relay_id;
+            ok.expires_in = 90;
+            ok.max_kib    = res.max_kib;
+            out.push_back(encode(from, wire::MsgType::RelayAllocOk, h->txn_id, ok));
+            return out;
+        }
+
+        case wire::MsgType::RelayData: {
+            auto m = wire::RelayData::decode(r);
+            if (!m) return out;
+
+            auto dst = store_.relay_forward(m->relay_id, from, m->payload.size(), now);
+            if (!dst) return out;  // unknown, exhausted, or a stranger: drop silently
+
+            // Charge relayed bytes against the sender's rate budget. Forwarding
+            // is not amplification -- the reply goes to a third party, not back
+            // to a potentially spoofed source -- but it is the one path where
+            // the server spends bandwidth on someone else's behalf.
+            if (!consume_budget(from, m->payload.size(), now)) return out;
+
+            wire::RelayData fwd;
+            fwd.relay_id = m->relay_id;
+            fwd.payload  = std::move(m->payload);
+            out.push_back(encode(*dst, wire::MsgType::RelayData, h->txn_id, fwd));
+            return out;
+        }
+
         case wire::MsgType::Stats: {
             auto m = wire::Stats::decode(r);
             if (!m) return out;
@@ -277,6 +322,9 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             w.u64(st.rej_bad_auth);
             w.u64(st.rej_quota);
             w.u64(st.rej_rate_limited);
+            w.u64(st.relays_open);
+            w.u64(st.relays_allocated);
+            w.u64(st.relay_bytes);
             out.push_back(Reply{from, finish(w, buf)});
             return out;
         }

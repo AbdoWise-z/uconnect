@@ -252,14 +252,14 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
 
     plain.resize(*n);
     if (plain.empty()) return;  // keepalive
-    events_.push_back({SessionEvent::Kind::Data, std::move(plain), {}});
+    events_.push_back({SessionEvent::Kind::Data, std::move(plain), {}, t->counter});
 }
 
 // ---------------------------------------------------------------------------
 // Sending
 // ---------------------------------------------------------------------------
-bool Session::send(std::span<const uint8_t> payload, Instant now) {
-    if (state_ != SessionState::Established) return false;
+std::optional<uint64_t> Session::send(std::span<const uint8_t> payload, Instant now) {
+    if (state_ != SessionState::Established) return std::nullopt;
 
     std::vector<uint8_t> ct(payload.size() + crypto::kTagLen);
     send_cs_.encrypt_at(send_counter_, {}, payload, ct);
@@ -272,13 +272,13 @@ bool Session::send(std::span<const uint8_t> payload, Instant now) {
     t.counter    = send_counter_;
     t.ciphertext = ct;
     t.encode(w);
-    if (!w.ok()) return false;
+    if (!w.ok()) return std::nullopt;
     buf.resize(w.size());
 
-    ++send_counter_;
+    const uint64_t used = send_counter_++;
     out_.push_back({path_, std::move(buf)});
     next_keepalive_ = now + cfg_.keepalive;
-    return true;
+    return used;
 }
 
 void Session::queue_keepalive(Instant now) {

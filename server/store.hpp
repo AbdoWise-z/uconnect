@@ -49,6 +49,18 @@ struct StoreConfig {
     size_t max_topics           = 100'000;
 
     std::chrono::seconds cookie_lifetime{30};
+
+    // --- relay -------------------------------------------------------------
+    // The fallback for pairs that cannot punch. Unlike registration, relaying
+    // keeps the server in the data path, so every limit here is about making
+    // that cost bounded and predictable.
+    bool                 relay_enabled = true;
+    std::chrono::seconds relay_expiry{90};   // idle bindings evaporate
+    size_t               max_relays          = 4096;
+    size_t               max_relays_per_ip   = 8;
+    // Per-binding ceiling. A relay is a fallback for a hard NAT, not a general
+    // purpose tunnel, and without a cap one pair could saturate the host.
+    uint64_t             relay_max_bytes     = 32ull * 1024 * 1024;
 };
 
 // --- record ----------------------------------------------------------------
@@ -65,6 +77,27 @@ struct Record {
     uint8_t                key_epoch = 0;
     TopicMode              mode      = TopicMode::Open;
     bool                   listed    = false;
+};
+
+// --- relay -----------------------------------------------------------------
+// A two-slot forwarder. The allocating peer occupies slot A; the first
+// datagram arriving from a different address claims slot B. After that the
+// binding simply swaps datagrams between the two.
+//
+// What it carries is opaque: a Noise handshake message or an AEAD-sealed
+// transport frame. The server sees who talks to whom, when, and how much, and
+// nothing about content -- the same metadata it already has from registration.
+struct RelayBinding {
+    wire::RelayId id = 0;
+    TopicId       topic{};
+    DevId         a_dev{};
+    DevId         b_dev{};
+    Endpoint      a_addr{};
+    Endpoint      b_addr{};
+    bool          b_bound = false;
+    Instant       created{};
+    Instant       last_seen{};
+    uint64_t      bytes = 0;
 };
 
 // --- stats -----------------------------------------------------------------
@@ -91,6 +124,12 @@ struct Stats {
     uint64_t rej_bad_request   = 0;
 
     uint64_t bytes_out_lookup = 0;
+
+    uint64_t relays_open       = 0;
+    uint64_t relays_allocated  = 0;
+    uint64_t relay_bytes       = 0;
+    uint64_t rej_relay_quota   = 0;
+    uint64_t rej_relay_unknown = 0;
 };
 
 // --- results ---------------------------------------------------------------
@@ -189,6 +228,24 @@ public:
                                          std::span<const uint8_t> authed, const wire::Mac&,
                                          const Endpoint& src, Instant now);
 
+    // --- relay -------------------------------------------------------------
+    // Allocate a forwarding binding between two peers in the same topic. The
+    // caller must already have verified the requester's MAC.
+    struct RelayResult {
+        ErrorCode     code     = ErrorCode::None;
+        wire::RelayId relay_id = 0;
+        uint32_t      max_kib  = 0;
+    };
+    RelayResult relay_alloc(const DevId& from, const DevId& peer, const Endpoint& src,
+                            Instant now);
+
+    // Where to forward a RelayData that arrived from `src`. Returns nullopt if
+    // the binding is unknown, exhausted, or `src` belongs to neither slot.
+    std::optional<Endpoint> relay_forward(wire::RelayId, const Endpoint& src, size_t bytes,
+                                          Instant now);
+
+    size_t relay_count() const { return relays_.size(); }
+
     // --- maintenance -------------------------------------------------------
     size_t sweep(Instant now);
     Stats  stats(Instant now) const;
@@ -250,6 +307,9 @@ private:
     std::unordered_map<DevId, Record, ArrayHash>       by_dev_;
     std::unordered_map<TopicId, TopicState, ArrayHash> topics_;
     std::unordered_map<IpKey, size_t, IpKeyHash>       per_ip_total_;
+
+    std::unordered_map<wire::RelayId, RelayBinding> relays_;
+    std::unordered_map<IpKey, size_t, IpKeyHash>    relays_per_ip_;
 
     // Ordered so list_topics can page over a stable sequence. Insertion order,
     // with the cursor an index into it.

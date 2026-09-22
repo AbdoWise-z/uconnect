@@ -794,3 +794,176 @@ TEST(a_validated_address_gets_the_real_answer) {
     REQUIRE(rt2.has_value());
     CHECK(*rt2 == wire::MsgType::StatsOk);
 }
+
+// ---------------------------------------------------------------------------
+// Relay: the fallback for pairs that cannot punch
+// ---------------------------------------------------------------------------
+namespace {
+
+// Allocate a relay the way a client would: authenticated with the requester's
+// lease token, for a peer in the same topic.
+struct RelayPair {
+    RegisterResult a, b;
+    wire::RelayId  id = 0;
+};
+
+RelayPair make_relay(Store& s, TopicId topic = topic_of(1)) {
+    RelayPair rp;
+    rp.a = s.register_entry(reg_msg(topic), ep(7, 4000), t0());
+    rp.b = s.register_entry(reg_msg(topic), ep(8, 5000), t0());
+    auto res = s.relay_alloc(rp.a.dev_id, rp.b.dev_id, ep(7, 4000), t0());
+    rp.id = res.relay_id;
+    return rp;
+}
+
+}  // namespace
+
+TEST(a_relay_forwards_between_exactly_two_addresses) {
+    auto s  = make_store();
+    auto rp = make_relay(s);
+    REQUIRE(rp.id != 0);
+
+    // The allocating peer holds slot A. Its first datagram has nowhere to go
+    // until the far side shows up.
+    CHECK(!s.relay_forward(rp.id, ep(7, 4000), 100, t0()).has_value());
+
+    // The peer arrives and claims slot B; its datagram goes to A.
+    auto to_a = s.relay_forward(rp.id, ep(8, 5000), 100, t0());
+    REQUIRE(to_a.has_value());
+    CHECK(*to_a == ep(7, 4000));
+
+    // Now traffic flows both ways.
+    auto to_b = s.relay_forward(rp.id, ep(7, 4000), 100, t0());
+    REQUIRE(to_b.has_value());
+    CHECK(*to_b == ep(8, 5000));
+}
+
+TEST(a_third_party_cannot_hijack_a_bound_relay) {
+    auto s  = make_store();
+    auto rp = make_relay(s);
+    s.relay_forward(rp.id, ep(8, 5000), 10, t0());  // B binds
+
+    // Both slots are taken. A stranger who learned the id is simply ignored --
+    // it cannot displace either peer or read anything, since the payload is
+    // Noise-protected end to end.
+    CHECK(!s.relay_forward(rp.id, ep(66, 6666), 10, t0()).has_value());
+}
+
+TEST(relay_refuses_an_unknown_binding) {
+    auto s = make_store();
+    CHECK(!s.relay_forward(0xDEADBEEF, ep(7, 4000), 10, t0()).has_value());
+    CHECK_EQ(s.stats(t0()).rej_relay_unknown, 1u);
+}
+
+TEST(relay_allocation_only_works_within_a_topic) {
+    // Same rule as CONNECT: the server must not become a general purpose
+    // tunnel between arbitrary registrants.
+    auto s = make_store();
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    auto c = s.register_entry(reg_msg(topic_of(2)), ep(9, 4000), t0());
+
+    auto res = s.relay_alloc(a.dev_id, c.dev_id, ep(7, 4000), t0());
+    CHECK(res.code == ErrorCode::BadRequest);
+    CHECK_EQ(res.relay_id, 0u);
+}
+
+TEST(relay_allocation_is_idempotent_for_a_pair) {
+    // A retried allocation after a lost reply must not leak a second binding.
+    auto s  = make_store();
+    auto rp = make_relay(s);
+    auto again = s.relay_alloc(rp.a.dev_id, rp.b.dev_id, ep(7, 4000), t0() + 1s);
+    CHECK(again.relay_id == rp.id);
+    CHECK_EQ(s.relay_count(), 1u);
+}
+
+TEST(relay_enforces_a_bandwidth_ceiling) {
+    // A relay is a fallback for a hard NAT, not a free tunnel. Without a cap
+    // one pair could saturate the host.
+    StoreConfig cfg;
+    cfg.relay_max_bytes = 1000;
+    auto s  = make_store(cfg);
+    auto rp = make_relay(s);
+
+    CHECK(s.relay_forward(rp.id, ep(8, 5000), 400, t0()).has_value());
+    CHECK(s.relay_forward(rp.id, ep(7, 4000), 400, t0()).has_value());
+    // Next one crosses the ceiling.
+    CHECK(!s.relay_forward(rp.id, ep(7, 4000), 400, t0()).has_value());
+    CHECK(s.stats(t0()).rej_relay_quota >= 1u);
+}
+
+TEST(relay_bindings_expire_when_idle) {
+    StoreConfig cfg;
+    cfg.relay_expiry = 90s;
+    auto s  = make_store(cfg);
+    auto rp = make_relay(s);
+    CHECK_EQ(s.relay_count(), 1u);
+
+    s.sweep(t0() + 30s);
+    CHECK_EQ(s.relay_count(), 1u);
+
+    // Idle past the window and it evaporates, like every other bit of state
+    // this server holds.
+    s.sweep(t0() + 200s);
+    CHECK_EQ(s.relay_count(), 0u);
+}
+
+TEST(relay_allocation_is_capped_per_source_address) {
+    StoreConfig cfg;
+    cfg.max_relays_per_ip = 2;
+    auto s = make_store(cfg);
+
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    std::vector<RegisterResult> peers;
+    for (uint16_t i = 0; i < 4; ++i) {
+        peers.push_back(s.register_entry(reg_msg(topic_of(1)),
+                                         ep(static_cast<uint8_t>(20 + i), 5000), t0()));
+    }
+
+    int granted = 0;
+    for (auto& p : peers) {
+        if (s.relay_alloc(a.dev_id, p.dev_id, ep(7, 4000), t0()).code == ErrorCode::None) {
+            ++granted;
+        }
+    }
+    CHECK_EQ(granted, 2);
+    CHECK(s.stats(t0()).rej_relay_quota >= 1u);
+}
+
+TEST(relay_can_be_disabled_entirely) {
+    // An operator who does not want to pay for other people's bandwidth.
+    StoreConfig cfg;
+    cfg.relay_enabled = false;
+    auto s = make_store(cfg);
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    auto b = s.register_entry(reg_msg(topic_of(1)), ep(8, 5000), t0());
+
+    auto res = s.relay_alloc(a.dev_id, b.dev_id, ep(7, 4000), t0());
+    CHECK(res.code == ErrorCode::Unsupported);
+}
+
+TEST(relay_data_is_forwarded_opaquely_by_the_service) {
+    // End to end through UdpService: the relay must move bytes it cannot read.
+    auto       s = make_store();
+    UdpService svc{s};
+    auto       rp = make_relay(s);
+    REQUIRE(rp.id != 0);
+
+    // B speaks first, claiming slot B.
+    std::vector<uint8_t> secret{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02};
+    wire::RelayData rd;
+    rd.relay_id = rp.id;
+    rd.payload  = secret;
+
+    auto out = svc.handle(ep(8, 5000), req(wire::MsgType::RelayData, rd), t0());
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].to == ep(7, 4000));  // forwarded to the allocator
+
+    // The payload must arrive byte-identical -- the server neither inspects
+    // nor rewrites it.
+    wire::Reader r{out[0].data};
+    REQUIRE(wire::Header::decode(r).has_value());
+    auto fwd = wire::RelayData::decode(r);
+    REQUIRE(fwd.has_value());
+    CHECK(fwd->relay_id == rp.id);
+    CHECK(fwd->payload == secret);
+}

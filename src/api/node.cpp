@@ -54,6 +54,13 @@ struct TopicIdLess {
     }
 };
 
+// How long the non-designated peer waits for the other end to offer a relay
+// before asking for one itself.
+constexpr auto kRelayBackupDelay = 2s;
+
+// How often auto-connect asks the server who else is in the topic.
+constexpr auto kDiscoveryInterval = 5s;
+
 constexpr auto kProbeMemory = 30s;  // how long an answered probe_txn stays usable
 
 // One byte at the front of every session payload says which of the two
@@ -148,6 +155,10 @@ struct Peer {
     bool          relayed     = false;
     wire::RelayId relay_id    = 0;
     bool          relay_asked = false;
+    Instant       relay_asked_at{};
+    // When the non-designated peer should stop waiting for the other end to
+    // offer a relay and ask for its own. Zero means "not waiting".
+    Instant       relay_backup_at{};
 
     // Reliable, ordered, congestion-controlled streams over this peer's
     // session. Created once the handshake completes.
@@ -179,6 +190,19 @@ struct Pending {
     wire::LeaseToken          lease{};
     Endpoint                  srflx{};
     ErrorCode                 error = ErrorCode::None;
+
+    // Which (topic, peer) a RelayAlloc was for.
+    //
+    // Without this the reply has to be matched by scanning every peer in every
+    // topic for one that is waiting -- which applies the first RelayAllocOk to
+    // ALL of them, so two concurrent allocations both end up on one binding.
+    // It also gives a rejection somewhere to be reported, instead of the peer
+    // hanging in Probing forever.
+    std::optional<std::pair<TopicId, DevId>> relay_for;
+
+    // Set on a LOOKUP issued by auto-connect, so its result can drive
+    // connections rather than being handed back to a waiting caller.
+    std::optional<TopicId> auto_discover;
 };
 
 struct AnsweredProbe {
@@ -203,6 +227,7 @@ struct Topic::Impl {
     bool                 listed    = false;
     std::vector<uint8_t> meta;
     Instant              next_keepalive{};
+    Instant              next_discovery{};
 
     std::unordered_map<DevId, Peer, ArrayHash> peers;
     size_t                                     max_peers    = 8;
@@ -264,6 +289,10 @@ struct Node::Impl {
     void     drive_topic(Topic::Impl&, const TopicId&, Instant now);
     void     drive_peer(Topic::Impl&, const TopicId&, Peer&, Instant now);
     void     drive_streams(Topic::Impl&, const TopicId&, Peer&, Instant now);
+    void     begin_connect(Topic::Impl&, const TopicId&, const DevId&, Instant now);
+    void     discover(Topic::Impl&, const TopicId&, Instant now);
+    size_t   connected_count(const Topic::Impl&) const;
+    size_t   total_peer_count() const;
 
     // Sends to a peer, wrapping in RelayData when that peer is on the relay
     // path. Every peer-bound datagram goes through here so the relay decision
@@ -514,6 +543,23 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
                 std::fprintf(stderr, "[uconnect] server error txn=%u: %s\n", h->txn_id,
                              to_string(p.error));
             }
+
+            // A refused relay allocation is a definitive answer -- the quota is
+            // full, or the operator disabled relaying. Report it against the
+            // peer rather than leaving it in Probing forever waiting for a
+            // reply that has already arrived and said no.
+            if (p.relay_for) {
+                auto tit = topics.find(p.relay_for->first);
+                if (tit != topics.end()) {
+                    auto& ti2 = *tit->second->impl_;
+                    auto  target = ti2.peers.find(p.relay_for->second);
+                    if (target != ti2.peers.end() && !target->second.relayed) {
+                        target->second.relay_asked = false;  // allow a later attempt
+                        set_peer_state(ti2, target->second, PeerState::Failed);
+                    }
+                }
+            }
+
             p.done  = true;
             cv.notify_all();
             return;
@@ -523,18 +569,26 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
             auto ok = wire::RelayAllocOk::decode(r);
             if (!ok) return;
 
-            // Switch every peer that was waiting on this allocation onto the
-            // relay path, tell it the relay id over the authenticated CONNECT
-            // relay, and start the handshake across it.
-            for (auto& [tid2, topic] : topics) {
-                auto& ti2 = *topic->impl_;
-                for (auto& [dev, peer] : ti2.peers) {
-                    if (!peer.relay_asked || peer.relayed) continue;
-                    peer.relayed  = true;
-                    peer.relay_id = ok->relay_id;
-                    send_connect_relay(ti2, tid2, dev, now);
-                    start_relay_session(ti2, tid2, peer, now);
-                }
+            // Apply it to the one peer it was requested for.
+            //
+            // This used to scan every topic for any peer that was waiting,
+            // which meant two concurrent allocations both landed on whichever
+            // relay id arrived first -- one pair silently talking over the
+            // other pair's binding.
+            if (!p.relay_for) return;
+            auto tit = topics.find(p.relay_for->first);
+            if (tit == topics.end()) return;
+            auto& ti2 = *tit->second->impl_;
+            auto  target = ti2.peers.find(p.relay_for->second);
+            if (target == ti2.peers.end()) return;
+
+            auto& peer = target->second;
+            if (!peer.relayed) {
+                peer.relayed  = true;
+                peer.relay_id = ok->relay_id;
+                // Tell the peer which binding to use, then handshake across it.
+                send_connect_relay(ti2, p.relay_for->first, peer.dev_id, now);
+                start_relay_session(ti2, p.relay_for->first, peer, now);
             }
             p.done = true;
             cv.notify_all();
@@ -591,6 +645,21 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
                 }
             }
             if (p.parts_seen >= p.parts_total) {
+                // An auto-connect lookup drives connections itself rather than
+                // handing the list back: nobody is waiting on it, the loop
+                // issued it.
+                if (p.auto_discover) {
+                    auto tit2 = topics.find(*p.auto_discover);
+                    if (tit2 != topics.end()) {
+                        auto& ti2 = *tit2->second->impl_;
+                        for (const auto& pi : p.peers) {
+                            // Never punch at our own record.
+                            if (ti2.self && pi.dev_id == *ti2.self) continue;
+                            if (pi.stale) continue;
+                            begin_connect(ti2, *p.auto_discover, pi.dev_id, now);
+                        }
+                    }
+                }
                 p.done = true;
                 cv.notify_all();
             }
@@ -842,33 +911,61 @@ void Node::Impl::send_to_peer(Peer& peer, const Endpoint& to, std::span<const ui
 }
 
 void Node::Impl::request_relay(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
-    (void)tid;
     if (peer.relay_asked || !ti.self) return;
-    peer.relay_asked = true;
+    peer.relay_asked    = true;
+    peer.relay_asked_at = now;
 
     uint32_t txn = alloc_txn();
-    std::vector<uint8_t> buf(wire::kMaxDatagram);
-    wire::Writer         w{buf};
-    wire::Header{wire::MsgType::RelayAlloc, wire::kVersion, 0, txn}.encode(w);
-    wire::RelayAlloc m;
-    m.from_dev   = *ti.self;
-    m.peer_dev   = peer.dev_id;
-    m.auth.seq   = ++ti.seq;
-    m.encode_prefix(w);
-    w.array(compute_mac(ti.lease, w.written()));
-    if (!w.ok()) return;
-    buf.resize(w.size());
+
+    // Built through a closure so the retransmission in pump() can resend it.
+    //
+    // A one-shot RelayAlloc meant a single dropped datagram stranded the pair
+    // permanently -- no retry, no timeout, no Failed event, the peer just sat
+    // in Probing forever. Which is the same lost-datagram failure the LOOKUP
+    // path already fixes, in the very path that exists to rescue connections
+    // that have already failed once.
+    //
+    // The sequence number is drawn FRESH on every build, not captured. The
+    // server rejects a sequence it has already seen, so a retransmission
+    // carrying the original seq would be refused as a replay and the retry
+    // would accomplish nothing. Re-reading the topic through `this` keeps the
+    // counter authoritative even though the Pending outlives this call.
+    const TopicId topic = tid;
+
+    auto build = [this, topic, txn](const std::vector<uint8_t>&) {
+        auto tit = topics.find(topic);
+        if (tit == topics.end()) return std::vector<uint8_t>{};
+        auto& t = *tit->second->impl_;
+        if (!t.self) return std::vector<uint8_t>{};
+
+        auto pit = pending.find(txn);
+        if (pit == pending.end() || !pit->second.relay_for) return std::vector<uint8_t>{};
+
+        std::vector<uint8_t> buf(wire::kMaxDatagram);
+        wire::Writer         w{buf};
+        wire::Header{wire::MsgType::RelayAlloc, wire::kVersion, 0, txn}.encode(w);
+        wire::RelayAlloc m;
+        m.from_dev = *t.self;
+        m.peer_dev = pit->second.relay_for->second;
+        m.auth.seq = ++t.seq;
+        m.encode_prefix(w);
+        w.array(compute_mac(t.lease, w.written()));
+        if (!w.ok()) return std::vector<uint8_t>{};
+        buf.resize(w.size());
+        return buf;
+    };
 
     Pending p;
     p.expect     = wire::MsgType::RelayAllocOk;
+    p.rebuild    = build;
+    p.relay_for  = std::make_pair(tid, peer.dev_id);
     pending[txn] = std::move(p);
+
     if (cfg.verbose) {
-        std::fprintf(stderr, "[uconnect] RelayAlloc txn=%u seq=%llu peer=%s\n", txn,
-                     static_cast<unsigned long long>(m.auth.seq),
+        std::fprintf(stderr, "[uconnect] RelayAlloc txn=%u peer=%s\n", txn,
                      to_hex(peer.dev_id).substr(0, 8).c_str());
     }
-    send_raw(server, buf);
-    (void)now;
+    send_raw(server, build(cookie));
 }
 
 void Node::Impl::start_relay_session(Topic::Impl& ti, const TopicId& tid, Peer& peer,
@@ -936,17 +1033,30 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                 // observed is not the address the peer must hit, and no amount
                 // of further probing finds one that works.
                 //
-                // Fall back to relaying through the server. Only the designated
-                // initiator asks for the binding -- the same dev_id tie-break
-                // that settles handshake glare -- so the two ends cannot
-                // allocate two relays for one pair.
-                const bool we_allocate =
+                // Fall back to relaying through the server.
+                //
+                // The designated initiator asks immediately; the other side
+                // waits a moment and then asks too if no offer has arrived.
+                //
+                // Only one side asking was a single point of failure: if its
+                // request was lost or refused, the pair was stranded with the
+                // other end never even trying. The tie-break is not needed for
+                // correctness here -- unlike handshake glare, a duplicate
+                // request is harmless, because the store already returns the
+                // existing binding for a pair rather than allocating a second.
+                // So it is only an optimisation to avoid a redundant round
+                // trip, and it should not be allowed to block the fallback.
+                const bool first =
                     ti.self && std::memcmp(ti.self->data(), peer.dev_id.data(),
                                            kDevIdLen) < 0;
-                if (we_allocate && !peer.relay_asked) {
-                    request_relay(ti, tid, peer, now);
-                } else if (!peer.relayed) {
-                    set_peer_state(ti, peer, PeerState::Failed);
+                if (!peer.relay_asked) {
+                    if (first) {
+                        request_relay(ti, tid, peer, now);
+                    } else {
+                        // Give the other end its head start, then follow up.
+                        peer.relay_backup_at = now + kRelayBackupDelay;
+                        set_peer_state(ti, peer, PeerState::Probing);
+                    }
                 }
                 break;
             }
@@ -1163,10 +1273,117 @@ void Node::Impl::send_connect_relay(Topic::Impl& ti, const TopicId& tid, const D
 void Node::Impl::drive_topic(Topic::Impl& ti, const TopicId& tid, Instant now) {
     if (ti.published && ti.self && now >= ti.next_keepalive) send_keepalive(ti, now);
 
+    // Auto-connect: one LOOKUP per interval, driven here rather than by the
+    // application polling peers() in a loop.
+    //
+    // Every caller was writing that loop by hand -- both bundled examples did,
+    // one of them every 20ms, which produced over a thousand lookups in ten
+    // seconds. Rude against a shared rendezvous server, and exactly the work a
+    // library should be doing.
+    if (ti.auto_connect && ti.published && ti.self && now >= ti.next_discovery) {
+        ti.next_discovery = now + kDiscoveryInterval;
+        if (connected_count(ti) < ti.max_peers) discover(ti, tid, now);
+    }
+
     for (auto& [dev, peer] : ti.peers) {
         (void)dev;
+
+        // The other end was given a head start to offer a relay and has not.
+        // Ask for one ourselves rather than waiting on it indefinitely.
+        if (peer.relay_backup_at != Instant{} && now >= peer.relay_backup_at &&
+            !peer.relay_asked && !peer.relayed && !peer.sess) {
+            peer.relay_backup_at = Instant{};
+            request_relay(ti, tid, peer, now);
+        }
+
         drive_peer(ti, tid, peer, now);
     }
+}
+
+size_t Node::Impl::connected_count(const Topic::Impl& ti) const {
+    size_t n = 0;
+    for (const auto& [dev, peer] : ti.peers) {
+        (void)dev;
+        if (peer.sess || peer.punch) ++n;
+    }
+    return n;
+}
+
+size_t Node::Impl::total_peer_count() const {
+    size_t n = 0;
+    for (const auto& [id, topic] : topics) {
+        (void)id;
+        n += connected_count(*topic->impl_);
+    }
+    return n;
+}
+
+// Issue a LOOKUP whose result drives connections rather than returning to a
+// caller. Asynchronous by necessity: peers() blocks until the reply arrives,
+// and this runs on the very loop that would have to process it.
+void Node::Impl::discover(Topic::Impl& ti, const TopicId& tid, Instant now) {
+    (void)now;
+    uint32_t txn = alloc_txn();
+
+    auto build = [tid, txn](const std::vector<uint8_t>& ck) {
+        std::vector<uint8_t> buf(wire::kMaxDatagram);
+        wire::Writer         w{buf};
+        wire::Header{wire::MsgType::Lookup, wire::kVersion, 0, txn}.encode(w);
+        wire::Lookup m;
+        m.id     = tid;
+        m.max    = wire::kLookupDefault;
+        m.cookie = ck;
+        m.encode(w);
+        if (!w.ok()) return std::vector<uint8_t>{};
+        buf.resize(w.size());
+        return buf;
+    };
+
+    Pending p;
+    p.expect        = wire::MsgType::LookupOk;
+    p.rebuild       = build;
+    p.auto_discover = tid;
+    pending[txn]    = std::move(p);
+    send_raw(server, build(cookie));
+    (void)ti;
+}
+
+// Start connecting to a peer. Assumes the node lock is held, so it can be
+// called both from the public API and from the loop itself.
+void Node::Impl::begin_connect(Topic::Impl& ti, const TopicId& tid, const DevId& dev,
+                               Instant now) {
+    auto it = ti.peers.find(dev);
+    if (it == ti.peers.end() || it->second.cands.empty()) return;
+    if (it->second.sess || it->second.punch || it->second.relayed) return;
+
+    // Caps are enforced here rather than at the public API, so auto-connect and
+    // an explicit connect() obey the same limits. Previously set_max_peers()
+    // and max_total_peers stored a value that nothing ever read.
+    if (connected_count(ti) >= ti.max_peers) return;
+    if (total_peer_count() >= cfg.max_total_peers) return;
+
+    if (cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] connect %s relay=%d self=%d cands=%zu\n",
+                     to_hex(dev).substr(0, 8).c_str(), cfg.force_relay ? 1 : 0,
+                     ti.self.has_value() ? 1 : 0, it->second.cands.size());
+    }
+
+    if (cfg.force_relay) {
+        const bool first =
+            ti.self && std::memcmp(ti.self->data(), dev.data(), kDevIdLen) < 0;
+        if (first) {
+            request_relay(ti, tid, it->second, now);
+        } else {
+            it->second.relay_backup_at = now + kRelayBackupDelay;
+            set_peer_state(ti, it->second, PeerState::Probing);
+        }
+        return;
+    }
+
+    // Tell them to punch back at the same moment; without this they have no
+    // reason to open their NAT toward us.
+    send_connect_relay(ti, tid, dev, now);
+    start_punch(ti, tid, it->second, now);
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,36 +1548,8 @@ std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::millisecon
 void Topic::connect(const DevId& dev) {
     auto& n = *impl_->node;
     std::lock_guard<std::mutex> lk(n.mu);
-
-    auto it = impl_->peers.find(dev);
-    if (it == impl_->peers.end() || it->second.cands.empty()) return;
-    if (it->second.sess || it->second.punch) return;
-
-    auto now = std::chrono::steady_clock::now();
-
-    if (n.cfg.verbose) {
-        std::fprintf(stderr, "[uconnect] connect %s relay=%d self=%d cands=%zu\n",
-                     to_hex(dev).substr(0, 8).c_str(), n.cfg.force_relay ? 1 : 0,
-                     impl_->self.has_value() ? 1 : 0, it->second.cands.size());
-    }
-
-    if (n.cfg.force_relay) {
-        // Straight to the relay, no probing. Only the designated initiator
-        // allocates, same tie-break as everywhere else.
-        const bool we_allocate =
-            impl_->self && std::memcmp(impl_->self->data(), dev.data(), kDevIdLen) < 0;
-        if (we_allocate) {
-            n.request_relay(*impl_, impl_->creds.id, it->second, now);
-        } else if (n.cfg.verbose) {
-            std::fprintf(stderr, "[uconnect]   waiting for peer to offer a relay\n");
-        }
-        return;
-    }
-
-    // Tell them to punch back at the same moment; without this they have no
-    // reason to open their NAT toward us.
-    n.send_connect_relay(*impl_, impl_->creds.id, dev, now);
-    n.start_punch(*impl_, impl_->creds.id, it->second, now);
+    n.begin_connect(*impl_, impl_->creds.id, dev,
+                    std::chrono::steady_clock::now());
 }
 
 void Topic::connect_all(size_t max_peers) {

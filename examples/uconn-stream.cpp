@@ -78,6 +78,10 @@ int main(int argc, char** argv) {
     });
     topic.on_stream_finished([&](Stream) { done = true; });
 
+    // Let the library discover and connect to peers on its own interval,
+    // instead of polling peers() from the loop below.
+    topic.set_auto_connect(true);
+
     if (!topic.publish()) { std::fprintf(stderr, "publish failed\n"); return 1; }
     std::printf("[%s] published\n", recv ? "recv" : "send");
     std::fflush(stdout);
@@ -88,9 +92,10 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> chunk(32 * 1024);
 
     while (std::chrono::steady_clock::now() < deadline && !done) {
-        for (const auto& p : topic.peers()) {
-            if (topic.state(p.dev_id) == PeerState::Unknown) topic.connect(p.dev_id);
-        }
+        // No discovery loop here: set_auto_connect(true) below makes the
+        // library do it, on its own interval. Polling peers() by hand is what
+        // this example used to do, and at a 20ms tick it produced well over a
+        // thousand lookups in ten seconds.
 
         if (to_send > 0) {
             auto conn = topic.connected();

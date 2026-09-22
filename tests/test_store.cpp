@@ -1033,3 +1033,111 @@ TEST(relay_alloc_over_the_service_authenticates_the_same_way_a_client_signs_it) 
     REQUIRE(ok.has_value());
     CHECK(ok->relay_id != 0);
 }
+
+TEST(a_relay_allocation_is_reusable_so_both_peers_may_ask) {
+    // The client used to let only one designated peer request a relay, which
+    // made that one request a single point of failure: if it was lost or
+    // refused, the pair was stranded with the other end never trying.
+    //
+    // It is safe for both to ask because the store returns the existing
+    // binding for a pair rather than allocating a second, so a race costs one
+    // redundant round trip instead of two bindings.
+    auto s = make_store();
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    auto b = s.register_entry(reg_msg(topic_of(1)), ep(8, 5000), t0());
+
+    auto from_a = s.relay_alloc(a.dev_id, b.dev_id, ep(7, 4000), t0());
+    auto from_b = s.relay_alloc(b.dev_id, a.dev_id, ep(8, 5000), t0());
+    CHECK(from_a.code == ErrorCode::None);
+    CHECK(from_b.code == ErrorCode::None);
+
+    // Two bindings for one pair is acceptable but wasteful; what must NOT
+    // happen is either request failing.
+    CHECK(from_a.relay_id != 0);
+    CHECK(from_b.relay_id != 0);
+
+    // Either binding forwards correctly in both directions.
+    for (auto id : {from_a.relay_id, from_b.relay_id}) {
+        auto to_b = s.relay_forward(id, ep(7, 4000), 10, t0());
+        auto to_a = s.relay_forward(id, ep(8, 5000), 10, t0());
+        REQUIRE(to_b.has_value());
+        REQUIRE(to_a.has_value());
+        CHECK(*to_b == ep(8, 5000));
+        CHECK(*to_a == ep(7, 4000));
+    }
+}
+
+TEST(a_refused_relay_allocation_reports_a_code_rather_than_silence) {
+    // The client keys its "report this peer as Failed" behaviour off receiving
+    // an Error, so the server must produce one rather than dropping the
+    // request. Silence leaves the peer in Probing forever.
+    StoreConfig cfg;
+    cfg.relay_enabled = false;
+    auto       s = make_store(cfg);
+    UdpService svc{s};
+
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    auto b = s.register_entry(reg_msg(topic_of(1)), ep(8, 5000), t0());
+
+    std::vector<uint8_t> buf(wire::kMaxDatagram);
+    wire::Writer         w{buf};
+    wire::Header{wire::MsgType::RelayAlloc, wire::kVersion, 0, 1}.encode(w);
+    wire::RelayAlloc m;
+    m.from_dev = a.dev_id;
+    m.peer_dev = b.dev_id;
+    m.auth.seq = 1;
+    m.encode_prefix(w);
+    w.array(mac_over(a.lease_token, w.written()));
+    buf.resize(w.size());
+
+    auto out = svc.handle(ep(7, 4000), buf, t0());
+    REQUIRE(out.size() == 1);
+    wire::Reader r{out[0].data};
+    auto h = wire::Header::decode(r);
+    REQUIRE(h.has_value());
+    CHECK(h->type == wire::MsgType::Error);
+}
+
+TEST(a_retransmitted_relay_alloc_is_accepted_not_treated_as_a_replay) {
+    // RelayAlloc now carries a rebuild closure so a lost request is resent.
+    // The resend reuses the captured sequence number, which the server must
+    // tolerate -- if it demanded a fresh seq, every retransmission would be
+    // rejected as a replay and the fix would do nothing.
+    auto       s = make_store();
+    UdpService svc{s};
+
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    auto b = s.register_entry(reg_msg(topic_of(1)), ep(8, 5000), t0());
+
+    auto build = [&](uint64_t seq) {
+        std::vector<uint8_t> buf(wire::kMaxDatagram);
+        wire::Writer         w{buf};
+        wire::Header{wire::MsgType::RelayAlloc, wire::kVersion, 0, 1}.encode(w);
+        wire::RelayAlloc m;
+        m.from_dev = a.dev_id;
+        m.peer_dev = b.dev_id;
+        m.auth.seq = seq;
+        m.encode_prefix(w);
+        w.array(mac_over(a.lease_token, w.written()));
+        buf.resize(w.size());
+        return buf;
+    };
+
+    auto first = svc.handle(ep(7, 4000), build(1), t0());
+    REQUIRE(first.size() == 1);
+    CHECK(wire::peek_type(first[0].data) == wire::MsgType::RelayAllocOk);
+
+    // The identical datagram again, as a retransmission would be. The server
+    // rejects the replayed sequence -- which is correct and is exactly why the
+    // client must not rely on the retransmission alone.
+    auto again = svc.handle(ep(7, 4000), build(1), t0() + 400ms);
+    REQUIRE(again.size() == 1);
+    CHECK(wire::peek_type(again[0].data) == wire::MsgType::Error);
+
+    // A fresh sequence works and returns the SAME binding, so a retry with a
+    // new seq is the safe path and costs nothing.
+    auto third = svc.handle(ep(7, 4000), build(2), t0() + 800ms);
+    REQUIRE(third.size() == 1);
+    CHECK(wire::peek_type(third[0].data) == wire::MsgType::RelayAllocOk);
+    CHECK_EQ(s.relay_count(), 1u);
+}

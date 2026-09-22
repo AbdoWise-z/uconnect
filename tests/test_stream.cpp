@@ -1129,6 +1129,15 @@ TEST(a_peer_reset_is_reported_to_the_application) {
     REQUIRE(resets.size() == 1);
     CHECK_EQ(resets[0].id, id);
     CHECK_EQ(resets[0].error_code, 42u);
+
+    // A bare reset ends ONE direction. Neither side may retire on it: b can
+    // still send to a, and a has not finished its own receive side. Retiring
+    // here is what used to swallow the STOP_SENDING half of a teardown.
+    CHECK(b.exists(id));
+    CHECK(a.exists(id));
+
+    // b's sending direction genuinely still works.
+    CHECK(b.writable(id));
 }
 
 TEST(writable_fires_only_for_a_stream_that_was_actually_blocked) {
@@ -1166,4 +1175,155 @@ TEST(writable_fires_only_for_a_stream_that_was_actually_blocked) {
     REQUIRE(!w.empty());
     for (const auto& e : w) CHECK_EQ(e.id, blocked);   // never the idle stream
     (void)idle;
+}
+
+TEST(close_tears_a_bidi_stream_down_from_one_side) {
+    // The teardown neither finish() nor reset() can do alone: RESET_STREAM to
+    // end our direction, STOP_SENDING to ask the peer to end its own. The
+    // peer's answering RESET_STREAM is what releases the initiator, so both
+    // ends must come back empty.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open();
+    a.write(id, pattern(200));
+    link.advance(200ms);
+    std::vector<uint8_t> seen;
+    drain(b, id, seen);
+    REQUIRE(!seen.empty());
+
+    a.close(id, 7);
+    link.advance(3s);
+
+    CHECK(!a.exists(id));
+    CHECK(!b.exists(id));
+    CHECK(a.active_streams().empty());
+    CHECK(b.active_streams().empty());
+
+    // The peer is told why, rather than the stream just going quiet.
+    auto resets = collect(b, StreamEventKind::Reset);
+    REQUIRE(!resets.empty());
+    CHECK_EQ(resets[0].error_code, 7u);
+}
+
+TEST(close_survives_a_lossy_link) {
+    // RESET_STREAM and STOP_SENDING are not carried in SentPacket::chunks, so
+    // ordinary loss detection cannot replay them. Without a re-arm on PTO a
+    // single dropped datagram strands one side forever.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.30, 10ms, 0ms, 5}};
+
+    StreamId id = *a.open();
+    a.write(id, pattern(400));
+    link.advance(1s);
+
+    a.close(id, 3);
+    link.advance(30s);
+
+    CHECK(link.dropped() > 0);   // the loss really happened
+    CHECK(!a.exists(id));
+    CHECK(!b.exists(id));
+}
+
+TEST(close_works_in_both_directions_on_a_unidirectional_stream) {
+    // A uni stream has only one direction, so close() must abort whichever end
+    // it is called from without naming a direction that does not exist.
+    {   // sender closes
+        StreamConnection a{fast_cfg(), Role::A};
+        StreamConnection b{fast_cfg(), Role::B};
+        Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+        StreamId id = *a.open(/*bidirectional=*/false);
+        a.write(id, pattern(200));
+        link.advance(200ms);
+        a.close(id, 1);
+        link.advance(3s);
+        CHECK(!a.exists(id));
+        CHECK(!b.exists(id));
+    }
+    {   // receiver closes
+        StreamConnection a{fast_cfg(), Role::A};
+        StreamConnection b{fast_cfg(), Role::B};
+        Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+        StreamId id = *a.open(/*bidirectional=*/false);
+        a.write(id, pattern(200));
+        link.advance(200ms);
+        REQUIRE(b.exists(id));
+        b.close(id, 2);
+        link.advance(3s);
+        CHECK(!a.exists(id));
+        CHECK(!b.exists(id));
+    }
+}
+
+TEST(closing_a_stream_leaves_the_others_untouched) {
+    // Closing a stream is not closing the connection. The session below is not
+    // this layer's business, and neither is any other stream on it.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId doomed   = *a.open();
+    StreamId survivor = *a.open();
+
+    a.write(doomed, pattern(100));
+    a.write(survivor, pattern(100, 9));
+    link.advance(500ms);
+
+    a.close(doomed, 1);
+    link.advance(2s);
+
+    REQUIRE(!a.exists(doomed));
+    REQUIRE(!b.exists(doomed));
+
+    // The other stream is still live and still carries bytes afterwards.
+    CHECK(a.exists(survivor));
+    CHECK(b.exists(survivor));
+    CHECK(!a.is_dead());
+    CHECK(!b.is_dead());
+
+    auto more = pattern(2000, 4);
+    size_t off = 0;
+    for (int i = 0; i < 40 && off < more.size(); ++i) {
+        off += a.write(survivor, std::span(more).subspan(off));
+        link.advance(100ms);
+    }
+    a.finish(survivor);
+    link.advance(3s);
+
+    std::vector<uint8_t> got;
+    drain(b, survivor, got);
+    CHECK_EQ(got.size(), 100u + more.size());
+}
+
+TEST(a_bare_reset_does_not_stop_the_peer_from_finishing) {
+    // The peer's sending direction is independent. Refusing to send on a
+    // peer-reset stream meant it could not push data OR a FIN, so its send side
+    // never completed and the stream could never be released.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open();
+    a.write(id, pattern(100));
+    link.advance(300ms);
+    std::vector<uint8_t> seen;
+    drain(b, id, seen);
+
+    a.reset(id, 5);
+    link.advance(500ms);
+
+    // b can still write and finish, even though a aborted its own direction.
+    CHECK(b.write(id, pattern(300, 2)) > 0);
+    b.finish(id);
+    link.advance(3s);
+
+    std::vector<uint8_t> back;
+    drain(a, id, back);
+    CHECK_EQ(back.size(), 300u);
+
+    link.advance(2s);
+    CHECK(!a.exists(id));
+    CHECK(!b.exists(id));
 }

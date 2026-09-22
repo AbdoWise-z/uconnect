@@ -1953,6 +1953,15 @@ void Stream::reset(uint64_t code) {
     });
 }
 
+void Stream::close(uint64_t code) {
+    if (!topic_) return;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    with_stream<int>(topic_->impl_->peers, peer_, 0, [&](auto& sc) {
+        sc.close(id_, code);
+        return 0;
+    });
+}
+
 bool Stream::readable() const {
     if (!topic_) return false;
     std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);

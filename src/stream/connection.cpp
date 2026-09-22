@@ -85,7 +85,12 @@ StreamConnection::StreamState* StreamConnection::ensure_peer_stream(StreamId id,
 bool StreamConnection::side_send_done(const StreamState& s) const {
     // A unidirectional stream the peer opened has no send side for us.
     if (!is_bidi(s.id) && opener(s.id) != role_) return true;
-    if (s.peer_reset) return true;               // peer aborted; we stop producing
+
+    // Note what is NOT here: peer_reset. RESET_STREAM terminates the SENDER's
+    // direction, not ours. Treating an inbound reset as "our send side is done
+    // too" retired the stream the instant the reset landed, which swallowed the
+    // STOP_SENDING that was supposed to follow and left the peer holding a
+    // stream nobody would ever answer for.
     if (s.send_reset) return s.reset_sent;       // we aborted; RESET_STREAM is out
     return s.send.complete();                    // all data and the FIN are acked
 }
@@ -130,7 +135,9 @@ void StreamConnection::emit(StreamEventKind k, StreamId id, uint64_t code) {
 // ---------------------------------------------------------------------------
 size_t StreamConnection::write(StreamId id, std::span<const uint8_t> data) {
     auto* s = find(id);
-    if (!s || s->peer_reset || s->send_reset) return 0;
+    // peer_reset is deliberately not checked: the peer aborting ITS sending
+    // direction says nothing about ours. Only our own abort stops us.
+    if (!s || s->send_reset) return 0;
 
     // Connection-level flow control caps the aggregate, so many streams cannot
     // together exceed what one stream alone would be refused.
@@ -191,6 +198,29 @@ void StreamConnection::stop_sending(StreamId id, uint64_t code) {
     }
 }
 
+void StreamConnection::close(StreamId id, uint64_t code) {
+    auto* s = find(id);
+    if (!s) return;
+
+    // A unidirectional stream only has one of these, and resetting a direction
+    // we do not own would name a stream the peer never expects to hear about.
+    const bool we_send = is_bidi(id) || opener(id) == role_;
+    const bool we_recv = is_bidi(id) || opener(id) != role_;
+
+    // Our direction: abort it.
+    if (we_send && !s->send_reset) {
+        s->send_reset      = true;
+        s->send_reset_code = code;
+    }
+    // Their direction: ask them to abort it, unless it is already over. The
+    // peer answers STOP_SENDING with a RESET_STREAM, and that answer is what
+    // releases this side.
+    if (we_recv && !s->peer_reset && !s->recv.finished()) {
+        s->send_stop      = true;
+        s->send_stop_code = code;
+    }
+}
+
 bool StreamConnection::readable(StreamId id) const {
     auto* s = find(id);
     return s && s->recv.readable() > 0;
@@ -208,7 +238,7 @@ bool StreamConnection::finished(StreamId id) const {
 
 bool StreamConnection::writable(StreamId id) const {
     auto* s = find(id);
-    if (!s || s->send_reset || s->peer_reset) return false;
+    if (!s || s->send_reset) return false;
     if (s->send.fin_written()) return false;
     return s->send.buffered() < cfg_.stream_send_cap && conn_send_used_ < conn_send_max_;
 }
@@ -444,6 +474,12 @@ size_t StreamConnection::poll_datagram(uint64_t pn, std::span<uint8_t> out, Inst
     }
 
     // Per-stream control frames, then data.
+    //
+    // RESET_STREAM and STOP_SENDING must be able to share a datagram. They are
+    // the two halves of a one-sided teardown, and splitting them across
+    // datagrams let the peer act on the reset and retire the stream before the
+    // stop_sending arrived -- which then looked like a late frame for a dead
+    // stream and was dropped, stranding the initiator.
     for (auto& [id, s] : streams_) {
         if (s.send_reset && !s.reset_sent) {
             ResetStreamFrame f{id, s.send_reset_code, s.send.written()};
@@ -452,7 +488,6 @@ size_t StreamConnection::poll_datagram(uint64_t pn, std::span<uint8_t> out, Inst
                 any               = true;
                 rec.ack_eliciting = true;
             }
-            continue;
         }
         if (s.send_stop && !s.stop_sent) {
             StopSendingFrame f{id, s.send_stop_code};
@@ -462,7 +497,9 @@ size_t StreamConnection::poll_datagram(uint64_t pn, std::span<uint8_t> out, Inst
                 rec.ack_eliciting = true;
             }
         }
-        if (s.recv.should_update_window()) {
+        // No point advertising more room on a stream the peer has stopped
+        // sending on.
+        if (!s.peer_reset && s.recv.should_update_window()) {
             MaxStreamDataFrame f{id, s.recv.max_offset()};
             if (encode_max_stream_data(w, f)) {
                 s.recv.window_announced();
@@ -478,7 +515,11 @@ size_t StreamConnection::poll_datagram(uint64_t pn, std::span<uint8_t> out, Inst
 
     if (cc_ok) {
         for (auto& [id, s] : streams_) {
-            if (s.send_reset || s.peer_reset) continue;
+            // Only our own abort stops us sending. Refusing to send because the
+            // PEER reset deadlocked the stream: we could not push data and could
+            // not push a FIN either, so our send side never completed and the
+            // stream could never retire.
+            if (s.send_reset) continue;
 
             while (w.remaining() > 16) {
                 const size_t overhead = stream_frame_overhead(id, s.send.sent());
@@ -594,6 +635,18 @@ void StreamConnection::on_timeout(Instant now) {
         // it on the first PTO punishes a single late ack far too harshly and
         // makes recovery from ordinary loss glacial.
         if (pto_count_ >= 2) cc_.on_persistent_congestion();
+
+        // Re-arm teardown frames. These are not carried in SentPacket::chunks,
+        // so ordinary loss detection cannot replay them: a dropped
+        // RESET_STREAM or STOP_SENDING would otherwise be lost for good and
+        // strand whichever side was waiting on the answer. A stream still
+        // holding one of these has not been retired, so the exchange is by
+        // definition unfinished.
+        for (auto& [id, s] : streams_) {
+            (void)id;
+            if (s.send_reset) s.reset_sent = false;
+            if (s.send_stop) s.stop_sent = false;
+        }
 
         arm_loss_timer(now);
     }

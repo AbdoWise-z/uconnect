@@ -125,7 +125,19 @@ public:
     // finish. For a one-way transfer open the stream unidirectional -- it then
     // retires as soon as the receiver has drained it.
     void finish();
-    void reset(uint64_t error_code = 0); // abort, discarding anything pending
+
+    // Abort our sending direction, discarding anything pending. On a
+    // bidirectional stream the peer may still send to us; use close() to end
+    // both directions.
+    void reset(uint64_t error_code = 0);
+
+    // End the stream in both directions without needing the other application
+    // to cooperate. The peer is told to stop sending and answers by aborting
+    // its own direction, which is what releases this side.
+    //
+    // This closes a stream, not the connection: the session and every other
+    // stream on this peer keep running.
+    void close(uint64_t error_code = 0);
 
     bool   readable() const;
     size_t readable_bytes() const;

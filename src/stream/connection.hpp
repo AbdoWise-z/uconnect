@@ -108,6 +108,14 @@ public:
     void reset(StreamId, uint64_t error_code);   // abort, discard pending data
     void stop_sending(StreamId, uint64_t error_code);
 
+    // One-sided full teardown: abort our sending direction and ask the peer to
+    // abort its own. The only call that ends a stream in both directions
+    // without the application on the other end cooperating.
+    //
+    // Purely a stream-level operation. The session underneath is untouched and
+    // every other stream on it keeps running.
+    void close(StreamId, uint64_t error_code = 0);
+
     bool   readable(StreamId) const;
     size_t readable_bytes(StreamId) const;
     bool   finished(StreamId) const;

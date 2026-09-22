@@ -94,7 +94,6 @@ struct RelayBinding {
     DevId         b_dev{};
     Endpoint      a_addr{};
     Endpoint      b_addr{};
-    bool          b_bound = false;
     Instant       created{};
     Instant       last_seen{};
     uint64_t      bytes = 0;

@@ -619,7 +619,7 @@ TEST(a_stream_delivers_bytes_intact_over_a_clean_link) {
     Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
 
     auto     data = pattern(50000);
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
     size_t   off  = 0;
     while (off < data.size()) {
         off += a.write(id, std::span(data).subspan(off));
@@ -642,7 +642,7 @@ TEST(a_stream_delivers_bytes_intact_despite_heavy_loss) {
     Link link{a, b, Link::Config{0.20, 10ms, 0ms, 7}};
 
     auto     data = pattern(20000, 3);
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
     size_t   off  = 0;
     for (int round = 0; round < 40 && off < data.size(); ++round) {
         off += a.write(id, std::span(data).subspan(off));
@@ -665,7 +665,7 @@ TEST(a_stream_delivers_bytes_in_order_despite_reordering) {
     Link link{a, b, Link::Config{0.05, 20ms, 18ms, 11}};
 
     auto     data = pattern(20000, 9);
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
     size_t   off  = 0;
     for (int round = 0; round < 40 && off < data.size(); ++round) {
         off += a.write(id, std::span(data).subspan(off));
@@ -687,8 +687,8 @@ TEST(two_streams_are_independent_so_one_stall_does_not_block_the_other) {
     StreamConnection b{fast_cfg(), Role::B};
     Link link{a, b, Link::Config{0.10, 10ms, 0ms, 13}};
 
-    StreamId s1 = a.open();
-    StreamId s2 = a.open();
+    StreamId s1 = *a.open();
+    StreamId s2 = *a.open();
     CHECK(s1 != s2);
 
     auto d1 = pattern(8000, 1);
@@ -717,8 +717,8 @@ TEST(streams_opened_concurrently_by_both_peers_never_collide) {
     StreamConnection b{fast_cfg(), Role::B};
 
     for (int i = 0; i < 10; ++i) {
-        StreamId ida = a.open();
-        StreamId idb = b.open();
+        StreamId ida = *a.open();
+        StreamId idb = *b.open();
         CHECK(ida != idb);
         CHECK(opener(ida) == Role::A);
         CHECK(opener(idb) == Role::B);
@@ -730,7 +730,7 @@ TEST(the_receiver_learns_about_a_stream_it_did_not_open) {
     StreamConnection b{fast_cfg(), Role::B};
     Link link{a, b, Link::Config{0.0, 5ms, 0ms, 17}};
 
-    StreamId id = a.open();
+    StreamId id = *a.open();
     auto     d  = pattern(100);
     a.write(id, d);
     link.advance(200ms);
@@ -749,7 +749,7 @@ TEST(congestion_control_actually_limits_bytes_in_flight) {
     StreamConnection a{fast_cfg(), Role::A};
     StreamConnection b{fast_cfg(), Role::B};
 
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
     auto     data = pattern(200000);
     a.write(id, data);
 
@@ -778,7 +778,7 @@ TEST(flow_control_stops_a_sender_outrunning_a_receiver_that_never_reads) {
     StreamConnection b{cfg, Role::B};
     Link link{a, b, Link::Config{0.0, 5ms, 0ms, 19}};
 
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
     auto     data = pattern(200000);
     size_t   off  = 0;
     for (int round = 0; round < 30; ++round) {
@@ -796,7 +796,7 @@ TEST(a_reset_stream_is_reported_to_the_peer) {
     StreamConnection b{fast_cfg(), Role::B};
     Link link{a, b, Link::Config{0.0, 5ms, 0ms, 23}};
 
-    StreamId id = a.open();
+    StreamId id = *a.open();
     a.write(id, pattern(100));
     link.advance(100ms);
     a.reset(id, 42);
@@ -815,7 +815,7 @@ TEST(a_dead_peer_is_eventually_reported_rather_than_probed_forever) {
     cfg.max_pto_count = 4;
 
     StreamConnection a{cfg, Role::A};
-    StreamId         id = a.open();
+    StreamId         id = *a.open();
     a.write(id, pattern(1000));
 
     // Send into a void: nothing is ever acknowledged.
@@ -845,7 +845,7 @@ TEST(a_large_transfer_costs_a_sane_number_of_packets) {
     Link link{a, b, Link::Config{0.0, 5ms, 0ms, 29}};
 
     auto     data = pattern(100000);
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
     size_t   off  = 0;
     for (int round = 0; round < 100 && off < data.size(); ++round) {
         off += a.write(id, std::span(data).subspan(off));
@@ -880,7 +880,7 @@ TEST(a_transfer_larger_than_the_receive_window_keeps_flowing) {
 
     const size_t total = 128 * 1024;  // eight windows' worth
     auto     data = pattern(total, 5);
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
 
     std::vector<uint8_t> got;
     size_t               off = 0;
@@ -909,7 +909,7 @@ TEST(a_stalled_reader_does_not_lose_data_once_it_resumes) {
 
     const size_t total = 64 * 1024;
     auto     data = pattern(total, 11);
-    StreamId id   = a.open();
+    StreamId id   = *a.open();
 
     size_t off = 0;
     for (int i = 0; i < 20; ++i) {
@@ -929,4 +929,241 @@ TEST(a_stalled_reader_does_not_lose_data_once_it_resumes) {
 
     CHECK_EQ(got.size(), total);
     CHECK(got == data);
+}
+
+// ---------------------------------------------------------------------------
+// Stream lifetime: retirement, the concurrency cap, and the events that were
+// being generated and dropped.
+// ---------------------------------------------------------------------------
+namespace {
+// Collect every event of one kind seen on a connection so far.
+std::vector<StreamEvent> collect(StreamConnection& c, StreamEventKind want) {
+    std::vector<StreamEvent> out;
+    while (auto e = c.poll_event()) {
+        if (e->kind == want) out.push_back(*e);
+    }
+    return out;
+}
+}  // namespace
+
+TEST(a_fully_closed_stream_is_retired_and_reports_closed) {
+    // Before this, streams_ only ever grew: a connection that opened and
+    // finished a million streams held a million buffers until it died.
+    //
+    // A bidirectional stream needs BOTH ends to finish. One side calling
+    // finish() half-closes it; the other direction is still open and the state
+    // is still live, which is why the one-way case below uses a uni stream.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    auto     data = pattern(4000);
+    StreamId id   = *a.open();
+    size_t   off  = 0;
+    while (off < data.size()) {
+        off += a.write(id, std::span(data).subspan(off));
+        link.advance(50ms);
+    }
+    a.finish(id);
+    link.advance(2s);
+
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    CHECK_EQ(got.size(), data.size());
+
+    // Half closed: a's send side is done but its recv side is not.
+    CHECK(a.exists(id));
+    CHECK(b.exists(id));
+
+    b.finish(id);
+    link.advance(2s);
+    drain(b, id, got);
+    link.advance(2s);
+
+    CHECK(!a.exists(id));
+    CHECK(!b.exists(id));
+    CHECK(a.active_streams().empty());
+    CHECK(b.active_streams().empty());
+
+    CHECK_EQ(collect(a, StreamEventKind::Closed).size(), 1u);
+    CHECK_EQ(collect(b, StreamEventKind::Closed).size(), 1u);
+}
+
+TEST(a_unidirectional_stream_retires_when_the_sender_finishes) {
+    // The one-way transfer case: there is no reverse direction to wait on, so
+    // FIN plus a drained receiver is the whole lifecycle.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open(/*bidirectional=*/false);
+    auto data = pattern(4000);
+    size_t off = 0;
+    while (off < data.size()) {
+        off += a.write(id, std::span(data).subspan(off));
+        link.advance(50ms);
+    }
+    a.finish(id);
+    link.advance(2s);
+
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    link.advance(2s);
+
+    CHECK_EQ(got.size(), data.size());
+    CHECK(!a.exists(id));
+    CHECK(!b.exists(id));
+    CHECK_EQ(collect(a, StreamEventKind::Closed).size(), 1u);
+    CHECK_EQ(collect(b, StreamEventKind::Closed).size(), 1u);
+}
+
+TEST(a_retired_stream_is_not_recreated_by_a_late_frame) {
+    // A retransmitted STREAM frame arriving after retirement must not spring
+    // the stream back to life and report a brand new Opened to the peer.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open(/*bidirectional=*/false);
+    a.write(id, pattern(100));
+    a.finish(id);
+    link.advance(2s);
+
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    link.advance(2s);
+    REQUIRE(!b.exists(id));
+
+    // Replay a data frame for the retired id straight into b.
+    (void)collect(b, StreamEventKind::Opened);
+    std::vector<uint8_t> frame(200);
+    wire::Writer w{frame};
+    auto payload = pattern(10);
+    size_t n = encode_stream(w, id, 0, false, payload);
+    REQUIRE(n > 0);
+    b.on_datagram(9999, std::span(frame).first(w.size()), t0() + 10s);
+
+    CHECK(!b.exists(id));
+    CHECK(collect(b, StreamEventKind::Opened).empty());
+}
+
+TEST(a_peer_cannot_conjure_a_stream_under_our_own_role_bit) {
+    // Stream ids carry the opener's role. A frame naming a locally-opened id
+    // we never opened would otherwise be reported to us as our own stream.
+    StreamConnection b{fast_cfg(), Role::B};
+
+    const StreamId forged = make_stream_id(Role::B, true, 7);  // B is us
+    std::vector<uint8_t> frame(200);
+    wire::Writer w{frame};
+    auto payload = pattern(10);
+    REQUIRE(encode_stream(w, forged, 0, false, payload) > 0);
+    b.on_datagram(1, std::span(frame).first(w.size()), t0());
+
+    CHECK(!b.exists(forged));
+    CHECK(collect(b, StreamEventKind::Opened).empty());
+}
+
+TEST(peer_opened_streams_are_capped) {
+    // Without a cap an authenticated peer pins unbounded memory by sending one
+    // byte to each of arbitrarily many stream ids.
+    StreamConfig cfg = fast_cfg();
+    cfg.max_concurrent_streams = 4;
+    StreamConnection b{cfg, Role::B};
+
+    for (uint64_t i = 0; i < 40; ++i) {
+        const StreamId id = make_stream_id(Role::A, true, i);
+        std::vector<uint8_t> frame(200);
+        wire::Writer w{frame};
+        auto payload = pattern(4);
+        REQUIRE(encode_stream(w, id, 0, false, payload) > 0);
+        b.on_datagram(i + 1, std::span(frame).first(w.size()), t0());
+    }
+
+    CHECK_EQ(b.active_streams().size(), 4u);
+    CHECK_EQ(collect(b, StreamEventKind::Opened).size(), 4u);
+}
+
+TEST(the_local_stream_cap_is_enforced_and_released_by_retirement) {
+    StreamConfig cfg = fast_cfg();
+    cfg.max_concurrent_streams = 2;
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId s1 = *a.open(/*bidirectional=*/false);
+    StreamId s2 = *a.open(/*bidirectional=*/false);
+    CHECK(!a.open().has_value());    // cap reached
+
+    // Finish one and let it retire; the slot must come back.
+    a.write(s1, pattern(64));
+    a.finish(s1);
+    link.advance(2s);
+    std::vector<uint8_t> got;
+    drain(b, s1, got);
+    link.advance(2s);
+
+    REQUIRE(!a.exists(s1));
+    CHECK(a.exists(s2));
+    auto s3 = a.open();
+    CHECK(s3.has_value());
+}
+
+TEST(a_peer_reset_is_reported_to_the_application) {
+    // The event was being emitted and then dropped by the api layer, so an
+    // aborted stream just went quiet.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open();
+    a.write(id, pattern(200));
+    link.advance(200ms);
+    std::vector<uint8_t> seen;
+    drain(b, id, seen);          // b now knows the stream
+    REQUIRE(!seen.empty());
+
+    a.reset(id, 42);
+    link.advance(1s);
+
+    auto resets = collect(b, StreamEventKind::Reset);
+    REQUIRE(resets.size() == 1);
+    CHECK_EQ(resets[0].id, id);
+    CHECK_EQ(resets[0].error_code, 42u);
+}
+
+TEST(writable_fires_only_for_a_stream_that_was_actually_blocked) {
+    // Waking every stream on every window update makes Writable noise the
+    // application has to filter itself.
+    StreamConfig cfg = fast_cfg();
+    cfg.stream_recv_window = 4096;
+    cfg.conn_recv_window   = 8192;
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{cfg, Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId blocked = *a.open();
+    StreamId idle    = *a.open();
+
+    // Fill the first stream until it refuses bytes.
+    auto data = pattern(64 * 1024);
+    size_t off = 0;
+    for (int i = 0; i < 40; ++i) {
+        size_t n = a.write(blocked, std::span(data).subspan(off));
+        off += n;
+        link.advance(50ms);
+        if (n == 0) break;
+    }
+    (void)collect(a, StreamEventKind::Writable);
+
+    // Draining on the receiver reopens the window.
+    std::vector<uint8_t> got;
+    for (int i = 0; i < 40; ++i) {
+        drain(b, blocked, got);
+        link.advance(50ms);
+    }
+
+    auto w = collect(a, StreamEventKind::Writable);
+    REQUIRE(!w.empty());
+    for (const auto& e : w) CHECK_EQ(e.id, blocked);   // never the idle stream
+    (void)idle;
 }

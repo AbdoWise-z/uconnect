@@ -27,7 +27,18 @@ const StreamConnection::StreamState* StreamConnection::find(StreamId id) const {
     return it == streams_.end() ? nullptr : &it->second;
 }
 
-StreamId StreamConnection::open(bool bidirectional) {
+size_t StreamConnection::live_streams(Role opened_by) const {
+    size_t n = 0;
+    for (const auto& [id, s] : streams_) {
+        (void)s;
+        if (opener(id) == opened_by) ++n;
+    }
+    return n;
+}
+
+std::optional<StreamId> StreamConnection::open(bool bidirectional) {
+    if (live_streams(role_) >= cfg_.max_concurrent_streams) return std::nullopt;
+
     StreamId id = make_stream_id(role_, bidirectional, next_index_++);
     // The initial peer window is the PER-STREAM default, not the connection
     // window. Both ends run the same config, so they agree on it until the
@@ -37,22 +48,77 @@ StreamId StreamConnection::open(bool bidirectional) {
     // whole connection window for one stream: it overran the receiver's
     // per-stream buffer, which refused the excess and reset the stream. A
     // 512 KB transfer stopped dead at exactly 256 KB.
-    streams_.emplace(id, StreamState{id, cfg_.stream_recv_window, cfg_.stream_recv_window});
+    auto [pos, _] = streams_.emplace(
+        id, StreamState{id, cfg_.stream_recv_window, cfg_.stream_recv_window});
+    // Opened announces a stream the PEER created. Marking ours notified keeps
+    // a later inbound frame for this id from reporting our own stream to us.
+    pos->second.open_notified = true;
     return id;
 }
 
-StreamConnection::StreamState& StreamConnection::ensure_peer_stream(StreamId id, Instant now) {
+StreamConnection::StreamState* StreamConnection::ensure_peer_stream(StreamId id, Instant now) {
     (void)now;
     auto it = streams_.find(id);
-    if (it != streams_.end()) return it->second;
+    if (it != streams_.end()) return &it->second;
 
-    auto [pos, _] = streams_.emplace(
+    // A frame naming a locally-opened stream that is not in the map: it was
+    // either retired, or never opened at all. The second case matters -- without
+    // it the peer can conjure a stream under OUR role bit and have it reported
+    // back to us as one we opened.
+    if (opener(id) == role_) return nullptr;
+
+    if ((id >> 2) < retired_hwm_peer_) return nullptr;   // late frame, retired stream
+
+    if (live_streams(opener(id)) >= cfg_.max_concurrent_streams) return nullptr;
+
+    auto [pos, inserted] = streams_.emplace(
         id, StreamState{id, cfg_.stream_recv_window, cfg_.stream_recv_window});
-    if (!pos->second.open_notified) {
-        pos->second.open_notified = true;
-        emit(StreamEventKind::Opened, id);
+    (void)inserted;
+    pos->second.open_notified = true;
+    emit(StreamEventKind::Opened, id);
+    return &pos->second;
+}
+
+// ---------------------------------------------------------------------------
+// Retirement
+// ---------------------------------------------------------------------------
+bool StreamConnection::side_send_done(const StreamState& s) const {
+    // A unidirectional stream the peer opened has no send side for us.
+    if (!is_bidi(s.id) && opener(s.id) != role_) return true;
+    if (s.peer_reset) return true;               // peer aborted; we stop producing
+    if (s.send_reset) return s.reset_sent;       // we aborted; RESET_STREAM is out
+    return s.send.complete();                    // all data and the FIN are acked
+}
+
+bool StreamConnection::side_recv_done(const StreamState& s) const {
+    // A unidirectional stream we opened has no recv side.
+    if (!is_bidi(s.id) && opener(s.id) == role_) return true;
+    if (s.peer_reset) return true;
+    // recv.finished() means the FIN offset is known AND the application has
+    // consumed everything up to it, so no unread bytes can be dropped here.
+    return s.recv.finished() && s.recv.readable() == 0;
+}
+
+void StreamConnection::retire_done_streams() {
+    for (auto it = streams_.begin(); it != streams_.end();) {
+        StreamState& s = it->second;
+        if (!side_send_done(s) || !side_recv_done(s)) {
+            ++it;
+            continue;
+        }
+        // The application must have been told why the stream ended before the
+        // state backing its handle disappears.
+        if (s.peer_reset && !s.reset_notified) { ++it; continue; }
+        if (!s.peer_reset && s.recv.fin_known() && !s.fin_notified) { ++it; continue; }
+
+        if (opener(it->first) != role_) {
+            const uint64_t index = it->first >> 2;
+            if (index + 1 > retired_hwm_peer_) retired_hwm_peer_ = index + 1;
+        }
+
+        emit(StreamEventKind::Closed, it->first);
+        it = streams_.erase(it);
     }
-    return pos->second;
 }
 
 void StreamConnection::emit(StreamEventKind k, StreamId id, uint64_t code) {
@@ -100,6 +166,9 @@ size_t StreamConnection::read(StreamId id, std::span<uint8_t> out) {
     if (n > 0 && s->recv.finished() && !s->fin_notified) {
         s->fin_notified = true;
         emit(StreamEventKind::Finished, id);
+        // Draining the last bytes can be what completes the stream, and `s` is
+        // invalidated if it is retired here -- do not touch it afterwards.
+        retire_done_streams();
     }
     return n;
 }
@@ -188,6 +257,9 @@ void StreamConnection::on_datagram(uint64_t pn, std::span<const uint8_t> payload
 
     for (const auto& f : scratch_) handle_frame(f, now);
 
+    // Acks and FINs both arrive here, so this is where most streams finish.
+    retire_done_streams();
+
     arm_loss_timer(now);
 }
 
@@ -229,7 +301,9 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
         }
 
         case FrameType::StreamBase: {
-            auto& s = ensure_peer_stream(f.stream.id, now);
+            auto* sp = ensure_peer_stream(f.stream.id, now);
+            if (!sp) break;
+            auto& s = *sp;
             if (s.peer_reset) break;
 
             const size_t before = s.recv.readable();
@@ -238,6 +312,7 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
                 // grow a buffer the peer controls the size of.
                 s.send_reset      = true;
                 s.send_reset_code = 1;
+                s.reset_notified  = true;
                 emit(StreamEventKind::Reset, f.stream.id, 1);
                 break;
             }
@@ -250,26 +325,35 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
         }
 
         case FrameType::ResetStream: {
-            auto& s      = ensure_peer_stream(f.reset.id, now);
-            s.peer_reset = true;
-            emit(StreamEventKind::Reset, f.reset.id, f.reset.error_code);
+            auto* sp = ensure_peer_stream(f.reset.id, now);
+            if (!sp) break;
+            sp->peer_reset = true;
+            if (!sp->reset_notified) {
+                sp->reset_notified = true;
+                emit(StreamEventKind::Reset, f.reset.id, f.reset.error_code);
+            }
             break;
         }
 
         case FrameType::StopSending: {
-            auto& s = ensure_peer_stream(f.stop.id, now);
+            auto* sp = ensure_peer_stream(f.stop.id, now);
+            if (!sp) break;
             // The peer does not want the rest. Stop producing and tell it we
             // have stopped, rather than continuing to burn the window.
-            s.send_reset      = true;
-            s.send_reset_code = f.stop.error_code;
+            sp->send_reset      = true;
+            sp->send_reset_code = f.stop.error_code;
             break;
         }
 
         case FrameType::MaxData: {
             if (f.max_data.max > conn_send_max_) {
                 conn_send_max_ = f.max_data.max;
+                // Only streams that actually hit backpressure. Waking every
+                // stream on every window update turns Writable into noise the
+                // application has to filter itself.
                 for (auto& [id, s] : streams_) {
-                    (void)s;
+                    if (!s.was_blocked) continue;
+                    s.was_blocked = false;
                     emit(StreamEventKind::Writable, id);
                 }
             }
@@ -277,11 +361,12 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
         }
 
         case FrameType::MaxStreamData: {
-            auto& s = ensure_peer_stream(f.max_stream_data.id, now);
-            if (f.max_stream_data.max > s.send.peer_max()) {
-                s.send.set_peer_max(f.max_stream_data.max);
-                if (s.was_blocked) {
-                    s.was_blocked = false;
+            auto* sp = ensure_peer_stream(f.max_stream_data.id, now);
+            if (!sp) break;
+            if (f.max_stream_data.max > sp->send.peer_max()) {
+                sp->send.set_peer_max(f.max_stream_data.max);
+                if (sp->was_blocked) {
+                    sp->was_blocked = false;
                     emit(StreamEventKind::Writable, f.max_stream_data.id);
                 }
             }
@@ -298,12 +383,9 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
 
 void StreamConnection::on_packet_acked(const SentPacket& p) {
     for (const auto& c : p.chunks) {
-        if (auto* s = find(c.stream_id)) {
-            s->send.on_acked(c.offset, c.length);
-            if (s->send.complete() && !s->open_notified) {
-                // nothing further; Closed is emitted from the send path
-            }
-        }
+        // A retired stream is gone from the map; a late ack for it is fine to
+        // drop, the data it covers was already accounted for.
+        if (auto* s = find(c.stream_id)) s->send.on_acked(c.offset, c.length);
     }
 }
 

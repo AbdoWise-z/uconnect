@@ -155,7 +155,6 @@ struct Peer {
     bool          relayed     = false;
     wire::RelayId relay_id    = 0;
     bool          relay_asked = false;
-    Instant       relay_asked_at{};
     // When the non-designated peer should stop waiting for the other end to
     // offer a relay and ask for its own. Zero means "not waiting".
     Instant       relay_backup_at{};
@@ -238,6 +237,9 @@ struct Topic::Impl {
     std::function<void(DevId, uint64_t)>                 on_stream;
     std::function<void(DevId, uint64_t)>                 on_stream_readable;
     std::function<void(DevId, uint64_t)>                 on_stream_finished;
+    std::function<void(DevId, uint64_t)>                 on_stream_writable;
+    std::function<void(DevId, uint64_t, uint64_t)>       on_stream_reset;
+    std::function<void(DevId, uint64_t)>                 on_stream_closed;
 
     const crypto::SymKey* psk() const { return keyed ? &keys.psk : nullptr; }
     const crypto::SymKey* probe_key() const { return keyed ? &keys.probe : nullptr; }
@@ -270,7 +272,6 @@ struct Node::Impl {
     std::atomic<bool> stop{false};
 
     // --- helpers ----------------------------------------------------------
-    void log(const char* fmt, ...) const;
     void send_raw(const Endpoint& to, std::span<const uint8_t> d) {
         sock.send_to(to, d);
     }
@@ -911,9 +912,9 @@ void Node::Impl::send_to_peer(Peer& peer, const Endpoint& to, std::span<const ui
 }
 
 void Node::Impl::request_relay(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
+    (void)now;
     if (peer.relay_asked || !ti.self) return;
-    peer.relay_asked    = true;
-    peer.relay_asked_at = now;
+    peer.relay_asked = true;
 
     uint32_t txn = alloc_txn();
 
@@ -1179,10 +1180,38 @@ void Node::Impl::drive_streams(Topic::Impl& ti, const TopicId& tid, Peer& peer, 
                         });
                 }
                 break;
+            case K::Writable:
+                // Backpressure lifted. Without this an application that got a
+                // short write from Stream::write had no way to learn the window
+                // had reopened except by polling.
+                if (ti.on_stream_writable) {
+                    deferred.push_back(
+                        [cb = ti.on_stream_writable, dev = peer.dev_id, id = e->id] {
+                            cb(dev, id);
+                        });
+                }
+                break;
+            case K::Reset:
+                // The peer aborted, or it overran our window and we tore the
+                // stream down. Either way the bytes stop here and the
+                // application has to be told, or the stream just goes quiet.
+                if (ti.on_stream_reset) {
+                    deferred.push_back([cb = ti.on_stream_reset, dev = peer.dev_id,
+                                        id = e->id, code = e->error_code] {
+                        cb(dev, id, code);
+                    });
+                }
+                break;
+            case K::Closed:
+                if (ti.on_stream_closed) {
+                    deferred.push_back(
+                        [cb = ti.on_stream_closed, dev = peer.dev_id, id = e->id] {
+                            cb(dev, id);
+                        });
+                }
+                break;
             case K::ConnDead:
                 if (peer.sess) peer.sess->close(now);
-                break;
-            default:
                 break;
         }
     }
@@ -1958,8 +1987,11 @@ Stream Topic::open_stream(const DevId& dev, bool bidirectional) {
     // Streams need an established session: the stream layer is created when the
     // handshake completes, because its role depends on which side initiated.
     if (it == impl_->peers.end() || !it->second.streams) return Stream{};
-    StreamId id = it->second.streams->open(bidirectional);
-    return Stream{this, dev, id};
+    // Nullopt means this peer already has max_concurrent_streams open; the
+    // caller gets an invalid handle, same as for an unconnected peer.
+    auto id = it->second.streams->open(bidirectional);
+    if (!id) return Stream{};
+    return Stream{this, dev, *id};
 }
 
 Stream Topic::stream(const DevId& dev, StreamId id) {
@@ -1994,6 +2026,28 @@ void Topic::on_stream_readable(std::function<void(Stream)> cb) {
 void Topic::on_stream_finished(std::function<void(Stream)> cb) {
     std::lock_guard<std::mutex> lk(impl_->node->mu);
     impl_->on_stream_finished = [this, cb = std::move(cb)](DevId dev, uint64_t id) {
+        cb(Stream{this, dev, id});
+    };
+}
+
+void Topic::on_stream_writable(std::function<void(Stream)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_stream_writable = [this, cb = std::move(cb)](DevId dev, uint64_t id) {
+        cb(Stream{this, dev, id});
+    };
+}
+
+void Topic::on_stream_reset(std::function<void(Stream, uint64_t)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_stream_reset = [this, cb = std::move(cb)](DevId dev, uint64_t id,
+                                                        uint64_t code) {
+        cb(Stream{this, dev, id}, code);
+    };
+}
+
+void Topic::on_stream_closed(std::function<void(Stream)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_stream_closed = [this, cb = std::move(cb)](DevId dev, uint64_t id) {
         cb(Stream{this, dev, id});
     };
 }

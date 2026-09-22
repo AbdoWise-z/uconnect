@@ -58,6 +58,14 @@ struct StreamConfig {
     // Consecutive probe timeouts before the connection is declared dead.
     uint32_t max_pto_count = 6;
 
+    // Cap on live PEER-opened streams. The peer decides how many stream ids it
+    // puts on the wire, and each one costs a recv and a send buffer, so without
+    // this an authenticated peer can pin unbounded memory just by sending one
+    // byte to each of a few million stream ids.
+    //
+    // Frames for streams beyond the cap are dropped rather than answered: any
+    // reply would need per-id state, which is the thing being rationed. A
+    // well-behaved peer never reaches the cap.
     uint64_t max_concurrent_streams = 64;
 };
 
@@ -67,7 +75,7 @@ enum class StreamEventKind : uint8_t {
     Writable,    // flow control opened up after being blocked
     Finished,    // peer sent FIN and all data has been delivered
     Reset,       // peer aborted the stream
-    Closed,      // stream fully done, both directions
+    Closed,      // stream fully done, both directions; state has been retired
     ConnDead,    // the whole connection failed (idle or too many PTOs)
 };
 
@@ -84,7 +92,9 @@ public:
     StreamConnection(StreamConfig cfg, Role role);
 
     // --- application side --------------------------------------------------
-    StreamId open(bool bidirectional = true);
+    // Nullopt when max_concurrent_streams locally-opened streams are already
+    // live. Retiring a finished stream frees a slot.
+    std::optional<StreamId> open(bool bidirectional = true);
 
     // Returns bytes accepted. A short count means flow control or the send cap
     // is applying backpressure; wait for a Writable event.
@@ -148,10 +158,11 @@ private:
         uint64_t send_stop_code  = 0;
         bool     stop_sent       = false;
 
-        bool peer_reset   = false;
-        bool was_blocked  = false;
-        bool fin_notified = false;
-        bool open_notified = false;
+        bool peer_reset     = false;
+        bool was_blocked    = false;
+        bool fin_notified   = false;
+        bool open_notified  = false;
+        bool reset_notified = false;
 
         StreamState(StreamId i, uint64_t recv_window, uint64_t peer_window)
             : id(i), recv(recv_window), send(peer_window) {}
@@ -159,7 +170,19 @@ private:
 
     StreamState* find(StreamId);
     const StreamState* find(StreamId) const;
-    StreamState& ensure_peer_stream(StreamId, Instant now);
+
+    // Null when the frame must be ignored: the id is over the peer's stream
+    // cap, names a locally-opened stream we never opened, or refers to one
+    // already retired. Callers drop the frame.
+    StreamState* ensure_peer_stream(StreamId, Instant now);
+
+    // A stream is retired once both directions are done and the application
+    // has been told. Without this, streams_ grows for the life of the
+    // connection and the stream cap could only ever be hit once.
+    bool side_send_done(const StreamState&) const;
+    bool side_recv_done(const StreamState&) const;
+    void retire_done_streams();
+    size_t live_streams(Role opened_by) const;
 
     void handle_frame(const Frame&, Instant now);
     void on_packet_acked(const SentPacket&);
@@ -173,6 +196,13 @@ private:
 
     std::map<StreamId, StreamState> streams_;
     uint64_t                        next_index_ = 0;
+
+    // Retirement high-water mark for peer-opened streams. Indices are handed
+    // out monotonically, so an id below the mark that is absent from the map is
+    // a late frame for a retired stream, not a new one. A single counter, not
+    // per-id tombstones, which would be unbounded again. Locally-opened ids
+    // need no mark: an absent one is always refused.
+    uint64_t retired_hwm_peer_ = 0;
 
     RttEstimator rtt_;
     Congestion   cc_;

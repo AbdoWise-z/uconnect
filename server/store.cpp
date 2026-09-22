@@ -584,9 +584,10 @@ std::optional<Endpoint> Store::relay_forward(wire::RelayId id, const Endpoint& s
         ++stats_.rej_relay_unknown;
         return std::nullopt;
     }
-    b.a_addr  = ait->second.bound_addr;
-    b.b_addr  = bit->second.bound_addr;
-    b.b_bound = true;
+    // Both endpoints are resolved from the live registry on every forward, so
+    // a rebinding peer keeps working and no "is B here yet" flag is needed.
+    b.a_addr = ait->second.bound_addr;
+    b.b_addr = bit->second.bound_addr;
 
     std::optional<Endpoint> dst;
     if (src == b.a_addr) dst = b.b_addr;

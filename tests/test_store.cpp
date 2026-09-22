@@ -919,8 +919,8 @@ TEST(relay_enforces_a_bandwidth_ceiling) {
 TEST(relay_bindings_expire_when_idle) {
     StoreConfig cfg;
     cfg.relay_expiry = 90s;
-    auto s  = make_store(cfg);
-    auto rp = make_relay(s);
+    auto s = make_store(cfg);
+    make_relay(s);   // this test watches the count, not the binding
     CHECK_EQ(s.relay_count(), 1u);
 
     s.sweep(t0() + 30s);

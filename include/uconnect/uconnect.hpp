@@ -120,7 +120,11 @@ public:
     // they were written. Returns bytes copied; 0 means nothing is ready yet.
     size_t read(std::span<uint8_t> out);
 
-    void finish();                       // half-close: no more writes from us
+    // Half-close: no more writes from us. On a bidirectional stream the other
+    // direction stays open, so the stream is only released once BOTH ends
+    // finish. For a one-way transfer open the stream unidirectional -- it then
+    // retires as soon as the receiver has drained it.
+    void finish();
     void reset(uint64_t error_code = 0); // abort, discarding anything pending
 
     bool   readable() const;
@@ -185,6 +189,8 @@ public:
 
     // --- streams -----------------------------------------------------------
     // Reliable and ordered. Available once a peer reaches PeerState::Connected.
+    // Returns an invalid handle if the peer is not connected, or if this peer
+    // already has the configured maximum number of streams open.
     Stream open_stream(const DevId&, bool bidirectional = true);
     Stream stream(const DevId&, StreamId);          // handle to an existing one
     std::vector<StreamId> streams(const DevId&) const;
@@ -198,6 +204,18 @@ public:
     void on_stream(std::function<void(Stream)>);
     void on_stream_readable(std::function<void(Stream)>);
     void on_stream_finished(std::function<void(Stream)>);
+
+    // Flow control reopened after a short write. Retry the write from here
+    // rather than polling writable() on a timer.
+    void on_stream_writable(std::function<void(Stream)>);
+
+    // The stream was aborted -- by the peer, or by us because the peer overran
+    // the receive window. No further bytes will arrive on it.
+    void on_stream_reset(std::function<void(Stream, uint64_t error_code)>);
+
+    // Both directions are done and the state behind the handle has been
+    // released. The handle stays safe to call; it just reports empty.
+    void on_stream_closed(std::function<void(Stream)>);
 
     // --- policy ------------------------------------------------------------
     void set_max_peers(size_t);

@@ -14,6 +14,7 @@
 #include "uconnect/uconnect.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <condition_variable>
 #include <cstring>
 #include <map>
@@ -54,6 +55,18 @@ struct TopicIdLess {
 };
 
 constexpr auto kProbeMemory = 30s;  // how long an answered probe_txn stays usable
+
+// One byte at the front of every session payload says which of the two
+// transports it belongs to.
+//
+// Both share the session, so without a discriminator a raw application
+// datagram gets handed to the stream layer, parsed as frames, and dropped as
+// malformed -- which is exactly what happened the first time these were wired
+// together: peers connected and no message ever arrived.
+namespace payload_kind {
+inline constexpr uint8_t kDatagram = 0x00;  // unreliable, delivered as-is
+inline constexpr uint8_t kStream   = 0x01;  // stream frames
+}  // namespace payload_kind
 
 }  // namespace
 
@@ -367,7 +380,22 @@ void Node::Impl::pump(Instant now) {
         (void)txn;
         if (p.done || !p.rebuild) continue;
         if (p.attempts >= kMaxAttempts) continue;
-        if (p.last_sent != Instant{} && now - p.last_sent < kRetransmit) continue;
+
+        // The request was already sent directly by whoever created it; this is
+        // the first time the loop has seen it. Record when, and wait.
+        //
+        // Without this the default-constructed timestamp read as "never sent"
+        // and every request went out a second time within ~20ms. For REGISTER
+        // that was quietly destructive: the server registered twice and issued
+        // a fresh lease token for the second one, while the client kept the
+        // first -- so every MAC afterwards failed with bad auth. It stayed
+        // hidden because punching does not depend on those MACs.
+        if (p.last_sent == Instant{}) {
+            p.last_sent = now;
+            continue;
+        }
+
+        if (now - p.last_sent < kRetransmit) continue;
         auto again = p.rebuild(cookie);
         if (again.empty()) continue;
         send_raw(server, again);
@@ -482,6 +510,10 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
         case wire::MsgType::Error: {
             auto e = wire::Error::decode(r);
             p.error = e ? e->code : ErrorCode::BadRequest;
+            if (cfg.verbose) {
+                std::fprintf(stderr, "[uconnect] server error txn=%u: %s\n", h->txn_id,
+                             to_string(p.error));
+            }
             p.done  = true;
             cv.notify_all();
             return;
@@ -830,6 +862,11 @@ void Node::Impl::request_relay(Topic::Impl& ti, const TopicId& tid, Peer& peer, 
     Pending p;
     p.expect     = wire::MsgType::RelayAllocOk;
     pending[txn] = std::move(p);
+    if (cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] RelayAlloc txn=%u seq=%llu peer=%s\n", txn,
+                     static_cast<unsigned long long>(m.auth.seq),
+                     to_hex(peer.dev_id).substr(0, 8).c_str());
+    }
     send_raw(server, buf);
     (void)now;
 }
@@ -939,14 +976,16 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     break;
                 }
                 case K::Data:
-                    // A datagram carries stream frames when the stream layer is
-                    // up; otherwise it is a raw application message. Both are
-                    // supported so send() keeps working unchanged.
-                    if (peer.streams && !e->data.empty()) {
-                        peer.streams->on_datagram(e->packet_number, e->data, now);
+                    // The leading byte says which transport this belongs to.
+                    if (e->data.empty()) break;
+                    if (e->data[0] == payload_kind::kStream && peer.streams) {
+                        peer.streams->on_datagram(
+                            e->packet_number,
+                            std::span<const uint8_t>(e->data).subspan(1), now);
                     } else if (ti.on_data) {
                         deferred.push_back([cb = ti.on_data, dev = peer.dev_id,
-                                            bytes = e->data] {
+                                            bytes = std::vector<uint8_t>(
+                                                e->data.begin() + 1, e->data.end())] {
                             cb(dev, bytes);
                         });
                     }
@@ -988,15 +1027,19 @@ void Node::Impl::drive_streams(Topic::Impl& ti, const TopicId& tid, Peer& peer, 
 
     // Bounded per pass so one busy peer cannot starve the others on this loop
     // iteration; the congestion window is the real limit.
+    //
+    // Byte 0 carries the payload tag and the stream layer writes from byte 1,
+    // so the receiver can tell stream frames from a raw application datagram.
     std::vector<uint8_t> buf(1200);
+    buf[0] = payload_kind::kStream;
     for (int i = 0; i < 32; ++i) {
         // The stream layer records the packet number in its loss-recovery
         // tables, so it must know the number BEFORE building the payload that
         // will be acknowledged under it.
         const uint64_t pn = peer.sess->next_send_counter();
-        size_t n = peer.streams->poll_datagram(pn, buf, now);
+        size_t n = peer.streams->poll_datagram(pn, std::span(buf).subspan(1), now);
         if (n == 0) break;
-        if (!peer.sess->send(std::span(buf).first(n), now)) break;
+        if (!peer.sess->send(std::span(buf).first(n + 1), now)) break;
         while (auto o = peer.sess->poll_transmit()) send_to_peer(peer, o->to, o->data);
     }
 
@@ -1294,6 +1337,26 @@ void Topic::connect(const DevId& dev) {
     if (it->second.sess || it->second.punch) return;
 
     auto now = std::chrono::steady_clock::now();
+
+    if (n.cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] connect %s relay=%d self=%d cands=%zu\n",
+                     to_hex(dev).substr(0, 8).c_str(), n.cfg.force_relay ? 1 : 0,
+                     impl_->self.has_value() ? 1 : 0, it->second.cands.size());
+    }
+
+    if (n.cfg.force_relay) {
+        // Straight to the relay, no probing. Only the designated initiator
+        // allocates, same tie-break as everywhere else.
+        const bool we_allocate =
+            impl_->self && std::memcmp(impl_->self->data(), dev.data(), kDevIdLen) < 0;
+        if (we_allocate) {
+            n.request_relay(*impl_, impl_->creds.id, it->second, now);
+        } else if (n.cfg.verbose) {
+            std::fprintf(stderr, "[uconnect]   waiting for peer to offer a relay\n");
+        }
+        return;
+    }
+
     // Tell them to punch back at the same moment; without this they have no
     // reason to open their NAT toward us.
     n.send_connect_relay(*impl_, impl_->creds.id, dev, now);
@@ -1357,7 +1420,12 @@ bool Topic::send(const DevId& dev, std::span<const uint8_t> payload) {
     auto it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.sess) return false;
     auto now = std::chrono::steady_clock::now();
-    if (!it->second.sess->send(payload, now)) return false;
+
+    std::vector<uint8_t> framed;
+    framed.reserve(payload.size() + 1);
+    framed.push_back(payload_kind::kDatagram);
+    framed.insert(framed.end(), payload.begin(), payload.end());
+    if (!it->second.sess->send(framed, now)) return false;
     while (auto o = it->second.sess->poll_transmit()) n.send_raw(o->to, o->data);
     return true;
 }

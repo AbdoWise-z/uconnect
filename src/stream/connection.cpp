@@ -29,7 +29,15 @@ const StreamConnection::StreamState* StreamConnection::find(StreamId id) const {
 
 StreamId StreamConnection::open(bool bidirectional) {
     StreamId id = make_stream_id(role_, bidirectional, next_index_++);
-    streams_.emplace(id, StreamState{id, cfg_.stream_recv_window, conn_send_max_});
+    // The initial peer window is the PER-STREAM default, not the connection
+    // window. Both ends run the same config, so they agree on it until the
+    // first MAX_STREAM_DATA arrives.
+    //
+    // Seeding this from conn_send_max_ instead let a sender believe it had the
+    // whole connection window for one stream: it overran the receiver's
+    // per-stream buffer, which refused the excess and reset the stream. A
+    // 512 KB transfer stopped dead at exactly 256 KB.
+    streams_.emplace(id, StreamState{id, cfg_.stream_recv_window, cfg_.stream_recv_window});
     return id;
 }
 
@@ -38,8 +46,8 @@ StreamConnection::StreamState& StreamConnection::ensure_peer_stream(StreamId id,
     auto it = streams_.find(id);
     if (it != streams_.end()) return it->second;
 
-    auto [pos, _] = streams_.emplace(id, StreamState{id, cfg_.stream_recv_window,
-                                                     conn_send_max_});
+    auto [pos, _] = streams_.emplace(
+        id, StreamState{id, cfg_.stream_recv_window, cfg_.stream_recv_window});
     if (!pos->second.open_notified) {
         pos->second.open_notified = true;
         emit(StreamEventKind::Opened, id);

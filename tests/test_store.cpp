@@ -823,19 +823,44 @@ TEST(a_relay_forwards_between_exactly_two_addresses) {
     auto rp = make_relay(s);
     REQUIRE(rp.id != 0);
 
-    // The allocating peer holds slot A. Its first datagram has nowhere to go
-    // until the far side shows up.
-    CHECK(!s.relay_forward(rp.id, ep(7, 4000), 100, t0()).has_value());
-
-    // The peer arrives and claims slot B; its datagram goes to A.
-    auto to_a = s.relay_forward(rp.id, ep(8, 5000), 100, t0());
-    REQUIRE(to_a.has_value());
-    CHECK(*to_a == ep(7, 4000));
-
-    // Now traffic flows both ways.
+    // Either peer may speak first. Both addresses come from their
+    // registrations, so neither has to announce itself to the relay before it
+    // can be reached.
+    //
+    // This matters more than it looks: an earlier version required the far
+    // side to claim its slot with a datagram, which deadlocked. The allocator
+    // could not send until its peer spoke, and the peer had nothing to say
+    // until it received the handshake.
     auto to_b = s.relay_forward(rp.id, ep(7, 4000), 100, t0());
     REQUIRE(to_b.has_value());
     CHECK(*to_b == ep(8, 5000));
+
+    auto to_a = s.relay_forward(rp.id, ep(8, 5000), 100, t0());
+    REQUIRE(to_a.has_value());
+    CHECK(*to_a == ep(7, 4000));
+}
+
+TEST(a_relay_follows_a_peer_that_rebinds) {
+    // Addresses are read from the registry on every datagram, so a NAT rebind
+    // mid-transfer is picked up automatically once the keepalive lands.
+    auto s  = make_store();
+    auto rp = make_relay(s);
+
+    auto ka  = build_keepalive(rp.b.dev_id, 1, rp.b.lease_token);
+    auto res = s.keepalive(rp.b.dev_id, 1, ka.authed(),
+                           mac_over(rp.b.lease_token, ka.authed()), ep(9, 7777), t0() + 5s);
+    REQUIRE(res.code == ErrorCode::None);
+
+    auto to_b = s.relay_forward(rp.id, ep(7, 4000), 100, t0() + 6s);
+    REQUIRE(to_b.has_value());
+    CHECK(*to_b == ep(9, 7777));  // followed the move
+}
+
+TEST(a_relay_dies_when_a_peer_lets_its_registration_lapse) {
+    auto s  = make_store();
+    auto rp = make_relay(s);
+    s.sweep(t0() + 200s);  // both records expire
+    CHECK(!s.relay_forward(rp.id, ep(7, 4000), 100, t0() + 200s).has_value());
 }
 
 TEST(a_third_party_cannot_hijack_a_bound_relay) {
@@ -966,4 +991,45 @@ TEST(relay_data_is_forwarded_opaquely_by_the_service) {
     REQUIRE(fwd.has_value());
     CHECK(fwd->relay_id == rp.id);
     CHECK(fwd->payload == secret);
+}
+
+TEST(relay_alloc_over_the_service_authenticates_the_same_way_a_client_signs_it) {
+    // Builds the RelayAlloc datagram byte-for-byte the way the client does, so
+    // a mismatch between how the client signs and how the server verifies
+    // shows up here rather than as a silent auth rejection on the wire.
+    auto       s = make_store();
+    UdpService svc{s};
+
+    auto a = s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    auto b = s.register_entry(reg_msg(topic_of(1)), ep(8, 5000), t0());
+
+    std::vector<uint8_t> buf(wire::kMaxDatagram);
+    wire::Writer         w{buf};
+    wire::Header{wire::MsgType::RelayAlloc, wire::kVersion, 0, 1}.encode(w);
+    wire::RelayAlloc m;
+    m.from_dev   = a.dev_id;
+    m.peer_dev   = b.dev_id;
+    m.auth.seq   = 1;
+    m.encode_prefix(w);
+    w.array(mac_over(a.lease_token, w.written()));
+    REQUIRE(w.ok());
+    buf.resize(w.size());
+
+    auto out = svc.handle(ep(7, 4000), buf, t0());
+    REQUIRE(out.size() == 1);
+
+    wire::Reader r{out[0].data};
+    auto h = wire::Header::decode(r);
+    REQUIRE(h.has_value());
+    if (h->type == wire::MsgType::Error) {
+        auto e = wire::Error::decode(r);
+        ::testing::fail(__FILE__, __LINE__,
+                        std::string("RelayAlloc rejected: ") +
+                            (e ? to_string(e->code) : "?"));
+        return;
+    }
+    CHECK(h->type == wire::MsgType::RelayAllocOk);
+    auto ok = wire::RelayAllocOk::decode(r);
+    REQUIRE(ok.has_value());
+    CHECK(ok->relay_id != 0);
 }

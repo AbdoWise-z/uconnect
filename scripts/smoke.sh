@@ -52,5 +52,27 @@ grep -q "<- .*hello from alice" /tmp/uc-bob.log   || { echo "FAIL: bob got no me
 [ "$RA" -eq 0 ] || { echo "FAIL: alice exit $RA"; FAIL=1; }
 [ "$RB" -eq 0 ] || { echo "FAIL: bob exit $RB"; FAIL=1; }
 
+# Two peers publishing once each should produce exactly two registrations, and
+# no authentication rejections at all.
+#
+# Both checks exist because of one bug that hid behind a passing smoke test: a
+# spurious retransmission registered every client twice, the server rotated the
+# lease token on the second registration, and every authenticated message
+# afterwards failed. Punching does not depend on those MACs, so peers still
+# connected and still exchanged messages -- nothing looked wrong until the
+# relay, which does depend on them, refused to work at all.
+STATS="$("$DEMO" --server "127.0.0.1:$UC_PORT" --stats 2>/dev/null || true)"
+echo "=== server stats ==="; echo "$STATS"
+
+REGS="$(echo "$STATS" | grep -o 'registers=[0-9]*' | cut -d= -f2)"
+AUTH="$(echo "$STATS" | grep -o 'auth=[0-9]*' | cut -d= -f2)"
+
+[ "${AUTH:-0}" = "0" ] || { echo "FAIL: $AUTH authentication rejection(s) -- lease drift"; FAIL=1; }
+# 3 = alice + bob + the helper that created the topic.
+if [ -n "$REGS" ] && [ "$REGS" -gt 3 ]; then
+    echo "FAIL: $REGS registrations for 3 publishers -- requests are being duplicated"
+    FAIL=1
+fi
+
 if [ "$FAIL" -eq 0 ]; then echo; echo "SMOKE TEST PASSED"; else echo; echo "SMOKE TEST FAILED"; fi
 exit $FAIL

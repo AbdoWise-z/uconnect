@@ -238,6 +238,14 @@ public:
         uint16_t             bind_port = 0;     // 0 = ephemeral
         std::chrono::seconds keepalive{20};
         size_t               max_total_peers = 64;
+
+        // Skip punching and go straight to the relay. Normally the relay is a
+        // fallback taken only after probing fails, but forcing it is the only
+        // practical way to exercise that path from a network where punching
+        // happens to work -- and it is what a peer on a known-symmetric NAT
+        // would want anyway, to avoid wasting seconds on probes that cannot
+        // succeed.
+        bool                 force_relay     = false;
         bool                 verbose         = false;
     };
 

@@ -21,3 +21,13 @@ if (UCONNECT_BUILD_SERVER AND UNIX OR MINGW)
              COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/smoke.sh)
     set_tests_properties(uconnect_smoke PROPERTIES TIMEOUT 90 LABELS "e2e")
 endif()
+
+# Reliable streams over both paths a peer can take: directly punched, and
+# relayed through the rendezvous server. Transfers a megabyte each way and
+# verifies every byte. Slower than the smoke test above, so it is labelled
+# separately: ctest -L e2e runs both, ctest -LE slow skips this one.
+if (UCONNECT_BUILD_SERVER AND UNIX OR MINGW)
+    add_test(NAME uconnect_stream_smoke
+             COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/stream-smoke.sh)
+    set_tests_properties(uconnect_stream_smoke PROPERTIES TIMEOUT 400 LABELS "e2e;slow")
+endif()

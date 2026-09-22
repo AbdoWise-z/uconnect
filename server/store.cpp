@@ -563,28 +563,46 @@ std::optional<Endpoint> Store::relay_forward(wire::RelayId id, const Endpoint& s
         return std::nullopt;
     }
 
+    // Resolve both endpoints from the live registry rather than from whoever
+    // spoke first.
+    //
+    // Two reasons. It removes a deadlock: an earlier version let the first
+    // datagram from a new address claim the far slot, so the allocator could
+    // not send until its peer spoke, and the peer had nothing to say until it
+    // received the handshake -- neither side could start. And it is stronger,
+    // because both addresses now come from authenticated registrations instead
+    // of from possession of the relay id, so knowing the id is not enough to
+    // insert yourself into someone else's binding.
+    //
+    // Reading them fresh each time also means a NAT rebind is picked up
+    // automatically: the keepalive updates the record, and the next relayed
+    // datagram follows it.
+    auto ait = by_dev_.find(b.a_dev);
+    auto bit = by_dev_.find(b.b_dev);
+    if (ait == by_dev_.end() || bit == by_dev_.end()) {
+        // One of the peers let its registration lapse. The binding is dead.
+        ++stats_.rej_relay_unknown;
+        return std::nullopt;
+    }
+    b.a_addr  = ait->second.bound_addr;
+    b.b_addr  = bit->second.bound_addr;
+    b.b_bound = true;
+
+    std::optional<Endpoint> dst;
+    if (src == b.a_addr) dst = b.b_addr;
+    else if (src == b.b_addr) dst = b.a_addr;
+
+    if (!dst) {
+        // A stranger who learned the id. Drop it: the payload is Noise
+        // protected anyway, so this only stops it wasting our bandwidth.
+        ++stats_.rej_relay_unknown;
+        return std::nullopt;
+    }
+
     b.last_seen = now;
     b.bytes += bytes;
     stats_.relay_bytes += bytes;
-
-    if (src == b.a_addr) {
-        if (!b.b_bound) return std::nullopt;  // nobody on the far side yet
-        return b.b_addr;
-    }
-    if (b.b_bound && src == b.b_addr) return b.a_addr;
-
-    // First datagram from a second address claims slot B. Knowing the relay id
-    // is what authorises this; it reached the peer over an authenticated
-    // CONNECT relay and is 64 unguessable bits.
-    //
-    // Worst case if an id leaks is denial of service on this one binding: the
-    // payload is Noise-protected, so an impostor cannot read or inject traffic.
-    if (!b.b_bound) {
-        b.b_bound = true;
-        b.b_addr  = src;
-        return b.a_addr;
-    }
-    return std::nullopt;
+    return dst;
 }
 
 size_t Store::sweep(Instant now) {

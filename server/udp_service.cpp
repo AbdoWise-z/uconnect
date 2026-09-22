@@ -38,21 +38,38 @@ Reply UdpService::make_error(const Endpoint& to, uint32_t txn_id, ErrorCode code
     return encode(to, wire::MsgType::Error, txn_id, e);
 }
 
-bool UdpService::consume_budget(const Endpoint& from, size_t bytes, Instant now) {
-    auto& b = buckets_[from.ip.bytes];
+namespace {
+
+// Token bucket, shared by the two independent budgets below.
+template <typename Bucket>
+bool take_tokens(Bucket& b, size_t bytes, size_t rate, size_t burst, Instant now) {
     if (b.last == Instant{}) {
-        b.tokens = static_cast<double>(cfg_.rate_burst_bytes);
+        b.tokens = static_cast<double>(burst);
         b.last   = now;
     }
-    auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - b.last).count();
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now - b.last).count();
     b.last = now;
-    b.tokens += elapsed * static_cast<double>(cfg_.rate_bytes_per_sec);
-    if (b.tokens > static_cast<double>(cfg_.rate_burst_bytes)) {
-        b.tokens = static_cast<double>(cfg_.rate_burst_bytes);
-    }
+    b.tokens += elapsed * static_cast<double>(rate);
+    if (b.tokens > static_cast<double>(burst)) b.tokens = static_cast<double>(burst);
     if (b.tokens < static_cast<double>(bytes)) return false;
     b.tokens -= static_cast<double>(bytes);
     return true;
+}
+
+}  // namespace
+
+bool UdpService::consume_budget(const Endpoint& from, size_t bytes, Instant now) {
+    return take_tokens(buckets_[from.ip.bytes], bytes, cfg_.rate_bytes_per_sec,
+                       cfg_.rate_burst_bytes, now);
+}
+
+// Relayed payload draws on a separate, larger budget. Sharing the signaling
+// bucket capped every relayed transfer at the signaling rate -- slow with no
+// error and no counter to explain it.
+bool UdpService::consume_relay_budget(const Endpoint& from, size_t bytes, Instant now) {
+    return take_tokens(relay_buckets_[from.ip.bytes], bytes, cfg_.relay_bytes_per_sec,
+                       cfg_.relay_burst_bytes, now);
 }
 
 std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint8_t> dgram,
@@ -287,7 +304,7 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             // is not amplification -- the reply goes to a third party, not back
             // to a potentially spoofed source -- but it is the one path where
             // the server spends bandwidth on someone else's behalf.
-            if (!consume_budget(from, m->payload.size(), now)) return out;
+            if (!consume_relay_budget(from, m->payload.size(), now)) return out;
 
             wire::RelayData fwd;
             fwd.relay_id = m->relay_id;

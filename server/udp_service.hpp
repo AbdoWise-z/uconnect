@@ -23,6 +23,17 @@ struct ServiceConfig {
     // returns 200 bytes.
     size_t   rate_bytes_per_sec = 256 * 1024;
     size_t   rate_burst_bytes   = 1024 * 1024;
+
+    // Relayed payload gets its own budget rather than sharing the signaling
+    // one. Signaling is small and bursty; a relay carries a whole session, and
+    // charging it against a limit sized for lookups silently throttles every
+    // relayed transfer to the signaling rate -- slowness with no error and no
+    // counter to point at.
+    //
+    // Still bounded, because a relay is a fallback for a hard NAT rather than
+    // a general purpose tunnel, and the operator is paying for this traffic.
+    size_t   relay_bytes_per_sec = 4 * 1024 * 1024;
+    size_t   relay_burst_bytes   = 8 * 1024 * 1024;
     uint8_t  max_pages          = 8;
 };
 
@@ -53,6 +64,7 @@ private:
     Reply make_error(const Endpoint&, uint32_t txn_id, ErrorCode);
 
     bool consume_budget(const Endpoint&, size_t bytes, Instant now);
+    bool consume_relay_budget(const Endpoint&, size_t bytes, Instant now);
 
     template <typename T>
     Reply encode(const Endpoint& to, wire::MsgType type, uint32_t txn_id, const T& msg,
@@ -76,6 +88,7 @@ private:
     Store&        store_;
     ServiceConfig cfg_;
     std::unordered_map<std::array<uint8_t, 16>, Bucket, IpHash> buckets_;
+    std::unordered_map<std::array<uint8_t, 16>, Bucket, IpHash> relay_buckets_;
 };
 
 }  // namespace uconnect::server

@@ -862,3 +862,71 @@ TEST(a_large_transfer_costs_a_sane_number_of_packets) {
     // Allow generous headroom for acks and window updates, but catch a blowup.
     CHECK(a.packets_sent() < 400u);
 }
+
+TEST(a_transfer_larger_than_the_receive_window_keeps_flowing) {
+    // Every other end-to-end test here moves less than one receive window, so
+    // none of them exercised the window actually sliding. That gap hid a real
+    // bug: the sender seeded its per-stream limit from the CONNECTION window,
+    // believed it had four times the room it really had, overran the
+    // receiver's buffer and got the stream reset -- a 512 KB transfer stopping
+    // dead at exactly 256 KB.
+    StreamConfig cfg = fast_cfg();
+    cfg.stream_recv_window = 16 * 1024;   // small, so the window must slide often
+    cfg.conn_recv_window   = 256 * 1024;  // deliberately much larger
+
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{cfg, Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 31}};
+
+    const size_t total = 128 * 1024;  // eight windows' worth
+    auto     data = pattern(total, 5);
+    StreamId id   = a.open();
+
+    std::vector<uint8_t> got;
+    size_t               off = 0;
+    for (int round = 0; round < 400 && got.size() < total; ++round) {
+        if (off < data.size()) off += a.write(id, std::span(data).subspan(off));
+        link.advance(50ms);
+        drain(b, id, got);   // the reader is what makes the window slide
+    }
+    a.finish(id);
+    link.advance(5s);
+    drain(b, id, got);
+
+    CHECK_EQ(got.size(), total);
+    CHECK(got == data);
+}
+
+TEST(a_stalled_reader_does_not_lose_data_once_it_resumes) {
+    // Backpressure must be recoverable, not fatal: a receiver that stops
+    // reading for a while should still get every byte when it starts again.
+    StreamConfig cfg = fast_cfg();
+    cfg.stream_recv_window = 8 * 1024;
+
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{cfg, Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 37}};
+
+    const size_t total = 64 * 1024;
+    auto     data = pattern(total, 11);
+    StreamId id   = a.open();
+
+    size_t off = 0;
+    for (int i = 0; i < 20; ++i) {
+        if (off < data.size()) off += a.write(id, std::span(data).subspan(off));
+        link.advance(50ms);   // b reads nothing: the window closes
+    }
+
+    std::vector<uint8_t> got;
+    for (int round = 0; round < 400 && got.size() < total; ++round) {
+        if (off < data.size()) off += a.write(id, std::span(data).subspan(off));
+        link.advance(50ms);
+        drain(b, id, got);
+    }
+    a.finish(id);
+    link.advance(5s);
+    drain(b, id, got);
+
+    CHECK_EQ(got.size(), total);
+    CHECK(got == data);
+}

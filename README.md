@@ -5,6 +5,11 @@ the way. Two devices sharing a topic and a secret find each other through a
 rendezvous server, punch through NAT, and talk over an authenticated,
 forward-secret channel the server cannot read or impersonate.
 
+When both ends sit behind symmetric NAT, punching cannot work and the server
+stays in the path as a relay — but only as a pipe. It forwards ciphertext it
+cannot decrypt, on a session negotiated end to end, so the trust model does not
+change when the route does.
+
 ```cpp
 uconnect::Node node{"rv.example.com:4433"};
 node.run_in_background();
@@ -15,7 +20,12 @@ auto& topic = node.join(uconnect::TopicCreds::parse(
 topic.on_data([](auto dev, auto bytes) { /* ... */ });
 topic.publish(meta);       // become findable
 topic.connect_all(8);      // LOOKUP -> punch -> Noise handshake
-topic.broadcast(payload);
+topic.broadcast(payload);  // unreliable datagram
+
+// ...or a reliable ordered stream, when delivery matters
+auto s = topic.open_stream(dev);
+s.write(bytes);
+s.finish();
 ```
 
 ## The two values
@@ -152,8 +162,20 @@ is later gated on.
 **Symmetric NAT on both ends defeats punching**, and the test suite asserts this
 rather than papering over it: a symmetric NAT allocates a fresh external port
 per destination, so the port the rendezvous server observed is not the port the
-peer must hit. A relay fallback is the answer and is **not yet implemented** —
-see Status.
+peer must hit.
+
+The answer is the relay, and it runs on the rendezvous server. A peer asks for
+an allocation, both ends address their traffic to the server, and it forwards
+between them. It forwards **opaque ciphertext**: the relay sits below the crypto
+layer, so the session is still end-to-end authenticated and forward-secret, and
+the server learns only that two `dev_id`s are exchanging bytes and how many.
+
+Relayed traffic gets its own rate budget rather than sharing the signaling one,
+which is small and bursty. Charging a whole session against a limit sized for
+lookups throttles every relayed transfer with no error and no counter to point
+at. `Node::Config::force_relay` skips punching entirely — the only practical way
+to exercise the path from a network where punching happens to work, and what a
+peer on a known-symmetric NAT wants anyway.
 
 ## Handshake binding
 
@@ -185,23 +207,95 @@ identity_msg = { app_pubkey, Sign(app_privkey, "your-app:v1" || handshake_hash) 
 — which on a keyed topic means anyone holding `K` — can run two sessions and
 relay A's identity proof into the second one to impersonate A to B.
 
+## Streams
+
+The session layer gives you authenticated datagrams: confidential, replay-proof,
+and free to lose or reorder. `Stream` adds the rest — reliability, ordering, flow
+control and congestion control — in a layer shaped like QUIC (RFC 9000/9002).
+
+| | session datagram | `Stream` |
+|---|---|---|
+| confidentiality, authentication, dedup | yes | inherited |
+| reliability, ordering | no | **yes** |
+| flow control, congestion control | no | **yes** |
+| `Topic::send` / `broadcast` | ✓ | |
+| `Topic::open_stream` | | ✓ |
+
+Streams are **multiplexed**, so head-of-line blocking is per stream, not per
+connection: a lost packet stalls its own stream while the others keep flowing.
+That is the reason to build on datagrams rather than one ordered pipe, and it is
+the thing TCP cannot offer.
+
+```cpp
+Stream s = topic.open_stream(dev);          // invalid handle if not connected
+                                            // or at the stream limit
+s.write(bytes);                             // short count = backpressure
+s.read(buf);                                // contiguous prefix only
+
+topic.on_stream         ([](Stream s)            { /* peer opened one */ });
+topic.on_stream_readable([](Stream s)            { /* bytes ready */ });
+topic.on_stream_writable([](Stream s)            { /* backpressure lifted */ });
+topic.on_stream_finished([](Stream s)            { /* peer sent FIN, all read */ });
+topic.on_stream_reset   ([](Stream s, uint64_t c){ /* aborted */ });
+topic.on_stream_closed  ([](Stream s)            { /* done, state released */ });
+```
+
+A short `write()` is backpressure, not an error. Wait for `on_stream_writable`
+rather than polling `writable()` on a timer.
+
+### Ending a stream
+
+Three verbs, and the difference is worth reading once:
+
+| | ends | releases the stream |
+|---|---|---|
+| `finish()` | our sending direction, gracefully | only once **both** ends finish |
+| `reset(code)` | our sending direction, abruptly | no — the peer may still send to us |
+| `close(code)` | **both** directions | yes, from one side |
+
+`finish()` is a half-close. On a bidirectional stream the reverse direction stays
+open, which is the point — but it means a one-way transfer where only the sender
+finishes leaves the stream live on both ends. For one-way transfers open the
+stream **unidirectional**; it then retires as soon as the receiver drains it.
+
+`close()` is the one-sided teardown: it aborts our direction and asks the peer to
+abort its own, and the peer's answer is what releases our side. It closes a
+*stream*, not the connection — the session and every other stream on that peer
+keep running.
+
+Finished streams are retired and their buffers released. Late frames for a
+retired stream are rejected by a high-water mark rather than per-id tombstones,
+which would be unbounded again.
+
+### Limits
+
+Peer-opened streams are capped (`max_concurrent_streams`, 64 by default). Each
+one costs a receive and a send buffer, and the peer decides how many stream ids
+it puts on the wire — without a cap an authenticated peer pins unbounded memory
+by sending one byte to each of arbitrarily many ids. Frames past the cap are
+dropped rather than answered, since any reply would need the per-id state being
+rationed.
+
 ## Layout
 
 ```
-src/wire/      protocol codec                      no dependencies
+src/wire/      protocol codec, varints             no dependencies
 src/crypto/    BLAKE2s, ChaCha20-Poly1305, X25519, Noise, HKDF
 src/path/      candidate ranking, punch state machine
 src/session/   Noise session, replay window, path migration
+src/stream/    frames, loss recovery, congestion control, streams
 src/io/        UDP sockets                         the ONLY target with a socket
 src/api/       Node and Topic
-server/        record store (sans-IO) + UDP service + binary
+server/        record store (sans-IO) + UDP service + relay + binary
 third_party/   vendored X25519 and Poly1305
 tests/         unit suite + a simulated network
-examples/      uconn-demo
+examples/      uconn-demo, uconn-chat, uconn-stream
+deploy/        Oracle Cloud setup, systemd units, git watcher
 ```
 
 Layering is enforced by CMake: if `uconnect_path` ever needs to link
-`uconnect_io`, the build says so.
+`uconnect_io`, the build says so. Note that `uconnect_stream` does **not** link
+`uconnect_crypto` — it sits above the session and never sees a key.
 
 ### Sans-IO
 
@@ -276,9 +370,27 @@ undefined `__ms_vsnprintf` out of `libmsvcrt`. Hence the copy.)
 `scripts/smoke.sh` does exactly this and asserts that both peers punch,
 handshake and exchange messages.
 
+An interactive chat over the same library:
+
+```sh
+./build/examples/chat/uconn-chat --server 127.0.0.1:4433 --topic 'uconn://...' --name alice
+```
+
+And a stream transfer, which verifies every byte it receives. Add `--relay` to
+force the path through the server instead of punching:
+
+```sh
+./build/examples/uconn-stream --server 127.0.0.1:4433 --topic 'uconn://...' --recv
+./build/examples/uconn-stream --server 127.0.0.1:4433 --topic 'uconn://...' --send 1048576
+```
+
+`scripts/stream-smoke.sh` runs that pair and fails unless the bytes arrive
+intact.
+
 ## Tests
 
-139 unit cases plus an end-to-end smoke test.
+215 unit cases plus two end-to-end smoke tests — one for punch + handshake +
+messaging, one that moves a megabyte over a stream and verifies every byte.
 
 The crypto is validated against published vectors — RFC 7693 (BLAKE2s),
 RFC 8439 §2.3.2/§2.5.2/§2.8.2 (ChaCha20, Poly1305, the full AEAD with exact
@@ -290,15 +402,20 @@ each other. Only the vectors distinguish "works" from "correct".
 ## Status
 
 Working end to end: registration, keepalive with rebinding, lookup with
-sampling, topic listing, stats, the relay that coordinates simultaneous
-punching, candidate ranking, punching, `Noise_NN`/`NNpsk0`, authenticated
-transport with replay protection, path migration, and an N-peer mesh.
+sampling, topic listing, stats, candidate ranking, punching, the relay fallback
+for symmetric NAT, `Noise_NN`/`NNpsk0`, authenticated transport with replay
+protection, path migration, an N-peer mesh, and reliable ordered streams with
+flow and congestion control.
+
+Verified against a live deployment as well as the simulator: byte-verified
+transfers of 512 KB–1 MB over both punched and relayed paths.
 
 Not yet implemented:
 
-- **Relay fallback for symmetric NAT.** The known gap. Punching covers roughly
-  80–90% of pairs; the rest need a relay. It belongs *below* the crypto layer so
-  the relay forwards opaque ciphertext and learns only metadata.
+- **Connection close on the wire.** `Topic::disconnect()` and `Node::shutdown()`
+  are local only — nothing tells the peer. It finds out via the 90-second idle
+  timeout, holding a NAT binding and possibly a relay slot the whole time. A
+  deliberate shutdown should not look identical to a cable being pulled.
 - **REST front end.** The store is sans-IO so an HTTP service sits beside the
   UDP one. It must be read-only, for the registration reason above.
 - **In-place rekey.** Sessions have a 15-minute lifetime and then ask for a
@@ -306,6 +423,14 @@ Not yet implemented:
   wrong desynchronises a session in a way that looks like packet loss.
 - **Key rotation.** `key_epoch` is carried on the wire and in the prologue but
   nothing drives it yet.
-- **Reliability/ordering.** Transport is datagrams. There is no retransmission
-  or stream layer above it.
-- **`Topic::set_auto_connect`** is stored but not acted on.
+- **Path migration for network changes.** A device that switches Wi-Fi to
+  cellular gets a new mapping, and there is no migration for it — both ends time
+  out and reconnect from scratch.
+
+Known sharp edges:
+
+- A **bidirectional** stream is only released when both ends `finish()`. A
+  one-way transfer over one leaves state on both sides until the session ends.
+  Use a unidirectional stream, or `close()`.
+- `SendBuffer` never returns its capacity to the allocator, so a stream that
+  carried a large transfer holds its peak send buffer until it is retired.

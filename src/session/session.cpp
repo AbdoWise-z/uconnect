@@ -244,16 +244,12 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
         if (!replay_.accept(m->counter)) return;
 
         plain.resize(*n);
-        if (plain.size() < 2) plain.assign(2, 0);  // tolerate a reason-less close
-        plain.resize(2);
+        const uint16_t peer_reason =
+            plain.size() >= 2 ? static_cast<uint16_t>((plain[0] << 8) | plain[1])
+                              : wire::close_reason::kUnspecified;
 
         last_recv_ = now;
-        close(now);
-        // close() queued a reason-less Closed event; carry the peer's reason on
-        // it so a caller can tell "the app disconnected" from "the node exited".
-        if (!events_.empty() && events_.back().kind == SessionEvent::Kind::Closed) {
-            events_.back().data = std::move(plain);
-        }
+        close_with_cause(now, CloseCause::PeerNotice, peer_reason);
         return;
     }
 
@@ -368,13 +364,20 @@ void Session::close_with_notice(uint16_t reason, Instant now) {
     close(now);
 }
 
-void Session::close(Instant now) {
+void Session::close(Instant now) { close_with_cause(now, CloseCause::Local, 0); }
+
+void Session::close_with_cause(Instant now, CloseCause cause, uint16_t peer_reason) {
     (void)now;
     if (state_ == SessionState::Closed) return;
     state_ = SessionState::Closed;
     send_cs_.clear();
     recv_cs_.clear();
-    events_.push_back({SessionEvent::Kind::Closed, {}, {}});
+
+    SessionEvent e;
+    e.kind        = SessionEvent::Kind::Closed;
+    e.cause       = cause;
+    e.peer_reason = peer_reason;
+    events_.push_back(std::move(e));
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +389,7 @@ void Session::on_timeout(Instant now) {
     if (state_ == SessionState::Handshaking) {
         if (now < handshake_next_) return;
         if (handshake_attempts_ >= cfg_.handshake_retries) {
-            close(now);
+            close_with_cause(now, CloseCause::TimedOut, 0);
             return;
         }
         if (initiator_) emit_handshake_init(now);
@@ -394,7 +397,7 @@ void Session::on_timeout(Instant now) {
     }
 
     if (now - last_recv_ >= cfg_.idle_timeout) {
-        close(now);
+        close_with_cause(now, CloseCause::TimedOut, 0);
         return;
     }
 

@@ -70,13 +70,20 @@ constexpr auto kProbeMemory = 30s;  // how long an answered probe_txn stays usab
 // datagram gets handed to the stream layer, parsed as frames, and dropped as
 // malformed -- which is exactly what happened the first time these were wired
 // together: peers connected and no message ever arrived.
-const char* close_reason_name(uint16_t r) {
-    switch (r) {
-        case wire::close_reason::kUnspecified: return "unspecified";
-        case wire::close_reason::kGoingAway:   return "going-away";
-        case wire::close_reason::kShutdown:    return "shutdown";
-        default:                               return "local";
+// The peer supplies only the reason code; the cause is our own account, so a
+// hostile peer cannot dress its disappearance up as our idle timer.
+PeerGone peer_gone_from(session::CloseCause cause, uint16_t peer_reason) {
+    switch (cause) {
+        case session::CloseCause::Local:    return PeerGone::Local;
+        case session::CloseCause::TimedOut: return PeerGone::TimedOut;
+        case session::CloseCause::PeerNotice:
+            switch (peer_reason) {
+                case wire::close_reason::kGoingAway: return PeerGone::GoingAway;
+                case wire::close_reason::kShutdown:  return PeerGone::ShuttingDown;
+                default:                             return PeerGone::Unspecified;
+            }
     }
+    return PeerGone::Unspecified;
 }
 
 namespace payload_kind {
@@ -85,6 +92,17 @@ inline constexpr uint8_t kStream   = 0x01;  // stream frames
 }  // namespace payload_kind
 
 }  // namespace
+
+const char* to_string(PeerGone g) {
+    switch (g) {
+        case PeerGone::Local:        return "local";
+        case PeerGone::TimedOut:     return "timed-out";
+        case PeerGone::GoingAway:    return "going-away";
+        case PeerGone::ShuttingDown: return "shutting-down";
+        case PeerGone::Unspecified:  return "unspecified";
+    }
+    return "unspecified";
+}
 
 const char* to_string(PeerState s) {
     switch (s) {
@@ -249,6 +267,7 @@ struct Topic::Impl {
     std::function<void(DevId, uint64_t)>                 on_stream_writable;
     std::function<void(DevId, uint64_t, uint64_t)>       on_stream_reset;
     std::function<void(DevId, uint64_t)>                 on_stream_closed;
+    std::function<void(DevId, PeerGone)>                 on_peer_closed;
 
     const crypto::SymKey* psk() const { return keyed ? &keys.psk : nullptr; }
     const crypto::SymKey* probe_key() const { return keyed ? &keys.probe : nullptr; }
@@ -1090,6 +1109,9 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                             ti.self && std::memcmp(ti.self->data(), peer.dev_id.data(),
                                                    kDevIdLen) < 0;
                         stream::StreamConfig scfg;
+                        scfg.stream_recv_window      = cfg.stream_recv_window;
+                        scfg.conn_recv_window        = cfg.conn_recv_window;
+                        scfg.max_concurrent_streams  = cfg.max_streams_per_peer;
                         peer.streams.emplace(scfg, a ? stream::Role::A : stream::Role::B);
                     }
                     set_peer_state(ti, peer, PeerState::Connected);
@@ -1120,24 +1142,23 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     if (peer.relayed) start_relay_session(ti, tid, peer, now);
                     else if (!peer.cands.empty()) start_punch(ti, tid, peer, now);
                     break;
-                case K::Closed:
+                case K::Closed: {
+                    const PeerGone why = peer_gone_from(e->cause, e->peer_reason);
                     if (cfg.verbose) {
-                        // e->data carries the peer's reason when the close came
-                        // from the wire; it is empty for a local teardown or an
-                        // idle timeout, which is itself the useful distinction.
-                        const uint16_t reason =
-                            e->data.size() >= 2
-                                ? static_cast<uint16_t>((e->data[0] << 8) | e->data[1])
-                                : 0xFFFFu;
                         std::fprintf(stderr, "[uconnect] session closed peer=%s reason=%s\n",
                                      to_hex(peer.dev_id).substr(0, 8).c_str(),
-                                     close_reason_name(reason));
+                                     to_string(why));
                     }
                     conns.erase(peer.sess->conn_id());
                     peer.sess.reset();
                     peer.streams.reset();
+                    if (ti.on_peer_closed) {
+                        deferred.push_back(
+                            [cb = ti.on_peer_closed, dev = peer.dev_id, why] { cb(dev, why); });
+                    }
                     set_peer_state(ti, peer, PeerState::Closed);
                     break;
+                }
             }
             if (!peer.sess) break;
         }
@@ -1648,6 +1669,33 @@ void Topic::disconnect_all_with_reason(uint16_t reason) {
     for (const auto& d : all) drop_peer_locked(d, reason);
 }
 
+std::optional<LinkInfo> Topic::link(const DevId& dev) const {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    auto it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.sess) return std::nullopt;
+    const auto& p = it->second;
+
+    LinkInfo li;
+    li.relayed            = p.relayed;
+    li.datagrams_sent     = p.sess->messages_sent();
+    li.datagrams_received = p.sess->messages_received();
+
+    // The stream layer only exists once the handshake completes, and it is
+    // where the path measurements live -- the session deliberately keeps no
+    // timers of its own beyond liveness.
+    if (p.streams) {
+        li.rtt = std::chrono::duration_cast<std::chrono::milliseconds>(
+            p.streams->smoothed_rtt());
+        li.congestion_window = p.streams->congestion_window();
+        li.bytes_in_flight   = p.streams->bytes_in_flight();
+        li.slow_start        = p.streams->in_slow_start();
+        li.packets_sent      = p.streams->packets_sent();
+        li.packets_lost      = p.streams->packets_lost();
+        li.open_streams      = p.streams->active_streams().size();
+    }
+    return li;
+}
+
 std::vector<DevId> Topic::connected() const {
     std::lock_guard<std::mutex> lk(impl_->node->mu);
     std::vector<DevId>          out;
@@ -1984,6 +2032,15 @@ void Stream::reset(uint64_t code) {
     });
 }
 
+void Stream::stop_sending(uint64_t code) {
+    if (!topic_) return;
+    std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
+    with_stream<int>(topic_->impl_->peers, peer_, 0, [&](auto& sc) {
+        sc.stop_sending(id_, code);
+        return 0;
+    });
+}
+
 void Stream::close(uint64_t code) {
     if (!topic_) return;
     std::lock_guard<std::mutex> lk(topic_->impl_->node->mu);
@@ -2083,6 +2140,11 @@ void Topic::on_stream_reset(std::function<void(Stream, uint64_t)> cb) {
                                                         uint64_t code) {
         cb(Stream{this, dev, id}, code);
     };
+}
+
+void Topic::on_peer_closed(std::function<void(DevId, PeerGone)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_peer_closed = std::move(cb);
 }
 
 void Topic::on_stream_closed(std::function<void(Stream)> cb) {

@@ -108,6 +108,41 @@ class Topic;
 // closed simply reports zero/false rather than misbehaving.
 using StreamId = uint64_t;
 
+// Why a peer connection ended, delivered with on_peer_closed.
+//
+// The first two are our own account of events; the rest come from the peer.
+// The distinction is not cosmetic: a peer that crashes says nothing, so
+// TimedOut is what a vanished peer looks like, and anything else means the
+// peer was still alive enough to say goodbye.
+enum class PeerGone : uint8_t {
+    Local,        // we disconnected, or shut down
+    TimedOut,     // silence: crash, cable pull, NAT rebind, or a failed handshake
+    GoingAway,    // the peer's application closed this connection
+    ShuttingDown, // the peer's node is exiting
+    Unspecified,  // the peer said goodbye without saying why
+};
+const char* to_string(PeerGone);
+
+// A snapshot of one peer connection. Everything here is diagnostic -- nothing
+// in the protocol depends on it -- but `relayed` is worth surfacing to users:
+// a relayed connection is still end-to-end encrypted, yet it puts the
+// rendezvous server back in the path where it can see traffic patterns.
+struct LinkInfo {
+    bool relayed = false;   // going through the rendezvous server, not direct
+
+    std::chrono::milliseconds rtt{0};      // smoothed, from the stream layer
+    size_t   congestion_window = 0;
+    size_t   bytes_in_flight   = 0;
+    bool     slow_start        = false;
+
+    uint64_t datagrams_sent     = 0;       // session level
+    uint64_t datagrams_received = 0;
+    uint64_t packets_sent       = 0;       // stream level
+    uint64_t packets_lost       = 0;
+
+    size_t open_streams = 0;
+};
+
 class Stream {
 public:
     Stream() = default;
@@ -138,6 +173,11 @@ public:
     // This closes a stream, not the connection: the session and every other
     // stream on this peer keep running.
     void close(uint64_t error_code = 0);
+
+    // Tell the peer to stop sending, without touching our own direction. The
+    // peer answers by aborting its side, so this is how a reader says "I have
+    // what I need" while still having something left to write.
+    void stop_sending(uint64_t error_code = 0);
 
     bool   readable() const;
     size_t readable_bytes() const;
@@ -192,6 +232,9 @@ public:
     std::vector<DevId> connected() const;
     PeerState          state(const DevId&) const;
 
+    // Diagnostics for one connected peer. Nullopt if there is no live session.
+    std::optional<LinkInfo> link(const DevId&) const;
+
     // --- datagrams ---------------------------------------------------------
     // Unreliable and unordered, like the session underneath. Fine for things
     // that are cheap to lose -- presence, telemetry, a game tick. Use a Stream
@@ -210,6 +253,11 @@ public:
     // --- events (invoked on the node's loop thread; do not block) ----------
     void on_peer(std::function<void(DevId, PeerState)>);
     void on_data(std::function<void(DevId, std::span<const uint8_t>)>);
+
+    // Fires alongside the PeerState::Closed transition, with the reason. Use
+    // this to tell a peer that said goodbye from one that simply vanished --
+    // the first is worth reporting calmly, the second is worth retrying.
+    void on_peer_closed(std::function<void(DevId, PeerGone)>);
 
     // The peer opened a stream. Nothing is readable yet -- wait for
     // on_stream_readable, or just try to read.
@@ -284,6 +332,22 @@ public:
         // succeed.
         bool                 force_relay     = false;
         bool                 verbose         = false;
+
+        // --- stream tuning -------------------------------------------------
+        // Receive window for one stream. The main memory-against-throughput
+        // knob: a long fat path needs a window near bandwidth x delay to keep
+        // the pipe full, and the cost is per stream.
+        size_t stream_recv_window = 256 * 1024;
+
+        // Receive window across every stream on one peer, so many half-idle
+        // streams cannot together pin far more than one busy stream would.
+        size_t conn_recv_window = 1024 * 1024;
+
+        // Concurrent streams per peer, counted separately for each end's
+        // streams. open_stream returns an invalid handle once ours are used up,
+        // and inbound frames past the peer's share are dropped -- each stream
+        // costs buffers, and the peer chooses how many ids it puts on the wire.
+        size_t max_streams_per_peer = 64;
     };
 
     explicit Node(Config);

@@ -1327,3 +1327,35 @@ TEST(a_bare_reset_does_not_stop_the_peer_from_finishing) {
     CHECK(!a.exists(id));
     CHECK(!b.exists(id));
 }
+
+TEST(stop_sending_ends_the_peers_direction_without_ending_ours) {
+    // The third teardown primitive, and the one a reader wants: "I have what I
+    // need, stop" -- without giving up our own direction the way close() does.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open();
+    auto data = pattern(40000);
+    size_t off = a.write(id, data);
+    link.advance(500ms);
+
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    REQUIRE(!got.empty());
+
+    b.stop_sending(id, 9);
+    link.advance(2s);
+
+    // a has aborted its sending direction, so nothing more is accepted or sent.
+    CHECK(!a.writable(id));
+    CHECK_EQ(a.write(id, std::span(data).subspan(off)), 0u);
+
+    const size_t delivered = got.size();
+    link.advance(2s);
+    drain(b, id, got);
+    CHECK_EQ(got.size(), delivered);   // the flow really stopped
+
+    // b's own sending direction survives: this is not a full teardown.
+    CHECK(b.writable(id));
+}

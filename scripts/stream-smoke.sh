@@ -52,7 +52,7 @@ leg() {
     got="$(grep -o '\[recv\] [0-9]* bytes' "/tmp/ss-$label-recv.log" | grep -o '[0-9]*' | head -1)"
 
     echo "--- $label ---"
-    grep -E '^\[(send|recv)\]' "/tmp/ss-$label-send.log" "/tmp/ss-$label-recv.log" \
+    grep -E '^\[(send|recv|link)\]' "/tmp/ss-$label-send.log" "/tmp/ss-$label-recv.log" \
         | sed "s|/tmp/ss-$label-[a-z]*\.log:||"
 
     [ "$RS" -eq 0 ] || { echo "FAIL [$label]: sender exit $RS"; FAIL=1; }

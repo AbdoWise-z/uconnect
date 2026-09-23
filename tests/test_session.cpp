@@ -593,9 +593,35 @@ TEST(a_closing_peer_is_reported_in_one_round_trip_not_after_the_idle_timeout) {
     CHECK(p->b.state() == SessionState::Closed);
     auto ev = take(p->b, SessionEvent::Kind::Closed);
     REQUIRE(ev.has_value());
-    REQUIRE(ev->data.size() == 2);
-    CHECK_EQ(static_cast<uint16_t>((ev->data[0] << 8) | ev->data[1]),
-             wire::close_reason::kShutdown);
+    CHECK(ev->cause == CloseCause::PeerNotice);
+    CHECK_EQ(ev->peer_reason, wire::close_reason::kShutdown);
+}
+
+TEST(a_vanished_peer_is_distinguishable_from_one_that_said_goodbye) {
+    // The cause is ours, never the peer's: a hostile peer supplies only a
+    // reason code, so it cannot dress its own disappearance up as our timer.
+    SessionConfig cfg;
+    cfg.idle_timeout = 90s;
+    cfg.max_lifetime = 1h;
+
+    auto psk = psk_of(0x5A);
+
+    {   // silence
+        auto p = establish(&psk, &psk);
+        REQUIRE(p.has_value());
+        p->b.on_timeout(t0() + 200s);
+        auto ev = take(p->b, SessionEvent::Kind::Closed);
+        REQUIRE(ev.has_value());
+        CHECK(ev->cause == CloseCause::TimedOut);
+    }
+    {   // our own call
+        auto p = establish(&psk, &psk);
+        REQUIRE(p.has_value());
+        p->b.close(t0() + 1s);
+        auto ev = take(p->b, SessionEvent::Kind::Closed);
+        REQUIRE(ev.has_value());
+        CHECK(ev->cause == CloseCause::Local);
+    }
 }
 
 TEST(a_close_is_sent_more_than_once_so_one_drop_does_not_lose_it) {

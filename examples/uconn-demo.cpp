@@ -139,6 +139,14 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         });
 
+        // A peer that says goodbye is worth reporting calmly; one that simply
+        // vanishes is worth retrying. Only this tells them apart.
+        topic.on_peer_closed([&, n = name](DevId dev, PeerGone why) {
+            std::printf("[%s] peer %s gone: %s\n", n.c_str(), short_id(dev).c_str(),
+                        to_string(why));
+            std::fflush(stdout);
+        });
+
         topic.on_data([&, n = name](DevId dev, std::span<const uint8_t> data) {
             std::string s(reinterpret_cast<const char*>(data.data()), data.size());
             std::printf("[%s] <- %s: %s\n", n.c_str(), short_id(dev).c_str(), s.c_str());

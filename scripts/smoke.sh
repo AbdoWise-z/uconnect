@@ -60,6 +60,15 @@ grep -q "> closed" /tmp/uc-alice.log || {
     echo "FAIL: alice never saw bob close -- the shutdown notice did not arrive"
     FAIL=1
 }
+
+# And the reason survives the whole path: bob's Node::shutdown() -> the wire ->
+# alice's application callback. "timed-out" here would mean the notice was lost
+# and a timer fired instead, which is exactly the case this must not regress to.
+grep -q "gone: shutting-down" /tmp/uc-alice.log || {
+    echo "FAIL: alice did not learn WHY bob left"
+    grep "gone:" /tmp/uc-alice.log || true
+    FAIL=1
+}
 [ "$RA" -eq 0 ] || { echo "FAIL: alice exit $RA"; FAIL=1; }
 [ "$RB" -eq 0 ] || { echo "FAIL: bob exit $RB"; FAIL=1; }
 

@@ -139,6 +139,24 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(50ms);
     }
 
+    // What the path actually looked like. `relayed` is the one worth reading
+    // closely: the transfer is still end-to-end encrypted either way, but a
+    // relayed one went through the rendezvous server.
+    for (const auto& dev : topic.connected()) {
+        if (auto li = topic.link(dev)) {
+            std::printf("[link] %s rtt=%lldms cwnd=%zu inflight=%zu %s "
+                        "pkts=%llu lost=%llu dgrams=%llu/%llu streams=%zu\n",
+                        li->relayed ? "relayed" : "direct",
+                        (long long)li->rtt.count(), li->congestion_window,
+                        li->bytes_in_flight, li->slow_start ? "slow-start" : "avoid",
+                        (unsigned long long)li->packets_sent,
+                        (unsigned long long)li->packets_lost,
+                        (unsigned long long)li->datagrams_sent,
+                        (unsigned long long)li->datagrams_received,
+                        li->open_streams);
+        }
+    }
+
     if (recv) {
         std::printf("[recv] %zu bytes, verified=%s, fin=%s\n", got.load(),
                     bad ? "NO" : "yes", done ? "yes" : "no");

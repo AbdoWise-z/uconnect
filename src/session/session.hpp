@@ -60,6 +60,15 @@ struct Outgoing {
     std::vector<uint8_t> data;
 };
 
+// Why a session ended. Set by us, never by the peer -- a peer supplies only
+// `peer_reason`, so a hostile one cannot make its own disappearance look like
+// our idle timer or our own call to close().
+enum class CloseCause : uint8_t {
+    Local,       // we tore it down
+    TimedOut,    // silence past the idle timeout, or a handshake that gave up
+    PeerNotice,  // the peer sent a Close; peer_reason carries its code
+};
+
 struct SessionEvent {
     enum class Kind : uint8_t {
         Established,
@@ -77,6 +86,10 @@ struct SessionEvent {
     // above needs it to acknowledge the datagram; the session has already
     // guaranteed it is free of duplicates, so it is trustworthy for that.
     uint64_t packet_number = 0;
+
+    // Kind::Closed only.
+    CloseCause cause       = CloseCause::Local;
+    uint16_t   peer_reason = 0;   // meaningful only when cause == PeerNotice
 };
 
 // Anti-replay, IPsec style: a high-water mark plus a bitmap of the 64 counters
@@ -183,6 +196,7 @@ private:
     void  finish_handshake(crypto::Split, Instant now);
     void  queue_keepalive(Instant now);
     void  queue_close(uint16_t reason);
+    void  close_with_cause(Instant now, CloseCause, uint16_t peer_reason);
 
     SessionConfig cfg_;
     DevId         peer_{};

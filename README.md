@@ -252,6 +252,7 @@ Three verbs, and the difference is worth reading once:
 | `finish()` | our sending direction, gracefully | only once **both** ends finish |
 | `reset(code)` | our sending direction, abruptly | no — the peer may still send to us |
 | `close(code)` | **both** directions | yes, from one side |
+| `stop_sending(code)` | the **peer's** direction | no — ours stays open |
 
 `finish()` is a half-close. On a bidirectional stream the reverse direction stays
 open, which is the point — but it means a one-way transfer where only the sender
@@ -263,13 +264,38 @@ abort its own, and the peer's answer is what releases our side. It closes a
 *stream*, not the connection — the session and every other stream on that peer
 keep running.
 
+`stop_sending()` is the reader's verb: "I have what I need, stop" — without
+giving up our own direction the way `close()` does.
+
 Finished streams are retired and their buffers released. Late frames for a
 retired stream are rejected by a high-water mark rather than per-id tombstones,
 which would be unbounded again.
 
+### Seeing what the path is doing
+
+```cpp
+if (auto li = topic.link(dev)) {
+    li->relayed;              // through the server, or direct
+    li->rtt;                  // smoothed
+    li->congestion_window;    li->bytes_in_flight;    li->slow_start;
+    li->packets_sent;         li->packets_lost;
+    li->datagrams_sent;       li->datagrams_received;
+    li->open_streams;
+}
+```
+
+All diagnostic — nothing in the protocol depends on it — except `relayed`, which
+is worth showing users. A relayed connection is still end to end encrypted, but
+the rendezvous server is back in the path and can see traffic patterns.
+
+`uconn-stream` prints this after a transfer, which is how the difference shows
+up concretely: the same megabyte over a relay loses packets where the direct
+path loses none.
+
 ### Limits
 
-Peer-opened streams are capped (`max_concurrent_streams`, 64 by default). Each
+Peer-opened streams are capped (`max_concurrent_streams`, 64 by default,
+`Node::Config::max_streams_per_peer`). Each
 one costs a receive and a send buffer, and the peer decides how many stream ids
 it puts on the wire — without a cap an authenticated peer pins unbounded memory
 by sending one byte to each of arbitrarily many ids. Frames past the cap are
@@ -299,6 +325,19 @@ Best effort by construction. Nothing acknowledges a close, so it goes out a few
 times and the idle timeout stays as the backstop. This makes a *deliberate*
 disconnect fast; crashes, cable pulls and NAT rebinds still take the full
 timeout, because there is nobody left to send anything.
+
+That difference is the useful one, so it reaches the application:
+
+```cpp
+topic.on_peer_closed([](DevId dev, PeerGone why) {
+    // Local | TimedOut | GoingAway | ShuttingDown | Unspecified
+});
+```
+
+`TimedOut` is what a vanished peer looks like — worth retrying. Anything else
+means the peer was alive enough to say goodbye — worth reporting calmly. The
+*cause* is always our own account of events; a peer supplies only a reason code,
+so a hostile one cannot dress its own disappearance up as our idle timer.
 
 A close before the handshake completes puts nothing on the wire: there are no
 keys to authenticate it with, and an unauthenticated one would be a teardown
@@ -417,7 +456,7 @@ intact.
 
 ## Tests
 
-222 unit cases plus two end-to-end smoke tests — one for punch + handshake +
+224 unit cases plus two end-to-end smoke tests — one for punch + handshake +
 messaging, one that moves a megabyte over a stream and verifies every byte.
 
 The crypto is validated against published vectors — RFC 7693 (BLAKE2s),

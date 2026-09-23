@@ -1,7 +1,7 @@
-/build/
-/build2/
-/cmake-build-debug/
-/cmake-build-release/
+# Any build tree, including the out-of-source ones used to cross-check a second
+# toolchain (build-posix, build-clang, ...).
+/build*/
+/cmake-build-*/
 /.idea/
 /keys/
 *.key

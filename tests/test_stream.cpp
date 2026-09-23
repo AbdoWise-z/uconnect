@@ -9,6 +9,7 @@
 // parameter. A 10-second transfer with 20% loss runs in milliseconds and gives
 // the same answer every time.
 
+#include <algorithm>
 #include <numeric>
 #include <random>
 

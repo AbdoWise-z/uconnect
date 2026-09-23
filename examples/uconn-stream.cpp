@@ -8,9 +8,11 @@
 // whole point of the layer: the session underneath loses and reorders, and the
 // application must not be able to tell.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>

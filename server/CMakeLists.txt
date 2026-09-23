@@ -12,5 +12,5 @@ add_executable(uconnect-rendezvous
         stun.hpp
         stun.cpp
 )
-target_link_libraries(uconnect-rendezvous PRIVATE uconnect_store uconnect_io)
+target_link_libraries(uconnect-rendezvous PRIVATE uconnect_store uconnect_io Threads::Threads)
 uconnect_bundle_runtime(uconnect-rendezvous)

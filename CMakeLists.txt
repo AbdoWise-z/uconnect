@@ -9,6 +9,12 @@ set(CMAKE_C_STANDARD 11)
 option(UCONNECT_BUILD_TESTS  "Build the test suite"   ON)
 option(UCONNECT_BUILD_SERVER "Build the rendezvous server" ON)
 
+# std::thread needs an explicit link on most Unix toolchains. It happens to work
+# without one on MinGW and on glibc 2.34+, where pthread was folded into libc --
+# which is exactly why this was missing and nothing complained.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 if (MSVC)
     add_compile_options(/W4)
 else()

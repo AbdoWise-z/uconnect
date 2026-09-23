@@ -6,6 +6,8 @@
 // "record is nominally alive but its candidate is dead" case, which is the one
 // that actually bites in production, is trivial to reproduce.
 
+#include <cstring>
+
 #include "store.hpp"
 #include "udp_service.hpp"
 #include "testing.hpp"

@@ -14,6 +14,10 @@
 // bcrypt.h must follow windows.h
 #include <bcrypt.h>
 #else
+// getentropy() rather than getrandom(): getrandom is a Linux extension and does
+// not exist on macOS or the BSDs, while getentropy is present on all of them --
+// macOS 10.12+, glibc 2.25+, OpenBSD, FreeBSD. One path for every POSIX target
+// beats a second branch that only ever gets compiled on someone else's machine.
 #include <sys/random.h>
 #endif
 
@@ -32,11 +36,18 @@ void random_bytes(std::span<uint8_t> out) {
         throw std::runtime_error("BCryptGenRandom failed; refusing to produce weak keys");
     }
 #else
+    // getentropy is all-or-nothing but caps a single call at 256 bytes, so the
+    // loop is about the cap, not about short reads.
     size_t off = 0;
     while (off < out.size()) {
-        ssize_t n = getrandom(out.data() + off, out.size() - off, 0);
-        if (n < 0) throw std::runtime_error("getrandom failed; refusing to produce weak keys");
-        off += static_cast<size_t>(n);
+        const size_t remaining = out.size() - off;
+        const size_t chunk     = remaining < 256 ? remaining : 256;
+        if (getentropy(out.data() + off, chunk) != 0) {
+            // Same reasoning as the Windows branch: returning predictable bytes
+            // would silently compromise every key this process generates.
+            throw std::runtime_error("getentropy failed; refusing to produce weak keys");
+        }
+        off += chunk;
     }
 #endif
 }

@@ -404,13 +404,25 @@ If your CLion is somewhere unusual, set `UCONNECT_TOOLCHAIN` to its install
 directory. If you have your own CMake/GCC/Ninja on PATH, the plain commands
 below work and you can ignore the scripts entirely.
 
-### Anywhere else
+### macOS and Linux
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Clang and GCC both work; macOS needs the Xcode command line tools
+(`xcode-select --install`) and nothing else. No Homebrew packages, because there
+are no external dependencies to install.
+
+Platform requirements are narrow by design. Randomness comes from `getentropy`,
+which needs **macOS 10.12+** or **glibc 2.25+** — chosen over Linux's
+`getrandom` precisely so there is one POSIX path rather than a second branch
+that only ever compiles on someone else's machine. Sockets are plain BSD
+sockets with `select`, not `epoll` or `kqueue`, so the same code serves both.
+Apple Silicon needs nothing special: the vendored X25519 and Poly1305 are
+portable C with no intrinsics and no endianness assumptions.
 
 ### Running the built binaries
 

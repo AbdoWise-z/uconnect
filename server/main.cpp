@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <cstdio>
 #include <cstring>

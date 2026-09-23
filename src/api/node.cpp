@@ -13,11 +13,13 @@
 
 #include "uconnect/uconnect.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <condition_variable>
 #include <cstring>
 #include <map>
+#include <stdexcept>
 #include <mutex>
 #include <thread>
 #include <unordered_map>

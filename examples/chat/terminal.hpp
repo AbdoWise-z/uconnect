@@ -11,6 +11,7 @@
 // prompt with the partially typed text intact.
 
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -19,12 +20,14 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <utility>
 #include <windows.h>
 #include <conio.h>
 #include <io.h>

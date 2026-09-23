@@ -26,6 +26,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include "uconnect/types.hpp"

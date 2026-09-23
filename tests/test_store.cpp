@@ -7,6 +7,7 @@
 // that actually bites in production, is trivial to reproduce.
 
 #include <cstring>
+#include <utility>
 
 #include "store.hpp"
 #include "udp_service.hpp"

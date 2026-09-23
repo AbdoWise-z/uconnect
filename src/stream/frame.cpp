@@ -1,5 +1,7 @@
 #include "frame.hpp"
 
+#include <utility>
+
 namespace uconnect::stream {
 namespace {
 

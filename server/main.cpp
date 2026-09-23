@@ -15,6 +15,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <string>
 
 #include "socket.hpp"

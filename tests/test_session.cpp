@@ -1,3 +1,6 @@
+#include <string_view>
+#include <utility>
+
 #include "session.hpp"
 #include "testing.hpp"
 

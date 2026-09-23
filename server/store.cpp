@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <unordered_set>
+#include <utility>
 
 namespace uconnect::server {
 namespace {

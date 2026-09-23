@@ -5,6 +5,8 @@
 // 30% packet loss during the exact window where the two peers have to overlap.
 // That is the whole argument for keeping this layer sans-IO.
 
+#include <utility>
+
 #include "netsim.hpp"
 #include "punch.hpp"
 #include "testing.hpp"

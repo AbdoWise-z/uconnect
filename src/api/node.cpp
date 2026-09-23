@@ -23,6 +23,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "kdf.hpp"
 #include "messages.hpp"

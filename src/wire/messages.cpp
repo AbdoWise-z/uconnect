@@ -1,5 +1,7 @@
 #include "messages.hpp"
 
+#include <utility>
+
 namespace uconnect::wire {
 namespace {
 

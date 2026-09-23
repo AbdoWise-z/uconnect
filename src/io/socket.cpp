@@ -6,6 +6,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <utility>
 #include <winsock2.h>
 // ws2tcpip.h and iphlpapi.h must follow winsock2.h
 #include <ws2tcpip.h>

@@ -1,6 +1,9 @@
 #include "session.hpp"
 
 #include <cstring>
+#include <span>
+#include <string_view>
+#include <utility>
 
 namespace uconnect::session {
 namespace {

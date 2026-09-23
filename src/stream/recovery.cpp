@@ -1,5 +1,7 @@
 #include "recovery.hpp"
 
+#include <utility>
+
 namespace uconnect::stream {
 
 // ---------------------------------------------------------------------------

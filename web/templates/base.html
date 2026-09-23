@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}uConnect{% endblock %}</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b35;
+    --fg: #e6e9ef; --dim: #8b93a3; --accent: #6ea8fe;
+    --warn: #e0a458; --bad: #e06c75; --ok: #7ec699;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa; --panel: #fff; --line: #e2e5ea;
+      --fg: #1a1d23; --dim: #667085; --accent: #2563eb;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  h2 { font-size: 1rem; margin: 2rem 0 .75rem; color: var(--dim);
+       text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .sub { color: var(--dim); font-size: .875rem; margin: 0 0 1.5rem; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 1rem 1.15rem; margin-bottom: 1rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: .75rem; }
+  .stat { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; padding: .7rem .9rem; }
+  .stat .n { font-size: 1.45rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--dim); font-size: .75rem; text-transform: uppercase;
+             letter-spacing: .05em; margin-top: .15rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th { text-align: left; color: var(--dim); font-weight: 600; font-size: .75rem;
+       text-transform: uppercase; letter-spacing: .05em;
+       padding: .4rem .6rem; border-bottom: 1px solid var(--line); }
+  td { padding: .5rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .tag { display: inline-block; padding: .1rem .45rem; border-radius: 5px;
+         font-size: .72rem; font-weight: 600; letter-spacing: .03em;
+         border: 1px solid var(--line); color: var(--dim); }
+  .tag.keyed { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .tag.open  { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  .tag.stale { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  .banner { border-radius: 8px; padding: .65rem .9rem; margin-bottom: 1rem;
+            font-size: .875rem; border: 1px solid; }
+  .banner.warn { color: var(--warn); border-color: var(--warn);
+                 background: color-mix(in srgb, var(--warn) 8%, transparent); }
+  .banner.bad  { color: var(--bad); border-color: var(--bad);
+                 background: color-mix(in srgb, var(--bad) 8%, transparent); }
+  .empty { color: var(--dim); padding: 1.5rem 0; text-align: center; }
+  .foot { color: var(--dim); font-size: .8rem; margin-top: 2.5rem;
+          border-top: 1px solid var(--line); padding-top: 1rem; }
+  form { display: flex; gap: .5rem; margin-top: .5rem; }
+  input[type=text] {
+    flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--fg);
+    border-radius: 7px; padding: .45rem .6rem; font-family: ui-monospace, monospace;
+  }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+           padding: .45rem .9rem; font-weight: 600; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><a href="/" style="color:inherit">uConnect</a></h1>
+  <p class="sub">watching <code>{{ server }}</code></p>
+
+  {% if error %}
+    <div class="banner {{ 'warn' if stale else 'bad' }}">
+      {% if stale %}Showing the last good data — refresh failed: {{ error }}
+      {% else %}{{ error }}{% endif %}
+    </div>
+  {% endif %}
+
+  {% block body %}{% endblock %}
+
+  <p class="foot">
+    Read-only. Everything here is already public to anyone who can reach the
+    rendezvous server: listing is opt-in per record, LOOKUP needs no key
+    because <code>K</code> never reaches the server, and metadata is plaintext
+    by design.
+    &nbsp;·&nbsp; <a href="/api/overview">JSON</a>
+  </p>
+</div>
+</body>
+</html>

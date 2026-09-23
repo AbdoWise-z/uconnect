@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}uConnect — topic{% endblock %}
+
+{% block body %}
+{% if topic %}
+  <h2>Topic</h2>
+  <div class="panel">
+    <div class="mono" style="word-break:break-all"><strong>{{ topic.id }}</strong></div>
+    <p class="sub" style="margin:.6rem 0 0">
+      {{ topic.members|length }} member{{ '' if topic.members|length == 1 else 's' }} returned.
+      LOOKUP returns a random sample capped at 30 by default, so this is not
+      necessarily everyone.
+    </p>
+  </div>
+
+  {% if topic.members %}
+    <div class="panel">
+      <table>
+        <tr><th>dev_id</th><th>metadata</th><th>age</th><th></th></tr>
+        {% for m in topic.members %}
+          <tr>
+            <td class="mono" style="word-break:break-all">{{ m.dev_id }}</td>
+            <td>
+              {%- if m.meta_text %}{{ m.meta_text }}
+              {%- elif m.meta_hex %}<span class="mono" style="color:var(--dim)">{{ m.meta_hex }}</span>
+              {%- else %}<span style="color:var(--dim)">—</span>{% endif %}
+            </td>
+            <td style="font-variant-numeric:tabular-nums">{{ m.age_s }}s</td>
+            <td>{% if m.stale %}<span class="tag stale">stale</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+  {% else %}
+    <div class="panel empty">
+      Nobody is registered under this topic right now.<br>
+      <span style="font-size:.85rem">
+        Records expire 90 seconds after their last keepalive.
+      </span>
+    </div>
+  {% endif %}
+
+  <p class="sub">
+    A <code>dev_id</code> is derived by the server as
+    <code>HMAC(secret, topic_id ‖ ip ‖ port)</code>, so it changes when the
+    address does and cannot be correlated across topics.
+  </p>
+{% endif %}
+
+<p><a href="/">← all topics</a></p>
+{% endblock %}

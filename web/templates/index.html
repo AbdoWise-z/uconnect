@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}uConnect — topics{% endblock %}
+
+{% block body %}
+{% if view %}
+  {% set s = view.stats %}
+  {% if s %}
+    <div class="grid">
+      <div class="stat"><div class="n">{{ s.topics_listed }}</div><div class="k">listed topics</div></div>
+      <div class="stat"><div class="n">{{ s.topics_total }}</div><div class="k">topics total</div></div>
+      <div class="stat"><div class="n">{{ s.entries_fresh }}</div><div class="k">fresh records</div></div>
+      <div class="stat"><div class="n">{{ s.entries_total }}</div><div class="k">records total</div></div>
+      <div class="stat"><div class="n">{{ s.relays_open }}</div><div class="k">relays open</div></div>
+    </div>
+    <p class="sub" style="margin-top:.75rem">
+      {{ s.registers }} registers · {{ s.lookups }} lookups · {{ s.keepalives }} keepalives ·
+      {{ s.rebinds }} NAT rebinds · {{ s.expired }} expired
+      {%- if s.rej_bad_auth or s.rej_quota or s.rej_rate_limited %}
+        · rejected: {{ s.rej_bad_auth }} auth, {{ s.rej_quota }} quota, {{ s.rej_rate_limited }} rate
+      {%- endif %}
+    </p>
+  {% endif %}
+
+  <h2>Topics</h2>
+  {% if view.topics %}
+    {% for t in view.topics %}
+      <div class="panel">
+        <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+          <a class="mono" href="/topic/{{ t.id }}"><strong>{{ t.short }}</strong>…</a>
+          <span class="tag {{ t.mode }}">{{ t.mode }}</span>
+          <span style="color:var(--dim);font-size:.85rem">
+            {{ t.peers }} peer{{ '' if t.peers == 1 else 's' }}, {{ t.fresh_peers }} fresh
+          </span>
+        </div>
+
+        {% if t.members %}
+          <table style="margin-top:.75rem">
+            <tr><th>dev_id</th><th>metadata</th><th>age</th><th></th></tr>
+            {% for m in t.members %}
+              <tr>
+                <td class="mono">{{ m.dev_id[:16] }}…</td>
+                <td>
+                  {%- if m.meta_text %}{{ m.meta_text }}
+                  {%- elif m.meta_hex %}<span class="mono" style="color:var(--dim)">{{ m.meta_hex[:24] }}…</span>
+                  {%- else %}<span style="color:var(--dim)">—</span>{% endif %}
+                </td>
+                <td style="font-variant-numeric:tabular-nums">{{ m.age_s }}s</td>
+                <td>{% if m.stale %}<span class="tag stale">stale</span>{% endif %}</td>
+              </tr>
+            {% endfor %}
+          </table>
+          {% if t.sampled %}
+            {# LOOKUP samples rather than enumerating, so say so -- otherwise a
+               big topic looks like it is losing records. #}
+            <p class="sub" style="margin:.6rem 0 0">
+              Showing {{ t.shown }} of {{ t.peers }}. LOOKUP returns a random
+              sample, never the whole swarm.
+            </p>
+          {% endif %}
+        {% else %}
+          <p class="sub" style="margin:.6rem 0 0">No members returned.</p>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="panel empty">
+      No listed topics.<br>
+      <span style="font-size:.85rem">
+        Topics appear here only when a peer opts in with <code>publish(meta, listed=true)</code>.
+      </span>
+    </div>
+  {% endif %}
+
+  <h2>Look up a topic by id</h2>
+  <div class="panel">
+    <p class="sub" style="margin:0">
+      Unlisted topics are reachable by id — that is what any peer does, and it
+      needs no key. Unlisted means absent from the directory, not secret.
+    </p>
+    <form action="/topic" method="get" onsubmit="location.href='/topic/'+this.t.value.trim();return false">
+      <input type="text" name="t" placeholder="32 hex characters" maxlength="32" required>
+      <button type="submit">Look up</button>
+    </form>
+  </div>
+{% endif %}
+{% endblock %}

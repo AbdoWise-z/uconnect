@@ -76,6 +76,7 @@ add_subdirectory(src/stream)
 add_subdirectory(src/io)
 add_subdirectory(src/api)
 add_subdirectory(examples)
+add_subdirectory(tools)
 
 if (UCONNECT_BUILD_SERVER)
     add_subdirectory(server)

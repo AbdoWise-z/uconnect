@@ -357,6 +357,8 @@ server/        record store (sans-IO) + UDP service + relay + binary
 third_party/   vendored X25519 and Poly1305
 tests/         unit suite + a simulated network
 examples/      uconn-demo, uconn-chat, uconn-stream
+tools/         uconn-observe -- reads a server's public view as JSON
+web/           Flask dashboard over uconn-observe
 deploy/        Oracle Cloud setup, systemd units, git watcher
 ```
 
@@ -465,6 +467,26 @@ force the path through the server instead of punching:
 
 `scripts/stream-smoke.sh` runs that pair and fails unless the bytes arrive
 intact.
+
+## Watching a server
+
+The server runs in a terminal and is not a web service. To see what it holds,
+`tools/uconn-observe` queries it over the ordinary client protocol and prints
+JSON, and `web/` is a Flask dashboard on top of that.
+
+```sh
+./build/tools/uconn-observe --server 127.0.0.1:4433 --members
+UCONNECT_SERVER=127.0.0.1:4433 python web/app.py    # http://127.0.0.1:8080
+```
+
+The server is untouched and unaware. The observer never calls `publish()`, so
+it registers nothing and does not appear in the listings it reports. Nothing in
+Python speaks the wire protocol — it shells out to a binary that links this
+library, so the framing has exactly one implementation and cannot drift.
+
+Everything shown is already public to anyone who can reach the server: listing
+is opt-in, LOOKUP needs no key because `K` never gets there, and metadata is
+plaintext by design. See [web/README.md](web/README.md).
 
 ## Tests
 

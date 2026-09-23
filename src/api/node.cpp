@@ -70,6 +70,15 @@ constexpr auto kProbeMemory = 30s;  // how long an answered probe_txn stays usab
 // datagram gets handed to the stream layer, parsed as frames, and dropped as
 // malformed -- which is exactly what happened the first time these were wired
 // together: peers connected and no message ever arrived.
+const char* close_reason_name(uint16_t r) {
+    switch (r) {
+        case wire::close_reason::kUnspecified: return "unspecified";
+        case wire::close_reason::kGoingAway:   return "going-away";
+        case wire::close_reason::kShutdown:    return "shutdown";
+        default:                               return "local";
+    }
+}
+
 namespace payload_kind {
 inline constexpr uint8_t kDatagram = 0x00;  // unreliable, delivered as-is
 inline constexpr uint8_t kStream   = 0x01;  // stream frames
@@ -1112,6 +1121,18 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     else if (!peer.cands.empty()) start_punch(ti, tid, peer, now);
                     break;
                 case K::Closed:
+                    if (cfg.verbose) {
+                        // e->data carries the peer's reason when the close came
+                        // from the wire; it is empty for a local teardown or an
+                        // idle timeout, which is itself the useful distinction.
+                        const uint16_t reason =
+                            e->data.size() >= 2
+                                ? static_cast<uint16_t>((e->data[0] << 8) | e->data[1])
+                                : 0xFFFFu;
+                        std::fprintf(stderr, "[uconnect] session closed peer=%s reason=%s\n",
+                                     to_hex(peer.dev_id).substr(0, 8).c_str(),
+                                     close_reason_name(reason));
+                    }
                     conns.erase(peer.sess->conn_id());
                     peer.sess.reset();
                     peer.streams.reset();
@@ -1592,29 +1613,39 @@ void Topic::connect_all(size_t max_peers) {
     }
 }
 
-void Topic::disconnect(const DevId& dev) {
-    auto& n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
-    auto it = impl_->peers.find(dev);
+// Shared by disconnect() and disconnect_all(). The reason is a parameter so a
+// node that is exiting can say so, rather than looking to every peer like an
+// application that happened to drop one connection. Caller holds the lock.
+void Topic::drop_peer_locked(const DevId& dev, uint16_t reason) {
+    auto& n  = *impl_->node;
+    auto  it = impl_->peers.find(dev);
     if (it == impl_->peers.end()) return;
     if (it->second.sess) {
-        it->second.sess->close(std::chrono::steady_clock::now());
+        // Queue the notice, then drain: close_with_notice() seals it before
+        // tearing down, because close() clears the send keys.
+        it->second.sess->close_with_notice(reason, std::chrono::steady_clock::now());
         while (auto o = it->second.sess->poll_transmit()) n.send_raw(o->to, o->data);
         n.conns.erase(it->second.sess->conn_id());
     }
     impl_->peers.erase(it);
 }
 
-void Topic::disconnect_all() {
+void Topic::disconnect(const DevId& dev) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    drop_peer_locked(dev, wire::close_reason::kGoingAway);
+}
+
+void Topic::disconnect_all() { disconnect_all_with_reason(wire::close_reason::kGoingAway); }
+
+void Topic::disconnect_all_with_reason(uint16_t reason) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
     std::vector<DevId> all;
-    {
-        std::lock_guard<std::mutex> lk(impl_->node->mu);
-        for (auto& [dev, peer] : impl_->peers) {
-            (void)peer;
-            all.push_back(dev);
-        }
+    all.reserve(impl_->peers.size());
+    for (auto& [dev, peer] : impl_->peers) {
+        (void)peer;
+        all.push_back(dev);
     }
-    for (const auto& d : all) disconnect(d);
+    for (const auto& d : all) drop_peer_locked(d, reason);
 }
 
 std::vector<DevId> Topic::connected() const {
@@ -1868,7 +1899,7 @@ void Node::shutdown() {
     }
     for (auto* t : all) {
         t->unpublish();
-        t->disconnect_all();
+        t->disconnect_all_with_reason(wire::close_reason::kShutdown);
     }
 
     impl_->stop = true;

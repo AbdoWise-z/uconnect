@@ -69,6 +69,7 @@ enum class MsgType : uint8_t {
     // --- noise ---
     HandshakeInit = 0x30, HandshakeResp = 0x31,
     Transport     = 0x40,
+    Close         = 0x41,
 };
 
 enum class MsgClass : uint8_t { Signaling, Probe, Handshake, Transport, Unknown };
@@ -449,5 +450,25 @@ struct Transport {
     void encode(Writer&) const;
     static std::optional<Transport> decode(Reader&);
 };
+
+// A peer telling us it is going away, so we learn in one round trip instead of
+// waiting out the 90-second idle timeout holding a NAT binding open.
+//
+// Same envelope as Transport -- conn_id, counter, ciphertext -- because it IS a
+// transport packet: same keys, same counter space, same replay window. What
+// differs is the header type and the AEAD's associated data, and that second
+// difference is load-bearing. The header is NOT covered by the tag, so with a
+// shared AAD anyone on path could flip a data packet's type byte from 0x40 to
+// 0x41 and tear down a session they cannot read. Sealing each kind against its
+// own type byte makes that forgery fail the tag check.
+using Close = Transport;
+
+// Why a peer went away. Advisory only: a peer that crashes says nothing at all,
+// so absence of a reason means nothing in particular.
+namespace close_reason {
+inline constexpr uint16_t kUnspecified = 0;
+inline constexpr uint16_t kGoingAway   = 1;  // application closed this connection
+inline constexpr uint16_t kShutdown    = 2;  // the whole node is exiting
+}  // namespace close_reason
 
 }  // namespace uconnect::wire

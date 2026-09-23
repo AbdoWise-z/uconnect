@@ -134,7 +134,17 @@ public:
     // it, so next_send_counter() lets it peek first.
     std::optional<uint64_t> send(std::span<const uint8_t> payload, Instant now);
     uint64_t next_send_counter() const { return send_counter_; }
+
+    // Local teardown. Nothing goes on the wire, so the peer only finds out when
+    // its idle timeout expires.
     void close(Instant now);
+
+    // Tell the peer first, then tear down. Best effort by construction: the
+    // notice is unacknowledged, so it is sent a few times and the peer's idle
+    // timeout remains the backstop. Use this for a deliberate disconnect --
+    // the difference between "goodbye" and a cable being pulled is worth 90
+    // seconds of the peer holding a NAT binding and possibly a relay slot.
+    void close_with_notice(uint16_t reason, Instant now);
 
     std::optional<Outgoing>     poll_transmit();
     std::optional<SessionEvent> poll_event();
@@ -172,6 +182,7 @@ private:
     void  emit_handshake_init(Instant now);
     void  finish_handshake(crypto::Split, Instant now);
     void  queue_keepalive(Instant now);
+    void  queue_close(uint16_t reason);
 
     SessionConfig cfg_;
     DevId         peer_{};

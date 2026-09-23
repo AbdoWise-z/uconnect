@@ -276,6 +276,34 @@ by sending one byte to each of arbitrarily many ids. Frames past the cap are
 dropped rather than answered, since any reply would need the per-id state being
 rationed.
 
+## Saying goodbye
+
+`Topic::disconnect()` and `Node::shutdown()` tell the peer, so it learns in one
+round trip instead of waiting out the 90-second idle timeout holding a NAT
+binding and possibly a relay slot. A deliberate shutdown should not look
+identical to a cable being pulled.
+
+The notice is a `Close` message: the same envelope as a transport packet —
+`conn_id`, counter, ciphertext — sealed with the same session keys and drawn
+from the same counter space, so the peer's existing replay window covers it and
+a captured close is inert against any other session.
+
+It is sealed against **its own type byte as associated data**, and that detail
+is load-bearing. The header is not covered by the AEAD tag, so if a close and a
+data packet were sealed the same way, anyone on path could flip one byte —
+`0x40` to `0x41` — and tear down a session they cannot read. Binding each kind
+to its type makes that forgery fail the tag check. There are tests for the
+forgery in both directions, and they fail if the binding is removed.
+
+Best effort by construction. Nothing acknowledges a close, so it goes out a few
+times and the idle timeout stays as the backstop. This makes a *deliberate*
+disconnect fast; crashes, cable pulls and NAT rebinds still take the full
+timeout, because there is nobody left to send anything.
+
+A close before the handshake completes puts nothing on the wire: there are no
+keys to authenticate it with, and an unauthenticated one would be a teardown
+primitive for anybody.
+
 ## Layout
 
 ```
@@ -389,7 +417,7 @@ intact.
 
 ## Tests
 
-215 unit cases plus two end-to-end smoke tests — one for punch + handshake +
+222 unit cases plus two end-to-end smoke tests — one for punch + handshake +
 messaging, one that moves a megabyte over a stream and verifies every byte.
 
 The crypto is validated against published vectors — RFC 7693 (BLAKE2s),
@@ -404,18 +432,14 @@ each other. Only the vectors distinguish "works" from "correct".
 Working end to end: registration, keepalive with rebinding, lookup with
 sampling, topic listing, stats, candidate ranking, punching, the relay fallback
 for symmetric NAT, `Noise_NN`/`NNpsk0`, authenticated transport with replay
-protection, path migration, an N-peer mesh, and reliable ordered streams with
-flow and congestion control.
+protection, path migration, an N-peer mesh, reliable ordered streams with flow
+and congestion control, and an authenticated connection close.
 
 Verified against a live deployment as well as the simulator: byte-verified
 transfers of 512 KB–1 MB over both punched and relayed paths.
 
 Not yet implemented:
 
-- **Connection close on the wire.** `Topic::disconnect()` and `Node::shutdown()`
-  are local only — nothing tells the peer. It finds out via the 90-second idle
-  timeout, holding a NAT binding and possibly a relay slot the whole time. A
-  deliberate shutdown should not look identical to a cable being pulled.
 - **REST front end.** The store is sans-IO so an HTTP service sits beside the
   UDP one. It must be read-only, for the registration reason above.
 - **In-place rekey.** Sessions have a 15-minute lifetime and then ask for a

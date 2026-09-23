@@ -224,6 +224,39 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
         return;
     }
 
+    if (h->type == wire::MsgType::Close) {
+        if (state_ != SessionState::Established && state_ != SessionState::NeedsRehandshake) {
+            return;
+        }
+        auto m = wire::Close::decode(r);
+        if (!m || m->conn_id != conn_id_) return;
+
+        // Sealed against its own type byte, so a re-typed data packet fails
+        // here rather than tearing the session down.
+        const uint8_t        ad = static_cast<uint8_t>(wire::MsgType::Close);
+        std::vector<uint8_t> plain(m->ciphertext.size());
+        auto n = recv_cs_.decrypt_at(m->counter, std::span<const uint8_t>(&ad, 1),
+                                     m->ciphertext, plain);
+        if (!n) return;  // forged or corrupt: drop, say nothing
+
+        // Same ordering as the data path: the counter is only trustworthy once
+        // the AEAD has verified it, or forged counters could poison the window.
+        if (!replay_.accept(m->counter)) return;
+
+        plain.resize(*n);
+        if (plain.size() < 2) plain.assign(2, 0);  // tolerate a reason-less close
+        plain.resize(2);
+
+        last_recv_ = now;
+        close(now);
+        // close() queued a reason-less Closed event; carry the peer's reason on
+        // it so a caller can tell "the app disconnected" from "the node exited".
+        if (!events_.empty() && events_.back().kind == SessionEvent::Kind::Closed) {
+            events_.back().data = std::move(plain);
+        }
+        return;
+    }
+
     if (h->type != wire::MsgType::Transport) return;
     if (state_ != SessionState::Established && state_ != SessionState::NeedsRehandshake) return;
 
@@ -283,6 +316,56 @@ std::optional<uint64_t> Session::send(std::span<const uint8_t> payload, Instant 
 
 void Session::queue_keepalive(Instant now) {
     send({}, now);  // an empty payload; the peer treats it as a keepalive
+}
+
+namespace {
+// Enough that losing every copy takes a burst failure rather than one drop.
+// There is nothing to acknowledge a close, so retrying on a timer would mean
+// keeping a session alive purely to announce that it is not -- the peer's idle
+// timeout already covers the case where all of these are lost.
+constexpr int kCloseCopies = 3;
+}  // namespace
+
+void Session::queue_close(uint16_t reason) {
+    const uint8_t plain[2] = {static_cast<uint8_t>(reason >> 8),
+                              static_cast<uint8_t>(reason & 0xFF)};
+
+    // The type byte is the associated data. See wire::Close: this is what stops
+    // a data packet being re-typed into a close by anyone on path.
+    const uint8_t ad = static_cast<uint8_t>(wire::MsgType::Close);
+
+    std::vector<uint8_t> ct(sizeof(plain) + crypto::kTagLen);
+    send_cs_.encrypt_at(send_counter_, std::span<const uint8_t>(&ad, 1),
+                        std::span<const uint8_t>(plain, sizeof(plain)), ct);
+
+    std::vector<uint8_t> buf(wire::kMaxDatagram);
+    wire::Writer         w{buf};
+    wire::Header{wire::MsgType::Close, wire::kVersion, 0, 0}.encode(w);
+    wire::Close m;
+    m.conn_id    = conn_id_;
+    m.counter    = send_counter_;
+    m.ciphertext = ct;
+    m.encode(w);
+    if (!w.ok()) return;
+    buf.resize(w.size());
+
+    // Shares the transport counter space deliberately: the peer runs every
+    // packet through one replay window, so a close drawn from a separate
+    // sequence would either be rejected as a replay or punch a hole in it.
+    ++send_counter_;
+    out_.push_back({path_, std::move(buf)});
+}
+
+void Session::close_with_notice(uint16_t reason, Instant now) {
+    if (state_ == SessionState::Closed) return;
+
+    // Only a session that reached the point of having keys can say anything. A
+    // handshake that never completed has no way to authenticate a goodbye, and
+    // an unauthenticated one would be a teardown primitive for anybody.
+    if (state_ == SessionState::Established || state_ == SessionState::NeedsRehandshake) {
+        for (int i = 0; i < kCloseCopies; ++i) queue_close(reason);
+    }
+    close(now);
 }
 
 void Session::close(Instant now) {

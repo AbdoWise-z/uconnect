@@ -554,3 +554,158 @@ TEST(a_forged_dev_id_cannot_be_injected_on_a_keyed_topic) {
                            ep(5, 5000), txn_of(9), tampered, t0() + 5ms)
                .has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Wire-level close
+// ---------------------------------------------------------------------------
+namespace {
+// Drain a session's outbound queue into the other end.
+size_t deliver(Session& from, Session& to, Endpoint via, Instant now) {
+    size_t n = 0;
+    while (auto o = from.poll_transmit()) {
+        to.on_datagram(via, o->data, now);
+        ++n;
+    }
+    return n;
+}
+
+std::optional<SessionEvent> take(Session& s, SessionEvent::Kind want) {
+    while (auto e = s.poll_event()) {
+        if (e->kind == want) return e;
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+TEST(a_closing_peer_is_reported_in_one_round_trip_not_after_the_idle_timeout) {
+    // The whole point: a deliberate disconnect should not look identical to a
+    // cable being pulled, which costs the peer 90s of holding a NAT binding.
+    auto psk = psk_of(0x5A);
+    auto p   = establish(&psk, &psk);
+    REQUIRE(p.has_value());
+
+    p->a.close_with_notice(wire::close_reason::kShutdown, t0() + 1s);
+    CHECK(p->a.state() == SessionState::Closed);
+
+    REQUIRE(deliver(p->a, p->b, ep(5, 5000), t0() + 1s) > 0);
+
+    // Immediately, not at t0()+90s.
+    CHECK(p->b.state() == SessionState::Closed);
+    auto ev = take(p->b, SessionEvent::Kind::Closed);
+    REQUIRE(ev.has_value());
+    REQUIRE(ev->data.size() == 2);
+    CHECK_EQ(static_cast<uint16_t>((ev->data[0] << 8) | ev->data[1]),
+             wire::close_reason::kShutdown);
+}
+
+TEST(a_close_is_sent_more_than_once_so_one_drop_does_not_lose_it) {
+    // Nothing acknowledges a close, so the only defence against loss is
+    // repetition plus the peer's idle timeout as a backstop.
+    auto psk = psk_of(0x5A);
+    auto p   = establish(&psk, &psk);
+    REQUIRE(p.has_value());
+
+    p->a.close_with_notice(wire::close_reason::kGoingAway, t0() + 1s);
+
+    std::vector<std::vector<uint8_t>> dgrams;
+    while (auto o = p->a.poll_transmit()) dgrams.push_back(o->data);
+    REQUIRE(dgrams.size() >= 2);
+
+    // Drop every copy but the last: the peer must still learn.
+    p->b.on_datagram(ep(5, 5000), dgrams.back(), t0() + 1s);
+    CHECK(p->b.state() == SessionState::Closed);
+}
+
+TEST(a_data_packet_cannot_be_retyped_into_a_close) {
+    // The header is not covered by the AEAD tag. If a close were sealed with
+    // the same associated data as a data packet, anyone on path could flip
+    // 0x40 to 0x41 and tear down a session they cannot read.
+    auto psk = psk_of(0x5A);
+    auto p   = establish(&psk, &psk);
+    REQUIRE(p.has_value());
+
+    REQUIRE(p->a.send(bytes("ordinary data"), t0() + 1s).has_value());
+    auto o = p->a.poll_transmit();
+    REQUIRE(o.has_value());
+
+    auto forged = o->data;
+    REQUIRE(forged[0] == static_cast<uint8_t>(wire::MsgType::Transport));
+    forged[0] = static_cast<uint8_t>(wire::MsgType::Close);
+
+    p->b.on_datagram(ep(5, 5000), forged, t0() + 1s);
+
+    CHECK(p->b.state() == SessionState::Established);   // survived
+    CHECK(!take(p->b, SessionEvent::Kind::Closed).has_value());
+}
+
+TEST(a_close_cannot_be_retyped_into_data) {
+    // The same binding in the other direction, so the two kinds really are
+    // separated rather than merely distinguished by a byte anyone can edit.
+    auto psk = psk_of(0x5A);
+    auto p   = establish(&psk, &psk);
+    REQUIRE(p.has_value());
+
+    p->a.close_with_notice(wire::close_reason::kGoingAway, t0() + 1s);
+    auto o = p->a.poll_transmit();
+    REQUIRE(o.has_value());
+
+    auto forged = o->data;
+    forged[0] = static_cast<uint8_t>(wire::MsgType::Transport);
+    p->b.on_datagram(ep(5, 5000), forged, t0() + 1s);
+
+    CHECK(p->b.state() == SessionState::Established);
+    CHECK(!take(p->b, SessionEvent::Kind::Data).has_value());
+}
+
+TEST(a_close_from_the_wrong_session_is_ignored) {
+    // conn_id and the keys both have to match, so a close captured from one
+    // session is inert against another.
+    auto psk = psk_of(0x5A);
+    auto p1  = establish(&psk, &psk);
+    auto p2  = establish(&psk, &psk, topic_of(1), topic_of(1), txn_of(3), txn_of(3));
+    REQUIRE(p1.has_value());
+    REQUIRE(p2.has_value());
+
+    p1->a.close_with_notice(wire::close_reason::kGoingAway, t0() + 1s);
+    auto o = p1->a.poll_transmit();
+    REQUIRE(o.has_value());
+
+    p2->b.on_datagram(ep(5, 5000), o->data, t0() + 1s);
+    CHECK(p2->b.state() == SessionState::Established);
+}
+
+TEST(a_replayed_close_cannot_reopen_the_question) {
+    // A close consumes a counter like any other packet, so replaying it is
+    // caught by the same window rather than needing its own defence.
+    auto psk = psk_of(0x5A);
+    auto p   = establish(&psk, &psk);
+    REQUIRE(p.has_value());
+
+    // Capture a close without letting the session go: send it from a clone of
+    // the same stream position by closing and keeping the datagrams.
+    p->a.close_with_notice(wire::close_reason::kGoingAway, t0() + 1s);
+    std::vector<std::vector<uint8_t>> dgrams;
+    while (auto o = p->a.poll_transmit()) dgrams.push_back(o->data);
+    REQUIRE(!dgrams.empty());
+
+    p->b.on_datagram(ep(5, 5000), dgrams[0], t0() + 1s);
+    CHECK(p->b.state() == SessionState::Closed);
+
+    // Feeding it again changes nothing and must not emit a second event.
+    (void)take(p->b, SessionEvent::Kind::Closed);
+    p->b.on_datagram(ep(5, 5000), dgrams[0], t0() + 2s);
+    CHECK(!take(p->b, SessionEvent::Kind::Closed).has_value());
+}
+
+TEST(a_close_before_the_handshake_completes_puts_nothing_on_the_wire) {
+    // There are no keys yet, so there is no way to authenticate a goodbye --
+    // and an unauthenticated one would be a teardown primitive for anybody.
+    auto psk = psk_of(0x5A);
+    auto a   = Session::initiate(SessionConfig{}, topic_of(1), 0, &psk, dev_of(1), dev_of(2),
+                                 ep(5, 5000), txn_of(9), t0());
+    while (a.poll_transmit()) {}   // discard the handshake init
+
+    a.close_with_notice(wire::close_reason::kGoingAway, t0() + 1s);
+    CHECK(a.state() == SessionState::Closed);
+    CHECK(!a.poll_transmit().has_value());
+}

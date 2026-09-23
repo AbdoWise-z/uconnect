@@ -255,6 +255,13 @@ private:
     friend class Stream;
     struct Impl;
     explicit Topic(std::unique_ptr<Impl>);
+
+    // Disconnect carrying a specific wire close reason. Private because the
+    // reason codes are a wire-layer detail; Node uses it so that a shutdown
+    // tells peers the node is exiting rather than that one link was dropped.
+    void disconnect_all_with_reason(uint16_t reason);
+    void drop_peer_locked(const DevId&, uint16_t reason);
+
     std::unique_ptr<Impl> impl_;
 };
 

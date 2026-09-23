@@ -28,11 +28,14 @@ TOPIC=$("$DEMO" --server "127.0.0.1:$UC_PORT" --create --seconds 0 2>/dev/null \
 if [ -z "$TOPIC" ]; then echo "FAIL: could not create a topic"; exit 1; fi
 echo "topic: ${TOPIC:0:40}..."
 
-"$DEMO" --server "127.0.0.1:$UC_PORT" --topic "$TOPIC" --name alice --seconds 14 \
+# Bob exits well before alice on purpose: his shutdown sends a wire-level close
+# and alice has to still be running to observe it. Without that message she
+# would not notice until the 90s idle timeout, long after this test is over.
+"$DEMO" --server "127.0.0.1:$UC_PORT" --topic "$TOPIC" --name alice --seconds 18 \
     > /tmp/uc-alice.log 2>&1 &
 A=$!
 sleep 2
-"$DEMO" --server "127.0.0.1:$UC_PORT" --topic "$TOPIC" --name bob --seconds 12 \
+"$DEMO" --server "127.0.0.1:$UC_PORT" --topic "$TOPIC" --name bob --seconds 8 \
     > /tmp/uc-bob.log 2>&1 &
 B=$!
 
@@ -49,6 +52,14 @@ grep -q "> connected" /tmp/uc-alice.log || { echo "FAIL: alice never connected";
 grep -q "> connected" /tmp/uc-bob.log   || { echo "FAIL: bob never connected"; FAIL=1; }
 grep -q "<- .*hello from bob"   /tmp/uc-alice.log || { echo "FAIL: alice got no message from bob"; FAIL=1; }
 grep -q "<- .*hello from alice" /tmp/uc-bob.log   || { echo "FAIL: bob got no message from alice"; FAIL=1; }
+
+# Bob's shutdown tells alice on the wire. She outlives him by ~8s, and the idle
+# timeout is 90s, so seeing "closed" at all proves the message arrived rather
+# than a timer having expired.
+grep -q "> closed" /tmp/uc-alice.log || {
+    echo "FAIL: alice never saw bob close -- the shutdown notice did not arrive"
+    FAIL=1
+}
 [ "$RA" -eq 0 ] || { echo "FAIL: alice exit $RA"; FAIL=1; }
 [ "$RB" -eq 0 ] || { echo "FAIL: bob exit $RB"; FAIL=1; }
 

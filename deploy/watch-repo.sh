@@ -124,6 +124,27 @@ deploy_web() {
         echo "$req_hash" > "$WORKDIR/web-req.sha"
     fi
 
+    # Refresh the unit itself, or a change to it would be the one thing that
+    # silently never deploys. The bind address is preserved from the installed
+    # copy: install-watcher.sh writes it per host, and overwriting that with
+    # the repo default would quietly move a dashboard someone had put on
+    # loopback back onto every interface.
+    local unit_src="$src/deploy/uconnect-web.service"
+    local unit_dst="/etc/systemd/system/$WEB_SERVICE.service"
+    if [ -f "$unit_src" ] && [ -f "$unit_dst" ]; then
+        local bind
+        bind="$(sed -n 's/^Environment=UCONNECT_WEB_BIND=//p' "$unit_dst" | head -1)"
+        [ -n "$bind" ] || bind="0.0.0.0:8080"
+        local staged="$WORKDIR/web-unit.staged"
+        sed "s|^Environment=UCONNECT_WEB_BIND=.*|Environment=UCONNECT_WEB_BIND=$bind|" \
+            "$unit_src" > "$staged"
+        if ! cmp -s "$staged" "$unit_dst"; then
+            log "web: unit file changed, refreshing (bind $bind preserved)"
+            cp -f "$staged" "$unit_dst" && systemctl daemon-reload
+        fi
+        rm -f "$staged"
+    fi
+
     # Ship the app. Copy to a staging dir and swap, so the running gunicorn
     # never reads a half-written tree.
     rm -rf "$WEB_ROOT.new"
@@ -150,11 +171,22 @@ import observer, app          # noqa
 
     systemctl restart "$WEB_SERVICE" 2>/dev/null || {
         log "web: WARN restart failed"; return 0; }
-    sleep 2
-    if systemctl is-active --quiet "$WEB_SERVICE"; then
+
+    # is-active alone is not evidence of health. With Restart=always a unit
+    # that dies on startup is reported "active" for most of its cycle, so a
+    # dashboard crash-looping on "address already in use" looked perfectly fine.
+    # A manual restart zeroes NRestarts, so anything above zero a few seconds
+    # later means it has already died and been resurrected at least once.
+    sleep 5
+    local restarts
+    restarts="$(systemctl show "$WEB_SERVICE" -p NRestarts --value 2>/dev/null || echo 0)"
+    if systemctl is-active --quiet "$WEB_SERVICE" && [ "${restarts:-0}" -eq 0 ]; then
         log "web: dashboard is up"
     else
-        log "web: WARN dashboard did not come up -- see journalctl -u $WEB_SERVICE"
+        log "web: WARN dashboard is not healthy (restarts=${restarts:-?})"
+        # The reason is almost always in the last few lines, and an operator
+        # should not have to go and ask for them.
+        journalctl -u "$WEB_SERVICE" -n 6 --no-pager 2>/dev/null | sed 's/^/    /'
     fi
     return 0
 }

@@ -50,6 +50,12 @@ Environment=UCONNECT_OBSERVE=/usr/local/bin/uconn-observe
 Environment=UCONNECT_CACHE_TTL=5
 Environment=PYTHONUNBUFFERED=1
 
+# The service account has no home directory, and gunicorn's control server
+# tries to use one -- logging "Permission denied: /home/uconnect-web" on every
+# start. Point HOME at a runtime directory systemd creates and owns instead.
+RuntimeDirectory=uconnect-web
+Environment=HOME=/run/uconnect-web
+
 Restart=always
 RestartSec=5
 

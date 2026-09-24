@@ -24,6 +24,12 @@
 #    expiry and clients re-register within one 20s keepalive, so a restart costs
 #    a few seconds of new registrations and nothing else. There is no state to
 #    migrate and no database to worry about.
+#
+#  * The web dashboard is deployed too, but STRICTLY AS AN ACCESSORY. It is
+#    updated after the server is confirmed healthy, and nothing that happens to
+#    it -- a failed pip install, a syntax error, a unit that will not start --
+#    is allowed to fail the deploy or trigger a rollback. A broken dashboard is
+#    an inconvenience; a rolled-back rendezvous server is an outage.
 
 set -uo pipefail
 
@@ -34,6 +40,13 @@ SERVICE="${UCONNECT_SERVICE:-uconnect-rendezvous}"
 BINARY="${UCONNECT_BINARY:-/usr/local/bin/uconnect-rendezvous}"
 INTERVAL="${UCONNECT_INTERVAL:-60}"
 LOCK="/var/lock/uconnect-watch.lock"
+
+# The dashboard. Deployed only if its unit is installed, so a box that does not
+# want one needs no configuration to opt out.
+WEB_SERVICE="${UCONNECT_WEB_SERVICE:-uconnect-web}"
+WEB_ROOT="${UCONNECT_WEB_ROOT:-/opt/uconnect/web}"
+OBSERVE_BIN="${UCONNECT_OBSERVE_BIN:-/usr/local/bin/uconn-observe}"
+VENV="${UCONNECT_VENV:-/opt/uconnect/venv}"
 
 ONCE=0
 LOOP=0
@@ -51,6 +64,100 @@ done
 [ "$ONCE" -eq 0 ] && [ "$LOOP" -eq 0 ] && ONCE=1
 
 log() { printf '%s  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+# ---------------------------------------------------------------------------
+# Dashboard deployment.
+#
+# Every failure path here returns 0. This runs after the rendezvous server is
+# already restarted and verified, and the caller ignores the result anyway --
+# both, because it would be absurd to roll back a working server because a
+# Flask app would not start.
+deploy_web() {
+    local src="$1" build="$2"
+
+    # No unit installed means this box does not want a dashboard.
+    if ! systemctl list-unit-files "$WEB_SERVICE.service" >/dev/null 2>&1 ||
+       ! systemctl cat "$WEB_SERVICE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "web: deploying dashboard"
+
+    if [ ! -x "$build/tools/uconn-observe" ]; then
+        log "web: WARN uconn-observe missing from the build -- skipping"
+        return 0
+    fi
+    install -m 0755 "$build/tools/uconn-observe" "$OBSERVE_BIN" || {
+        log "web: WARN could not install uconn-observe -- skipping"; return 0; }
+
+    # Python deps. Re-created only when requirements.txt actually changes: a
+    # pip install on every commit would add tens of seconds to each deploy and
+    # reach out to the network for no reason.
+    # Note the pip check, not just the python one. A half-built venv leaves a
+    # working interpreter behind with no pip -- which is exactly what a missing
+    # ensurepip produces -- and testing for python alone would then skip
+    # straight past the repair.
+    if [ ! -x "$VENV/bin/python" ] || [ ! -x "$VENV/bin/pip" ]; then
+        log "web: creating virtualenv"
+        rm -rf "$VENV"
+        if ! python3 -m venv "$VENV" > "$WORKDIR/web-venv.log" 2>&1; then
+            log "web: WARN python3 -m venv failed -- skipping the dashboard"
+            # The reason matters and is not guessable: on Debian/Ubuntu it is a
+            # missing python3-venv package, and the message says so precisely.
+            sed 's/^/    /' "$WORKDIR/web-venv.log" | head -6
+            return 0
+        fi
+    fi
+    local req="$src/web/requirements.txt" req_hash
+    req_hash="$(sha256sum "$req" 2>/dev/null | cut -d' ' -f1)"
+    if [ "$req_hash" != "$(cat "$WORKDIR/web-req.sha" 2>/dev/null)" ]; then
+        log "web: installing python dependencies"
+        # gunicorn is a deployment choice rather than an application dependency,
+        # so it lives here and not in requirements.txt. Flask's own server is
+        # explicitly not for this.
+        "$VENV/bin/pip" install -q --upgrade pip > "$WORKDIR/web-pip.log" 2>&1
+        if ! "$VENV/bin/pip" install -q -r "$req" gunicorn >> "$WORKDIR/web-pip.log" 2>&1; then
+            log "web: WARN pip install failed -- leaving the old dashboard running"
+            tail -6 "$WORKDIR/web-pip.log" | sed 's/^/    /'
+            return 0
+        fi
+        echo "$req_hash" > "$WORKDIR/web-req.sha"
+    fi
+
+    # Ship the app. Copy to a staging dir and swap, so the running gunicorn
+    # never reads a half-written tree.
+    rm -rf "$WEB_ROOT.new"
+    mkdir -p "$WEB_ROOT.new"
+    cp -r "$src/web/." "$WEB_ROOT.new/" || {
+        log "web: WARN copy failed -- skipping"; rm -rf "$WEB_ROOT.new"; return 0; }
+    rm -rf "$WEB_ROOT.old"
+    [ -d "$WEB_ROOT" ] && mv "$WEB_ROOT" "$WEB_ROOT.old"
+    mv "$WEB_ROOT.new" "$WEB_ROOT"
+    chown -R uconnect-web:uconnect-web "$WEB_ROOT" 2>/dev/null || true
+
+    # A smoke test before restarting: the data layer imports cleanly and the
+    # observer binary can actually reach the server. Catches a syntax error or
+    # a missing dependency here, in the log, rather than as a 500 later.
+    if ! "$VENV/bin/python" -c "
+import sys; sys.path.insert(0, '$WEB_ROOT')
+import observer, app          # noqa
+" >/dev/null 2>&1; then
+        log "web: WARN the app does not import -- rolling the dashboard back"
+        rm -rf "$WEB_ROOT"
+        [ -d "$WEB_ROOT.old" ] && mv "$WEB_ROOT.old" "$WEB_ROOT"
+        return 0
+    fi
+
+    systemctl restart "$WEB_SERVICE" 2>/dev/null || {
+        log "web: WARN restart failed"; return 0; }
+    sleep 2
+    if systemctl is-active --quiet "$WEB_SERVICE"; then
+        log "web: dashboard is up"
+    else
+        log "web: WARN dashboard did not come up -- see journalctl -u $WEB_SERVICE"
+    fi
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 check_once() {
@@ -166,6 +273,10 @@ check_once() {
 
     echo "$remote_sha" > "$WORKDIR/deployed.sha"
     log "deployed ${remote_sha:0:8} successfully"
+
+    # Only now, with the server confirmed up. The result is ignored on purpose:
+    # the dashboard is an accessory and must not be able to fail this deploy.
+    deploy_web "$src" "$build" || true
     return 0
 }
 

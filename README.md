@@ -488,6 +488,11 @@ Everything shown is already public to anyone who can reach the server: listing
 is opt-in, LOOKUP needs no key because `K` never gets there, and metadata is
 plaintext by design. See [web/README.md](web/README.md).
 
+On a deployed box the repo watcher redeploys the dashboard alongside the server
+on every commit — `sudo bash deploy/install-watcher.sh --with-web`. It is
+strictly an accessory: deployed only after the server is confirmed healthy, and
+no failure of its own is allowed to fail the deploy or trigger a rollback.
+
 ## Tests
 
 224 unit cases plus two end-to-end smoke tests — one for punch + handshake +

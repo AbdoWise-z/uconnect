@@ -1,0 +1,78 @@
+# systemd unit for the read-only web dashboard.
+#
+# Installed by deploy/install-watcher.sh --with-web, and redeployed on every
+# commit by the same watcher that redeploys the server.
+#
+#   sudo systemctl status uconnect-web
+#   journalctl -u uconnect-web -f
+#
+# Open the port as well -- the OS firewall is not the only one in the path:
+#   firewalld: sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload
+#   Oracle/AWS/GCP: add an inbound TCP rule. Source All / Destination 8080,
+#                   not the other way round.
+#
+# THIS IS UNAUTHENTICATED AND PUBLIC. Anyone who can reach the port can read
+# the topic directory and the metadata of every listed record. That is all data
+# the rendezvous server already hands to any client that asks -- listing is
+# opt-in, LOOKUP needs no key -- so the dashboard exposes nothing new. It does
+# make it convenient, which is a different thing. Put it behind a reverse proxy
+# with auth, or bind it to loopback and reach it over SSH, if that matters.
+
+[Unit]
+Description=uConnect web dashboard (read-only)
+After=network-online.target uconnect-rendezvous.service
+Wants=network-online.target
+
+# Deliberately NOT Requires=. The dashboard is an accessory: if the rendezvous
+# server is down, the right behaviour is a page that says so, not a second
+# unit flapping in sympathy.
+After=uconnect-rendezvous.service
+
+[Service]
+# One worker with threads, not several processes. The response cache is what
+# keeps the dashboard from tripping the server's own per-IP rate limiter, and
+# workers do not share memory -- four processes would mean four independent
+# caches and four times the lookups.
+ExecStart=/opt/uconnect/venv/bin/gunicorn \
+    --workers 1 --threads 4 \
+    --bind ${UCONNECT_WEB_BIND} \
+    --chdir /opt/uconnect/web \
+    --access-logfile - --error-logfile - \
+    app:app
+
+Environment=UCONNECT_WEB_BIND=0.0.0.0:8080
+# Loopback: the dashboard runs on the same box as the server it watches, so
+# this traffic never leaves the machine. It also means the observer's lookups
+# are rate-limited under 127.0.0.1 rather than under the public address, so a
+# busy dashboard cannot throttle real peers.
+Environment=UCONNECT_SERVER=127.0.0.1:4433
+Environment=UCONNECT_OBSERVE=/usr/local/bin/uconn-observe
+Environment=UCONNECT_CACHE_TTL=5
+Environment=PYTHONUNBUFFERED=1
+
+Restart=always
+RestartSec=5
+
+User=uconnect-web
+Group=uconnect-web
+
+# Looser than the rendezvous unit because this one forks a subprocess and needs
+# an interpreter, but still no reason to let it write anything.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

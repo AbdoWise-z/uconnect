@@ -100,6 +100,52 @@ pip install gunicorn
 UCONNECT_SERVER=1.2.3.4:4433 gunicorn -w 2 -b 127.0.0.1:8080 --chdir web app:app
 ```
 
+## Running it on the server
+
+The repo watcher that redeploys the rendezvous server on every commit deploys
+this too. Install once:
+
+```sh
+sudo bash deploy/install-watcher.sh --with-web
+sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload
+# plus an inbound TCP rule in the cloud firewall: Source All / Destination 8080
+```
+
+You do **not** need to stop the rendezvous server first. The installer only
+adds the new unit; the server is restarted by the next deploy, which it would
+be anyway, and restarts are cheap — records live in memory with a 90s expiry
+and clients re-register within one 20s keepalive.
+
+On each commit the watcher then builds `uconn-observe`, refreshes the venv if
+`requirements.txt` changed, swaps the app tree, and restarts `uconnect-web`.
+
+**The dashboard is strictly an accessory.** It is deployed only after the
+rendezvous server is confirmed healthy, and every failure path in its
+deployment is non-fatal: a failed `pip install`, a syntax error, a unit that
+will not start — all of them log loudly and leave the server alone. A broken
+dashboard is an inconvenience; a rolled-back rendezvous server is an outage.
+
+It also runs under gunicorn with **one worker and several threads**, not
+several workers. Workers do not share memory, so four processes would mean four
+independent caches and four times the lookups — and the cache is the thing
+keeping the dashboard from tripping the server's rate limiter.
+
+It watches `127.0.0.1:4433`, so its traffic never leaves the box. That also
+means its lookups are rate-limited under the loopback address rather than the
+public one, so a busy dashboard cannot throttle real peers.
+
+If it does not come up:
+
+```sh
+journalctl -u uconnect-web -f          # the app
+journalctl -u uconnect-watch -f        # the deploy that installed it
+```
+
+The most likely cause on a Debian/Ubuntu host is a missing `python3-venv`
+package. `python3 -m venv --help` succeeds even when venv creation cannot, so
+both the installer and the watcher build a real one and print the actual error
+rather than guessing.
+
 ## Routes
 
 | Route | Returns |

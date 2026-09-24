@@ -250,6 +250,27 @@ check_once() {
     subject="$(git log -1 --pretty=%s)"
     log "building ${remote_sha:0:8}: $subject"
 
+    # Update this script from the commit being deployed. Without it the watcher
+    # runs forever with whatever logic install-watcher.sh happened to lay down,
+    # so a fix to the deployment process is the one change that never deploys --
+    # which is a strange hole in a thing whose entire job is deploying changes.
+    #
+    # Atomic rename rather than a write in place: bash reads a script
+    # incrementally as it runs, so overwriting our own file mid-execution can
+    # resume the shell at a byte offset into different text. Renaming leaves
+    # this process on the old inode and the next tick picks up the new one.
+    local self_src="$src/deploy/watch-repo.sh"
+    local self_dst="${UCONNECT_SELF:-/usr/local/bin/uconnect-watch}"
+    if [ -f "$self_src" ] && ! cmp -s "$self_src" "$self_dst" 2>/dev/null; then
+        if install -m 0755 "$self_src" "$self_dst.new" 2>/dev/null &&
+           mv -f "$self_dst.new" "$self_dst" 2>/dev/null; then
+            log "watcher: updated itself -- the new logic applies from the next tick"
+        else
+            log "watcher: WARN could not update itself"
+            rm -f "$self_dst.new" 2>/dev/null
+        fi
+    fi
+
     # Build in a tree separate from anything the running service touches.
     local build="$WORKDIR/build"
     if ! cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release \

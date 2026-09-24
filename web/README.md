@@ -117,7 +117,18 @@ be anyway, and restarts are cheap — records live in memory with a 90s expiry
 and clients re-register within one 20s keepalive.
 
 On each commit the watcher then builds `uconn-observe`, refreshes the venv if
-`requirements.txt` changed, swaps the app tree, and restarts `uconnect-web`.
+`requirements.txt` changed, swaps the app tree, refreshes the unit file if it
+changed (preserving the configured bind address), and restarts `uconnect-web`.
+
+The watcher also **updates itself** from each commit it deploys, so changes to
+the deploy logic take effect from the next tick. Two things it deliberately
+does not self-update, and which still need `install-watcher.sh`:
+
+- `uconnect-rendezvous.service` — the running server's lifeline. Quietly
+  rewriting it from a commit turns a bad edit into an outage instead of a
+  failed deploy.
+- `uconnect-watch.service` / `.timer` — generated per host with the repo,
+  branch and interval baked in, so the repo copy is not authoritative.
 
 **The dashboard is strictly an accessory.** It is deployed only after the
 rendezvous server is confirmed healthy, and every failure path in its

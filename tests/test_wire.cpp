@@ -191,12 +191,12 @@ TEST(register_roundtrips_with_candidates_and_meta) {
     in.id         = topic_of(0x9f);
     in.mode       = TopicMode::Keyed;
     in.key_epoch  = 3;
-    in.listed     = true;
+    in.unlisted   = true;
     in.host_cands = {host_v4(40, 51820), srflx_v6(51820)};
     in.meta       = {'n', 'a', 'm', 'e'};
     in.cookie     = {1, 2, 3, 4};
 
-    auto dgram = pack(MsgType::Register, in, flags::kListed);
+    auto dgram = pack(MsgType::Register, in, flags::kUnlisted);
     Reader r{dgram};
     auto h = Header::decode(r);
     REQUIRE(h.has_value());
@@ -206,7 +206,7 @@ TEST(register_roundtrips_with_candidates_and_meta) {
     CHECK(out->id == in.id);
     CHECK(out->mode == TopicMode::Keyed);
     CHECK_EQ(out->key_epoch, 3);
-    CHECK(out->listed);  // carried in the header flags, not the body
+    CHECK(out->unlisted);  // carried in the header flags, not the body
     REQUIRE(out->host_cands.size() == 2);
     CHECK(out->host_cands[0] == in.host_cands[0]);
     CHECK(out->host_cands[1] == in.host_cands[1]);

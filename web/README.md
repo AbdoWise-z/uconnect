@@ -57,8 +57,9 @@ old rather than quietly wrong.
 
 Everything shown is **already public to anyone who can reach the server**:
 
-- Listing is opt-in per record — `publish(meta, listed=true)`. A topic absent
-  from the directory was never offered to it.
+- Topics are listed by default; a record opts out with
+  `publish(meta, unlisted=true)`. Hiding is sticky and topic-wide, so one
+  member asking for it hides the topic from everyone.
 - LOOKUP needs no key. `K` never reaches the server and is only ever used
   between peers, so knowing a `topic_id` is sufficient — which is exactly how
   every peer already finds the others.
@@ -157,15 +158,83 @@ package. `python3 -m venv --help` succeeds even when venv creation cannot, so
 both the installer and the watcher build a real one and print the actual error
 rather than guessing.
 
+## The interactive app (`/app`)
+
+Create a topic, and watch signaling activity as it happens.
+
+**Topic keys are generated in the browser and never sent here.** `crypto.
+getRandomValues` produces the 128-bit id and the 256-bit key; only the id is
+POSTed, so the page can list what you made. A server that minted keys would
+know every secret it handed out, which would quietly undo the one property the
+whole protocol exists to provide — so `/api/topic` *rejects* a request carrying
+a key rather than ignoring it, because a client sending one has misunderstood
+something worth failing loudly over.
+
+Nothing is created on the rendezvous server by pressing the button. A topic
+comes into being when a peer registers under it; until then the URI is just two
+random numbers.
+
+### What the live feed can and cannot show
+
+It carries **signaling, not conversations**. Peer traffic is end-to-end
+encrypted and never reaches the rendezvous server, so the observable events are
+registrations, membership changes, topic lifecycle and counter deltas. There is
+no way to stream message contents and there never will be.
+
+Membership join/leave is suppressed for sampled topics. LOOKUP returns at most
+30 members, so on a large topic a peer drops out of one sample and back into the
+next without having gone anywhere — reporting that as join/leave would be pure
+noise.
+
+The transport is **Server-Sent Events, not WebSockets**. Data only ever flows
+one way; SSE needs no extra dependency, works with the existing threaded worker,
+and reconnects by itself. A WebSocket would add a handshake, a second protocol
+and an async worker to operate, for a channel nothing ever sends up. The hub
+already speaks in discrete events, so swapping it later is contained.
+
+### Sessions and limits
+
+A session is a random id in a cookie. There is no login, and the session is not
+a credential — everything here is public anyway. It exists to bound resources.
+
+| Limit | Default | Why |
+|---|---|---|
+| sessions per IP | 10 | stops one host farming identities |
+| live feeds, global | 24 | each pins a server thread for as long as the tab is open |
+| live feeds per session | 2 | one tab cannot corner the pool |
+| topics per session | 20 | keeps `/api/topic` from being free storage |
+| idle session timeout | 30 min | without it the per-IP cap is permanent |
+
+That last one matters more than it looks: ten visits from an office NAT would
+otherwise lock out everyone behind it forever — a denial of service implemented
+by the thing meant to prevent one.
+
+`X-Forwarded-For` is **ignored** unless `UCONNECT_TRUST_PROXY=1`. It is a header
+anyone can send; trusting it without a proxy in front would let one host present
+a fresh address per request and make the per-IP limit decorative.
+
+All of this is single-process state, which is the third reason the unit runs one
+gunicorn worker. With four workers each would keep its own counts and "10 per
+IP" would really be forty.
+
 ## Routes
 
 | Route | Returns |
 |---|---|
-| `/` | topics, members, server counters |
+| `/` | topics, members, server counters, derived stats |
+| `/app` | create a topic, live activity feed |
 | `/topic/<hex>` | one topic, listed or not |
 | `/api/overview` | the same data as JSON (`?members=0` to skip lookups) |
 | `/api/topic/<hex>` | one topic as JSON |
+| `/api/topic` (POST) | record a browser-generated topic id against the session |
+| `/api/events` | Server-Sent Events feed |
+| `/api/build` | the commit the running deployment was built from |
 | `/healthz` | 200 if the rendezvous server is reachable, 503 otherwise |
+
+Every page header shows the deployed commit. The watcher writes that sha only
+after the build passed its tests and the service came up, so it names the commit
+actually serving rather than the newest one pushed — which is the whole reason
+to display it.
 
 ## Tests
 

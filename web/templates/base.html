@@ -70,12 +70,25 @@
 <body>
 <div class="wrap">
   <h1><a href="/" style="color:inherit">uConnect</a></h1>
-  <p class="sub">watching <code>{{ server }}</code></p>
+  <p class="sub">
+    watching <code>{{ server }}</code>
+    &nbsp;·&nbsp; <a href="/">topics</a>
+    &nbsp;·&nbsp; <a href="/app">create &amp; watch</a>
+    {% if build and build.short %}
+      &nbsp;·&nbsp; running
+      <a href="{{ build.url }}" title="{{ build.subject or build.sha }}"><code>{{ build.short }}</code></a>
+      {%- if build.subject %}<span style="color:var(--dim)"> — {{ build.subject[:56] }}</span>{% endif %}
+    {% endif %}
+  </p>
 
-  {% if error %}
-    <div class="banner {{ 'warn' if stale else 'bad' }}">
-      {% if stale %}Showing the last good data — refresh failed: {{ error }}
-      {% else %}{{ error }}{% endif %}
+  {# default(): pages that have no notion of staleness must not have to pass
+     these just to satisfy the shared chrome. #}
+  {% set _err = error|default(none) %}
+  {% set _stale = stale|default(false) %}
+  {% if _err %}
+    <div class="banner {{ 'warn' if _stale else 'bad' }}">
+      {% if _stale %}Showing the last good data — refresh failed: {{ _err }}
+      {% else %}{{ _err }}{% endif %}
     </div>
   {% endif %}
 

@@ -46,11 +46,11 @@ Store make_store(StoreConfig cfg = {}) {
     return Store{cfg, secret, 12345};
 }
 
-wire::Register reg_msg(TopicId id, bool listed = false, TopicMode mode = TopicMode::Keyed) {
+wire::Register reg_msg(TopicId id, bool unlisted = false, TopicMode mode = TopicMode::Keyed) {
     wire::Register m;
     m.id     = id;
     m.mode   = mode;
-    m.listed = listed;
+    m.unlisted = unlisted;
     return m;
 }
 
@@ -508,10 +508,10 @@ TEST(resolve_returns_metadata_for_any_dev_id) {
     CHECK(!s.resolve(unknown, t0()).has_value());
 }
 
-TEST(topics_listing_is_opt_in) {
+TEST(topics_are_listed_unless_a_member_opts_out) {
     auto s = make_store();
-    s.register_entry(reg_msg(topic_of(1), /*listed=*/false), ep(7, 4000), t0());
-    s.register_entry(reg_msg(topic_of(2), /*listed=*/true), ep(8, 4000), t0());
+    s.register_entry(reg_msg(topic_of(1), /*unlisted=*/true), ep(7, 4000), t0());
+    s.register_entry(reg_msg(topic_of(2), /*unlisted=*/false), ep(8, 4000), t0());
 
     auto r = s.list_topics(0, 100, t0());
     REQUIRE(r.topics.size() == 1);
@@ -522,8 +522,8 @@ TEST(topics_listing_is_opt_in) {
 
 TEST(topics_listing_counts_fresh_separately_from_total) {
     auto s = make_store();
-    s.register_entry(reg_msg(topic_of(1), true), ep(7, 4000), t0());
-    s.register_entry(reg_msg(topic_of(1), true), ep(8, 4000), t0() + 60s);
+    s.register_entry(reg_msg(topic_of(1)), ep(7, 4000), t0());
+    s.register_entry(reg_msg(topic_of(1)), ep(8, 4000), t0() + 60s);
 
     auto r = s.list_topics(0, 100, t0() + 60s);
     REQUIRE(r.topics.size() == 1);
@@ -534,7 +534,7 @@ TEST(topics_listing_counts_fresh_separately_from_total) {
 TEST(topics_listing_pages_with_a_cursor) {
     auto s = make_store();
     for (uint8_t i = 1; i <= 10; ++i) {
-        s.register_entry(reg_msg(topic_of(i), true), ep(i, 4000), t0());
+        s.register_entry(reg_msg(topic_of(i)), ep(i, 4000), t0());
     }
     auto p1 = s.list_topics(0, 4, t0());
     CHECK_EQ(p1.topics.size(), 4u);
@@ -586,16 +586,32 @@ TEST(relay_requires_the_senders_own_mac) {
 // ---------------------------------------------------------------------------
 TEST(stats_reports_records_not_unique_devices) {
     auto s = make_store();
-    s.register_entry(reg_msg(topic_of(1), true), ep(7, 4000), t0());
-    s.register_entry(reg_msg(topic_of(1), true), ep(8, 4000), t0());
-    s.register_entry(reg_msg(topic_of(2), false), ep(9, 4000), t0() + 60s);
+    s.register_entry(reg_msg(topic_of(1), /*unlisted=*/true), ep(7, 4000), t0());
+    s.register_entry(reg_msg(topic_of(1), /*unlisted=*/true), ep(8, 4000), t0());
+    s.register_entry(reg_msg(topic_of(2), /*unlisted=*/false), ep(9, 4000), t0() + 60s);
 
     auto st = s.stats(t0() + 60s);
     CHECK_EQ(st.entries_total, 3u);
     CHECK_EQ(st.entries_fresh, 1u);  // the first two went stale
     CHECK_EQ(st.topics_total, 2u);
-    CHECK_EQ(st.topics_listed, 1u);
+    CHECK_EQ(st.topics_listed, 1u);  // topic 1 hidden by its members, topic 2 not
     CHECK_EQ(st.registers, 3u);
+}
+
+TEST(one_member_asking_to_be_hidden_hides_the_whole_topic) {
+    // Sticky in the direction that fails safe. Under the old opt-IN rule the
+    // sticky bit was the one that EXPOSED, so a single careless client
+    // published a private topic and no other member could undo it.
+    auto s = make_store();
+    s.register_entry(reg_msg(topic_of(1), /*unlisted=*/false), ep(7, 4000), t0());
+    CHECK_EQ(s.list_topics(0, 100, t0()).topics.size(), 1u);
+
+    s.register_entry(reg_msg(topic_of(1), /*unlisted=*/true), ep(8, 4000), t0());
+    CHECK_EQ(s.list_topics(0, 100, t0()).topics.size(), 0u);
+
+    // And a later member who does not ask to be hidden cannot re-expose it.
+    s.register_entry(reg_msg(topic_of(1), /*unlisted=*/false), ep(9, 4000), t0());
+    CHECK_EQ(s.list_topics(0, 100, t0()).topics.size(), 0u);
 }
 
 TEST(stats_counts_rejections_so_quotas_can_be_tuned_against_real_numbers) {

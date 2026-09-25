@@ -70,7 +70,7 @@ std::optional<Register> Register::decode(Reader& r, const Header& h) {
     if (mode > static_cast<uint8_t>(TopicMode::Keyed)) return std::nullopt;
     m.mode      = static_cast<TopicMode>(mode);
     m.key_epoch = r.u8();
-    m.listed    = (h.flags & flags::kListed) != 0;
+    m.unlisted  = (h.flags & flags::kUnlisted) != 0;
     if (!read_vec(r, m.host_cands, kMaxCandidates, read_candidate)) return std::nullopt;
     if (!read_blob16_capped(r, m.meta, kMaxMeta)) return std::nullopt;
     auto cookie = r.blob8();

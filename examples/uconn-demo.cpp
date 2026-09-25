@@ -36,7 +36,7 @@ void usage() {
         "  --create-open          generate an OPEN topic (no authentication!)\n"
         "  --name <string>        name announced in metadata (default: anon)\n"
         "  --seconds <n>          how long to run (default 20)\n"
-        "  --listed               opt in to the public topic listing\n"
+        "  --unlisted             keep this topic OUT of the public listing\n"
         "  --explore              list topics on the server and exit\n"
         "  --stats                print server stats and exit\n");
 }
@@ -46,7 +46,7 @@ void usage() {
 int main(int argc, char** argv) {
     std::string server, topic_uri, name = "anon";
     int         seconds     = 20;
-    bool        create      = false, create_open = false, listed = false;
+    bool        create      = false, create_open = false, unlisted = false;
     bool        explore     = false, want_stats = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--create") create = true;
         else if (a == "--create-open") create_open = true;
-        else if (a == "--listed") listed = true;
+        else if (a == "--unlisted") unlisted = true;
         else if (a == "--explore") explore = true;
         else if (a == "--stats") want_stats = true;
         else if (a == "--server") { if (auto* v = next(i)) server = v; }
@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
         });
 
         std::vector<uint8_t> meta(name.begin(), name.end());
-        if (!topic.publish(meta, listed)) {
+        if (!topic.publish(meta, unlisted)) {
             std::fprintf(stderr, "[%s] publish failed (is the server running?)\n",
                          name.c_str());
             return 1;

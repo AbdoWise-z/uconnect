@@ -203,7 +203,7 @@ RegisterResult Store::register_entry(const wire::Register& msg, const Endpoint& 
     r.last_seen  = now;
     r.key_epoch  = msg.key_epoch;
     r.mode       = msg.mode;
-    r.listed     = msg.listed;
+    r.unlisted   = msg.unlisted;
     r.last_seq   = 0;
 
     // A fresh lease token on every registration. A device that restarted has
@@ -219,10 +219,18 @@ RegisterResult Store::register_entry(const wire::Register& msg, const Endpoint& 
         topic_order_.push_back(msg.id);
     }
     topic.mode = msg.mode;
-    // Listed is sticky per topic: one member opting in makes the topic
-    // discoverable. That is why `listed` defaults to false everywhere -- a
-    // single careless client would otherwise expose a private topic.
-    if (msg.listed) topic.listed = true;
+    // Topics are listed by default; hiding is sticky. One member asking to be
+    // unlisted hides the topic for everyone, for the life of the topic -- which
+    // ends when its last member goes, since the entry is erased then. No
+    // recount on departure: it would be O(members) on every leave, and the
+    // conservative answer is the right one to be wrong towards anyway.
+    //
+    // The stickiness runs this way round because the two mistakes are not
+    // symmetric. A topic wrongly hidden is an inconvenience someone notices; a
+    // topic wrongly exposed cannot be taken back. Under the previous opt-in
+    // rule the sticky bit was the one that exposed, so a single careless client
+    // published a private topic and no other member could undo it.
+    if (msg.unlisted) topic.listed = false;
     if (is_new) {
         add_member(topic, dev);
         topic.per_ip[ip_key(src)]++;

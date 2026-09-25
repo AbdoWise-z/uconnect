@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block title %}uConnect — create &amp; watch{% endblock %}
+
+{% block body %}
+{% if limited %}
+  <div class="banner bad">{{ limited }}</div>
+{% endif %}
+
+<h2>Create a topic</h2>
+<div class="panel">
+  <p class="sub" style="margin:0 0 .75rem">
+    The key is generated <strong>in your browser</strong> and never sent to this
+    server. A topic's secret is the only credential the protocol has — a server
+    that minted it would know every key it handed out, which would undo the one
+    property the whole design exists to provide. Only the topic id is recorded
+    here, and the rendezvous server would learn that anyway the moment a peer
+    registered.
+  </p>
+  <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+    <button id="mk-keyed" {% if limited %}disabled{% endif %}>Create keyed topic</button>
+    <button id="mk-open" style="background:var(--warn)" {% if limited %}disabled{% endif %}>
+      Create open topic
+    </button>
+  </div>
+  <div id="made" style="display:none;margin-top:1rem">
+    <div class="sub" style="margin:0 0 .35rem">Share this URI. Anyone who has it can join.</div>
+    <div style="display:flex;gap:.5rem">
+      <input type="text" id="uri" readonly class="mono">
+      <button id="copy">Copy</button>
+    </div>
+    <p class="sub" id="warn-open" style="display:none;color:var(--warn);margin:.6rem 0 0">
+      This is an <strong>open</strong> topic: encrypted against a passive
+      observer and nothing else. Anyone on path, including the rendezvous
+      server, can sit in the middle undetectably. Use a keyed topic for
+      anything confidential.
+    </p>
+    <p class="sub" style="margin:.6rem 0 0">
+      Nothing exists on the server yet — a topic comes into being when a peer
+      registers under it:
+      <br><code id="cmd" class="mono"></code>
+    </p>
+  </div>
+</div>
+
+{% if topics %}
+  <h2>Created in this session</h2>
+  <div class="panel">
+    {% for t in topics %}
+      <div class="mono" style="padding:.15rem 0">
+        <a href="/topic/{{ t }}">{{ t }}</a>
+      </div>
+    {% endfor %}
+    <p class="sub" style="margin:.6rem 0 0">
+      Ids only. The keys were never sent here, so this list cannot be used to
+      join anything — keep the URIs you copied.
+    </p>
+  </div>
+{% endif %}
+
+<h2>Live activity</h2>
+<div class="panel">
+  <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+    <span id="dot" class="tag">connecting…</span>
+    <span class="sub" style="margin:0">
+      {{ limits.live_streams }}/{{ limits.max_total_streams }} feeds open ·
+      {{ limits.sessions }} session{{ '' if limits.sessions == 1 else 's' }}
+      from {{ limits.unique_ips }} address{{ '' if limits.unique_ips == 1 else 'es' }}
+    </span>
+  </div>
+  <div id="feed" class="mono" style="margin-top:.75rem;max-height:340px;overflow-y:auto;
+       font-size:.82rem;line-height:1.7"></div>
+  <p class="sub" style="margin:.75rem 0 0">
+    This is <strong>signaling</strong>, not conversations. Peer traffic is
+    end-to-end encrypted and never reaches the rendezvous server, so what
+    passes through here is registrations, lookups and membership changes —
+    never a message.
+  </p>
+</div>
+
+<script>
+const hex = b => Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+
+// crypto.getRandomValues, not Math.random. Math.random is not a CSPRNG in any
+// browser and its output is predictable enough to enumerate; a topic key drawn
+// from it would be guessable.
+function randomHex(bytes) {
+  const b = new Uint8Array(bytes);
+  crypto.getRandomValues(b);
+  return hex(b);
+}
+
+async function create(keyed) {
+  const id = randomHex(16);                       // 128-bit topic id
+  const key = keyed ? randomHex(32) : null;       // 256-bit secret, stays here
+  const uri = 'uconn://' + id + (key ? '#' + key : '');
+
+  document.getElementById('made').style.display = '';
+  document.getElementById('uri').value = uri;
+  document.getElementById('warn-open').style.display = keyed ? 'none' : '';
+  document.getElementById('cmd').textContent =
+    "uconn-chat --server {{ server }} --topic '" + uri + "' --nick you";
+
+  // Only the id. Sending the key would defeat the point of generating it here.
+  try {
+    const r = await fetch('/api/topic', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({topic_id: id})
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      note('could not record topic: ' + (j.error || r.status), 'bad');
+    }
+  } catch (e) { /* the URI is already usable; recording it is a convenience */ }
+}
+
+document.getElementById('mk-keyed').onclick = () => create(true);
+document.getElementById('mk-open').onclick = () => create(false);
+document.getElementById('copy').onclick = () => {
+  const el = document.getElementById('uri');
+  el.select(); navigator.clipboard.writeText(el.value);
+};
+
+// --- live feed -------------------------------------------------------------
+const feed = document.getElementById('feed');
+const dot = document.getElementById('dot');
+let lines = 0;
+
+function note(text, cls) {
+  const d = document.createElement('div');
+  const t = new Date().toLocaleTimeString();
+  d.innerHTML = '<span style="color:var(--dim)">' + t + '</span> ' +
+                (cls ? '<span class="tag ' + cls + '">' + text + '</span>' : text);
+  feed.prepend(d);
+  if (++lines > 200) { feed.removeChild(feed.lastChild); lines--; }
+}
+
+const short = s => (s || '').slice(0, 12);
+
+{% if not limited %}
+const es = new EventSource('/api/events');
+es.onopen = () => { dot.textContent = 'live'; dot.className = 'tag keyed'; };
+es.onerror = () => { dot.textContent = 'reconnecting…'; dot.className = 'tag stale'; };
+es.addEventListener('ready', e => note('watching ' + JSON.parse(e.data).topics + ' topic(s)'));
+es.addEventListener('topic_new', e => { const d = JSON.parse(e.data);
+  note('topic <a href="/topic/' + d.topic + '">' + short(d.topic) + '</a> appeared (' + d.mode + ')'); });
+es.addEventListener('topic_gone', e => { const d = JSON.parse(e.data);
+  note('topic ' + short(d.topic) + ' gone'); });
+es.addEventListener('peer_join', e => { const d = JSON.parse(e.data);
+  note('peer ' + short(d.dev_id) + (d.name ? ' (' + d.name + ')' : '') +
+       ' joined ' + short(d.topic)); });
+es.addEventListener('peer_leave', e => { const d = JSON.parse(e.data);
+  note('peer ' + short(d.dev_id) + (d.name ? ' (' + d.name + ')' : '') +
+       ' left ' + short(d.topic)); });
+es.addEventListener('topic_count', e => { const d = JSON.parse(e.data);
+  note(short(d.topic) + ' now ' + d.peers + ' peer(s), ' + d.fresh + ' fresh'); });
+es.addEventListener('activity', e => { const d = JSON.parse(e.data);
+  note(Object.entries(d.deltas).map(([k, v]) => k + ' +' + v).join(', ')); });
+es.addEventListener('error', e => { try {
+  note(JSON.parse(e.data).message, 'stale'); } catch (_) {} });
+{% else %}
+dot.textContent = 'feed unavailable'; dot.className = 'tag stale';
+{% endif %}
+</script>
+{% endblock %}

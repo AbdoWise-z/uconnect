@@ -20,6 +20,14 @@ import threading
 import time
 from typing import Any
 
+__all__ = [
+    "Observer",
+    "ObserverError",
+    "summarise",
+    "derived_stats",
+    "deployment_info",
+]
+
 
 class ObserverError(RuntimeError):
     pass
@@ -155,6 +163,78 @@ class Observer:
         return self._cached(f"topic:{topic_id}", ["--topic", topic_id])
 
 
+def deployment_info(
+    sha_path: str | None = None, src_path: str | None = None
+) -> dict:
+    """What commit the running deployment was built from.
+
+    The watcher writes the sha only after the build passed its tests and the
+    service came up, so this is the commit actually serving, not merely the
+    newest one pushed. That distinction is the entire reason to show it.
+    """
+    sha_path = sha_path or os.environ.get("UCONNECT_SHA_FILE", "/opt/uconnect/deployed.sha")
+    src_path = src_path or os.environ.get("UCONNECT_SRC_DIR", "/opt/uconnect/src")
+
+    info: dict[str, Any] = {"sha": None, "short": None, "subject": None, "url": None}
+    try:
+        with open(sha_path) as fh:
+            sha = fh.read().strip()
+        if sha:
+            info["sha"] = sha
+            info["short"] = sha[:7]
+            info["url"] = f"https://github.com/AbdoWise-z/uconnect/commit/{sha}"
+            info["age_s"] = int(time.time() - os.path.getmtime(sha_path))
+    except OSError:
+        return info
+
+    # The subject is a nicety; a missing or unreadable git tree must not turn
+    # the header into an error page.
+    try:
+        proc = subprocess.run(
+            ["git", "-C", src_path, "log", "-1", "--pretty=%s", info["sha"]],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            info["subject"] = proc.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return info
+
+
+def derived_stats(data: dict) -> dict:
+    """Numbers a reader wants that the raw counters do not state outright."""
+    s = data.get("stats") or {}
+    topics = data.get("topics", [])
+
+    peers = sum(t.get("peers", 0) for t in topics)
+    fresh = sum(t.get("fresh_peers", 0) for t in topics)
+    keyed = sum(1 for t in topics if t.get("mode") == "keyed")
+
+    total_records = s.get("entries_total", 0)
+    fresh_records = s.get("entries_fresh", 0)
+    rejects = (s.get("rej_bad_auth", 0) + s.get("rej_quota", 0)
+               + s.get("rej_rate_limited", 0))
+
+    return {
+        "listed_peers": peers,
+        "listed_fresh": fresh,
+        "keyed_topics": keyed,
+        "open_topics": len(topics) - keyed,
+        # Records past the 45s freshness line: alive on paper, but their NAT
+        # binding may already be gone. A climbing number here is the early
+        # symptom of clients that have stopped sending keepalives.
+        "stale_records": max(0, total_records - fresh_records),
+        "largest_topic": max((t.get("peers", 0) for t in topics), default=0),
+        "avg_peers_per_topic": round(peers / len(topics), 1) if topics else 0,
+        "relay_share": (
+            round(100.0 * s.get("relays_allocated", 0) / s["registers"], 1)
+            if s.get("registers") else 0.0
+        ),
+        "relay_mib": round(s.get("relay_bytes", 0) / (1024 * 1024), 2),
+        "rejects_total": rejects,
+    }
+
+
 def summarise(data: dict) -> dict:
     """Flatten the observer's output into what a template wants.
 
@@ -187,4 +267,5 @@ def summarise(data: dict) -> dict:
         "topics": topics,
         "topic_count": len(topics),
         "peer_count": sum(t["peers"] for t in topics),
+        "derived": derived_stats(data),
     }

@@ -178,6 +178,174 @@ def test_garbage_output_is_explained():
         check("JSON" in str(exc), "names the real problem")
 
 
+
+# ---------------------------------------------------------------------------
+# Sessions and limits
+# ---------------------------------------------------------------------------
+from sessions import LimitError, SessionRegistry, client_ip  # noqa: E402
+from events import EventHub  # noqa: E402
+
+
+def test_session_cap_per_ip():
+    print("caps sessions per IP")
+    r = SessionRegistry(max_per_ip=3)
+    sids = [r.touch(None, "1.2.3.4").sid for _ in range(3)]
+    check(len(set(sids)) == 3, "issues distinct session ids")
+    try:
+        r.touch(None, "1.2.3.4")
+        check(False, "should have refused the 4th")
+    except LimitError as e:
+        check("too many" in str(e), "refuses past the cap with a usable message")
+    check(r.touch(None, "5.6.7.8") is not None, "a different address is unaffected")
+    check(r.touch(sids[0], "1.2.3.4").sid == sids[0], "an existing session still works")
+
+
+def test_idle_sessions_expire():
+    # Without reaping, the cap becomes permanent: ten visits from an office NAT
+    # would lock out everyone behind it forever.
+    print("expires idle sessions so the cap is not permanent")
+    r = SessionRegistry(max_per_ip=2, idle_timeout=0.0)
+    r.touch(None, "1.1.1.1")
+    r.touch(None, "1.1.1.1")
+    try:
+        r.touch(None, "1.1.1.1")
+        check(True, "idle sessions were reaped, so a new one is allowed")
+    except LimitError:
+        check(False, "should have reaped idle sessions")
+
+
+def test_stream_limits():
+    print("caps live streams globally and per session")
+    r = SessionRegistry(max_per_ip=10, max_total_streams=2, max_streams_per_session=1)
+    a = r.touch(None, "1.1.1.1").sid
+    b = r.touch(None, "2.2.2.2").sid
+    c = r.touch(None, "3.3.3.3").sid
+    r.open_stream(a); r.open_stream(b)
+    try:
+        r.open_stream(c); check(False, "should have hit the global cap")
+    except LimitError as e:
+        check("capacity" in str(e), "global cap refuses with a clear message")
+    try:
+        r.open_stream(a); check(False, "should have hit the per-session cap")
+    except LimitError:
+        check(True, "per-session cap holds")
+    r.close_stream(a)
+    r.open_stream(c)
+    check(True, "closing a stream frees the slot")
+
+
+def test_stream_slot_is_not_leaked_by_a_reaped_session():
+    # A session reaped mid-stream must still return its slot, or the feed
+    # slowly closes itself to everyone.
+    print("does not leak a stream slot when the session is gone")
+    r = SessionRegistry(max_total_streams=1, idle_timeout=0.0)
+    s = r.touch(None, "1.1.1.1").sid
+    r.open_stream(s)
+    r._sessions.clear()          # simulate the reaper taking it mid-stream
+    r.close_stream(s)
+    check(r._live_streams == 0, "global counter returned to zero")
+
+
+def test_topic_cap_per_session():
+    print("caps topics recorded per session")
+    r = SessionRegistry(max_topics_per_session=2)
+    s = r.touch(None, "1.1.1.1").sid
+    r.record_topic(s, "a" * 32)
+    r.record_topic(s, "b" * 32)
+    try:
+        r.record_topic(s, "c" * 32)
+        check(False, "should have refused")
+    except LimitError:
+        check(True, "refuses past the cap")
+    r.record_topic(s, "a" * 32)
+    check(len(r._sessions[s].topics) == 2, "re-recording an existing id is a no-op")
+
+
+def test_forwarded_for_is_not_trusted_by_default():
+    # It is a header; anyone can send one. Trusting it by default would turn
+    # the per-IP limit into a suggestion.
+    print("ignores X-Forwarded-For unless told to trust it")
+    hdrs = {"X-Forwarded-For": "9.9.9.9"}
+    check(client_ip(hdrs, "1.2.3.4", trust_proxy=False) == "1.2.3.4", "uses the peer address")
+    check(client_ip(hdrs, "1.2.3.4", trust_proxy=True) == "9.9.9.9", "honours it when enabled")
+
+
+# ---------------------------------------------------------------------------
+# Event diffing
+# ---------------------------------------------------------------------------
+def _snap(topics):
+    return {"ok": True, "topics": topics, "stats": {"registers": 0, "lookups": 0}}
+
+
+def _topic(tid, peers, members):
+    return {"id": tid, "mode": "keyed", "peers": peers, "fresh_peers": peers,
+            "members": [{"dev_id": d, "meta_text": n} for d, n in members]}
+
+
+def test_first_snapshot_is_a_baseline():
+    print("does not replay the world as new events on first poll")
+    hub = EventHub.__new__(EventHub)
+    hub._lock = __import__("threading").Lock()
+    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
+    hub._diff(_snap([_topic("a" * 32, 2, [("d1", "alice"), ("d2", "bob")])]))
+    kinds = [e["kind"] for e in hub._recent]
+    check(kinds == ["ready"], f"only a baseline event, got {kinds}")
+
+
+def test_diff_reports_joins_leaves_and_topics():
+    print("reports joins, leaves and topic lifecycle")
+    hub = EventHub.__new__(EventHub)
+    hub._lock = __import__("threading").Lock()
+    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
+
+    hub._diff(_snap([_topic("a" * 32, 1, [("d1", "alice")])]))
+    hub._recent.clear()
+    hub._diff(_snap([_topic("a" * 32, 2, [("d1", "alice"), ("d2", "bob")]),
+                     _topic("b" * 32, 1, [("d3", "carol")])]))
+    kinds = {e["kind"] for e in hub._recent}
+    check("peer_join" in kinds, "reports a join")
+    check("topic_new" in kinds, "reports a new topic")
+    joined = [e for e in hub._recent if e["kind"] == "peer_join"]
+    check(any(e.get("name") == "bob" for e in joined), "carries the metadata name")
+
+    hub._recent.clear()
+    hub._diff(_snap([_topic("a" * 32, 1, [("d1", "alice")])]))
+    kinds = {e["kind"] for e in hub._recent}
+    check("peer_leave" in kinds, "reports a leave")
+    check("topic_gone" in kinds, "reports a topic disappearing")
+
+
+def test_sampled_topics_do_not_produce_phantom_events():
+    # LOOKUP samples. On a big topic a peer drops out of one sample and back
+    # into the next without having gone anywhere; reporting that as join/leave
+    # would be pure noise.
+    print("suppresses join/leave on sampled topics")
+    hub = EventHub.__new__(EventHub)
+    hub._lock = __import__("threading").Lock()
+    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
+
+    hub._diff(_snap([_topic("a" * 32, 500, [("d1", "x"), ("d2", "y")])]))
+    hub._recent.clear()
+    hub._diff(_snap([_topic("a" * 32, 500, [("d3", "z"), ("d4", "w")])]))
+    kinds = {e["kind"] for e in hub._recent}
+    check("peer_join" not in kinds and "peer_leave" not in kinds,
+          f"no membership events for a sampled topic, got {kinds}")
+
+
+def test_slow_subscriber_does_not_grow_memory():
+    print("drops events for a subscriber that stopped reading")
+    import queue as _q
+    hub = EventHub.__new__(EventHub)
+    hub._lock = __import__("threading").Lock()
+    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
+    q = _q.Queue(maxsize=2)
+    hub._subscribers.add(q)
+    for i in range(50):
+        hub._publish("activity", deltas={"lookups": i})
+    check(q.qsize() == 2, "queue stayed bounded")
+    check(len(hub._recent) <= 100, "history stayed bounded")
+
+
 if __name__ == "__main__":
     for fn in [
         test_parses_and_summarises,
@@ -188,8 +356,18 @@ if __name__ == "__main__":
         test_rejects_bad_topic_ids,
         test_missing_binary_is_explained,
         test_garbage_output_is_explained,
+        test_session_cap_per_ip,
+        test_idle_sessions_expire,
+        test_stream_limits,
+        test_stream_slot_is_not_leaked_by_a_reaped_session,
+        test_topic_cap_per_session,
+        test_forwarded_for_is_not_trusted_by_default,
+        test_first_snapshot_is_a_baseline,
+        test_diff_reports_joins_leaves_and_topics,
+        test_sampled_topics_do_not_produce_phantom_events,
+        test_slow_subscriber_does_not_grow_memory,
     ]:
         fn()
     print()
-    print("FAILED" if FAILED else "all observer tests passed")
+    print("FAILED" if FAILED else "all web tests passed")
     sys.exit(1 if FAILED else 0)

@@ -484,9 +484,15 @@ it registers nothing and does not appear in the listings it reports. Nothing in
 Python speaks the wire protocol — it shells out to a binary that links this
 library, so the framing has exactly one implementation and cannot drift.
 
-Everything shown is already public to anyone who can reach the server: listing
-is opt-in, LOOKUP needs no key because `K` never gets there, and metadata is
-plaintext by design. See [web/README.md](web/README.md).
+There is also a small interactive app at `/app`: create a topic and watch
+signaling activity live. **Topic keys are generated in the browser and never
+sent to the server** — a server that minted them would know every secret it
+handed out. The feed carries registrations and membership changes, never
+message contents: those are end-to-end encrypted and never reach the server.
+
+Everything shown is already public to anyone who can reach the server: topics
+are listed unless a member opts out, LOOKUP needs no key because `K` never gets
+there, and metadata is plaintext by design. See [web/README.md](web/README.md).
 
 On a deployed box the repo watcher redeploys the dashboard alongside the server
 on every commit — `sudo bash deploy/install-watcher.sh --with-web`. It is
@@ -495,7 +501,7 @@ no failure of its own is allowed to fail the deploy or trigger a rollback.
 
 ## Tests
 
-224 unit cases plus two end-to-end smoke tests — one for punch + handshake +
+225 unit cases plus two end-to-end smoke tests — one for punch + handshake +
 messaging, one that moves a megabyte over a stream and verifies every byte.
 
 The crypto is validated against published vectors — RFC 7693 (BLAKE2s),

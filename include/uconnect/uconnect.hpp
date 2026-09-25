@@ -210,7 +210,15 @@ public:
     // --- membership --------------------------------------------------------
     // REGISTER with the server and start the ~20s keepalive. Until this is
     // called the node can find others but cannot be found.
-    bool publish(std::span<const uint8_t> meta = {}, bool listed = false);
+    // Topics appear in the public listing by default. Pass unlisted=true to
+    // keep this one out of it.
+    //
+    // Hiding is sticky and topic-wide: one member asking for it hides the
+    // topic from everyone, for as long as the topic exists. Being unlisted is
+    // not secrecy -- anyone holding the topic_id can still look the topic up,
+    // because that is how peers find each other. It only means the topic is
+    // absent from the directory.
+    bool publish(std::span<const uint8_t> meta = {}, bool unlisted = false);
     void unpublish();
     std::optional<DevId> self() const;
 

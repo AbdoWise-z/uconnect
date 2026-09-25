@@ -253,7 +253,7 @@ struct Topic::Impl {
     wire::LeaseToken     lease{};
     uint64_t             seq       = 0;
     bool                 published = false;
-    bool                 listed    = false;
+    bool                 unlisted  = false;
     std::vector<uint8_t> meta;
     Instant              next_keepalive{};
     Instant              next_discovery{};
@@ -1270,12 +1270,12 @@ void Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, Instant now)
     auto build = [this, &ti, tid, txn](const std::vector<uint8_t>& ck) {
         std::vector<uint8_t> buf(wire::kMaxDatagram);
         wire::Writer         w{buf};
-        uint8_t flags = ti.listed ? wire::flags::kListed : 0;
+        uint8_t flags = ti.unlisted ? wire::flags::kUnlisted : 0;
         wire::Header{wire::MsgType::Register, wire::kVersion, flags, txn}.encode(w);
         wire::Register m;
         m.id         = tid;
         m.mode       = ti.keyed ? TopicMode::Keyed : TopicMode::Open;
-        m.listed     = ti.listed;
+        m.unlisted   = ti.unlisted;
         m.host_cands = host_cands;
         m.meta       = ti.meta;
         m.cookie     = ck;
@@ -1469,12 +1469,12 @@ Topic::~Topic() = default;
 const TopicId& Topic::id() const { return impl_->creds.id; }
 bool Topic::is_authenticated() const { return impl_->keyed; }
 
-bool Topic::publish(std::span<const uint8_t> meta, bool listed) {
+bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
     auto& n = *impl_->node;
     std::unique_lock<std::mutex> lk(n.mu);
 
     impl_->meta.assign(meta.begin(), meta.end());
-    impl_->listed = listed;
+    impl_->unlisted = unlisted;
 
     uint32_t txn_before = n.next_txn;
     n.send_register(*impl_, impl_->creds.id, std::chrono::steady_clock::now());

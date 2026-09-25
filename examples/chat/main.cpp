@@ -144,7 +144,7 @@ void usage() {
         "  --create                create a keyed topic and print its invite\n"
         "  --create-open           create an OPEN topic (no authentication)\n"
         "  --nick <name>           your display name (default: your username)\n"
-        "  --listed                opt in to the server's public topic listing\n"
+        "  --unlisted              keep this topic OUT of the public listing\n"
         "  --port <n>              bind a specific local UDP port\n"
         "\n"
         "Type a message and press Enter to send it to everyone.\n"
@@ -186,7 +186,7 @@ std::string timestamp() {
 
 int main(int argc, char** argv) {
     std::string server, topic_uri, nick = default_nick();
-    bool        create = false, create_open = false, listed = false;
+    bool        create = false, create_open = false, unlisted = false;
     uint16_t    port = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--create") create = true;
         else if (a == "--create-open") create_open = true;
-        else if (a == "--listed") listed = true;
+        else if (a == "--unlisted") unlisted = true;
         else if (a == "--server") { if (auto* v = next(i)) server = v; }
         else if (a == "--topic")  { if (auto* v = next(i)) topic_uri = v; }
         else if (a == "--nick")   { if (auto* v = next(i)) nick = v; }
@@ -322,7 +322,7 @@ int main(int argc, char** argv) {
         });
 
         std::vector<uint8_t> meta(nick.begin(), nick.end());
-        if (!topic.publish(meta, listed)) {
+        if (!topic.publish(meta, unlisted)) {
             std::fprintf(stderr,
                          "could not register with %s -- is the rendezvous server "
                          "running?\n",
@@ -436,7 +436,7 @@ int main(int argc, char** argv) {
                 nick = arg;
                 term.set_prompt("[" + nick + "] ");
                 std::vector<uint8_t> m(nick.begin(), nick.end());
-                topic.publish(m, listed);  // republish metadata
+                topic.publish(m, unlisted);  // republish metadata
                 topic.broadcast(encode(MsgType::Hello, nick));
                 sys("you are now " + nick);
             }

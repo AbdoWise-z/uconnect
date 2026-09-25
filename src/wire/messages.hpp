@@ -84,7 +84,12 @@ constexpr MsgClass classify(uint8_t type) {
 
 // --- flags -----------------------------------------------------------------
 namespace flags {
-inline constexpr uint8_t kListed   = 1u << 0;  // Register: include in Topics listing
+// Register: keep this topic OUT of the public listing. Inverted from the
+// obvious direction on purpose -- topics are listed by default, and the
+// interesting request is the one to be hidden. An old client that set this bit
+// meaning "list me" now reads as "hide me", which is the safe way round for a
+// flag whose two failure modes are "invisible" and "exposed".
+inline constexpr uint8_t kUnlisted = 1u << 0;
 inline constexpr uint8_t kWantMeta = 1u << 1;  // Lookup: include meta in entries
 inline constexpr uint8_t kStale    = 1u << 0;  // PeerEntry: past the freshness window
 }  // namespace flags
@@ -146,7 +151,7 @@ struct Register {
     TopicId                id{};
     TopicMode              mode      = TopicMode::Open;
     uint8_t                key_epoch = 0;
-    bool                   listed    = false;
+    bool                   unlisted  = false;
     std::vector<Candidate> host_cands;  // client supplies host only; srflx is observed
     std::vector<uint8_t>   meta;
     std::vector<uint8_t>   cookie;      // from Retry; empty on the first attempt

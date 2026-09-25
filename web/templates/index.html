@@ -12,12 +12,28 @@
       <div class="stat"><div class="n">{{ s.entries_total }}</div><div class="k">records total</div></div>
       <div class="stat"><div class="n">{{ s.relays_open }}</div><div class="k">relays open</div></div>
     </div>
+    {% set d = view.derived %}
+    <div class="grid" style="margin-top:.75rem">
+      <div class="stat"><div class="n">{{ d.keyed_topics }}/{{ d.open_topics }}</div>
+      <div class="k">keyed / open</div></div>
+      <div class="stat"><div class="n">{{ d.largest_topic }}</div><div class="k">largest topic</div></div>
+      <div class="stat"><div class="n">{{ d.avg_peers_per_topic }}</div><div class="k">avg peers/topic</div></div>
+      <div class="stat"><div class="n">{{ d.stale_records }}</div><div class="k">stale records</div></div>
+      <div class="stat"><div class="n">{{ d.relay_share }}%</div><div class="k">needed a relay</div></div>
+      <div class="stat"><div class="n">{{ d.relay_mib }}</div><div class="k">relayed MiB</div></div>
+    </div>
     <p class="sub" style="margin-top:.75rem">
       {{ s.registers }} registers · {{ s.lookups }} lookups · {{ s.keepalives }} keepalives ·
       {{ s.rebinds }} NAT rebinds · {{ s.expired }} expired
-      {%- if s.rej_bad_auth or s.rej_quota or s.rej_rate_limited %}
+      {%- if d.rejects_total %}
         · rejected: {{ s.rej_bad_auth }} auth, {{ s.rej_quota }} quota, {{ s.rej_rate_limited }} rate
       {%- endif %}
+    </p>
+    <p class="sub" style="margin-top:-.5rem">
+      <em>Stale records</em> are past the 45s freshness line: alive on paper, but
+      their NAT binding may already be gone.
+      <em>Needed a relay</em> is the share of registrations that could not punch —
+      symmetric NAT on both ends.
     </p>
   {% endif %}
 
@@ -64,9 +80,11 @@
     {% endfor %}
   {% else %}
     <div class="panel empty">
-      No listed topics.<br>
+      No topics right now.<br>
       <span style="font-size:.85rem">
-        Topics appear here only when a peer opts in with <code>publish(meta, listed=true)</code>.
+        Topics are listed by default; they appear once a peer registers and
+        disappear 90 seconds after its last keepalive. A topic is absent only if
+        a member asked to be hidden with <code>publish(meta, unlisted=true)</code>.
       </span>
     </div>
   {% endif %}

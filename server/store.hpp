@@ -77,7 +77,7 @@ struct Record {
     Instant                created{};
     uint8_t                key_epoch = 0;
     TopicMode              mode      = TopicMode::Open;
-    bool                   listed    = false;
+    bool                   unlisted  = false;  // this member asked to be hidden
 };
 
 // --- relay -----------------------------------------------------------------
@@ -276,7 +276,11 @@ private:
 
     struct TopicState {
         TopicMode          mode   = TopicMode::Open;
-        bool               listed = false;
+        // Listed by default; any one member asking to be hidden hides the whole
+        // topic. Sticky in the direction that fails safe: with an opt-IN flag a
+        // single careless client exposed a private topic and nobody could undo
+        // it, so the sticky bit is now the one that conceals.
+        bool               listed = true;
         std::vector<DevId> members;  // swap-and-pop; order is not meaningful
         std::unordered_map<DevId, size_t, ArrayHash> pos;
         // Per-source-IP counts, maintained incrementally. Scanning the member

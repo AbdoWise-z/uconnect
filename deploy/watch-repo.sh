@@ -325,6 +325,12 @@ check_once() {
     fi
 
     echo "$remote_sha" > "$WORKDIR/deployed.sha"
+    # The subject alongside it, so the dashboard never has to run git. It runs
+    # as its own unprivileged user and this tree is root-owned, so a git call
+    # from there trips the dubious-ownership guard and returns nothing --
+    # which looked like "no subject" rather than "no permission".
+    printf '%s\n' "$subject" > "$WORKDIR/deployed.subject"
+    chmod 0644 "$WORKDIR/deployed.sha" "$WORKDIR/deployed.subject" 2>/dev/null || true
     log "deployed ${remote_sha:0:8} successfully"
 
     # Only now, with the server confirmed up. The result is ignored on purpose:

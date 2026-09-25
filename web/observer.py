@@ -163,9 +163,7 @@ class Observer:
         return self._cached(f"topic:{topic_id}", ["--topic", topic_id])
 
 
-def deployment_info(
-    sha_path: str | None = None, src_path: str | None = None
-) -> dict:
+def deployment_info(sha_path: str | None = None) -> dict:
     """What commit the running deployment was built from.
 
     The watcher writes the sha only after the build passed its tests and the
@@ -173,8 +171,6 @@ def deployment_info(
     newest one pushed. That distinction is the entire reason to show it.
     """
     sha_path = sha_path or os.environ.get("UCONNECT_SHA_FILE", "/opt/uconnect/deployed.sha")
-    src_path = src_path or os.environ.get("UCONNECT_SRC_DIR", "/opt/uconnect/src")
-
     info: dict[str, Any] = {"sha": None, "short": None, "subject": None, "url": None}
     try:
         with open(sha_path) as fh:
@@ -187,16 +183,14 @@ def deployment_info(
     except OSError:
         return info
 
-    # The subject is a nicety; a missing or unreadable git tree must not turn
-    # the header into an error page.
+    # Written by the watcher next to the sha. Deliberately not a git call: this
+    # process runs as its own unprivileged user and the source tree is
+    # root-owned, so git trips the dubious-ownership guard and returns nothing
+    # -- indistinguishable, from here, from a commit with no subject.
     try:
-        proc = subprocess.run(
-            ["git", "-C", src_path, "log", "-1", "--pretty=%s", info["sha"]],
-            capture_output=True, text=True, timeout=5,
-        )
-        if proc.returncode == 0:
-            info["subject"] = proc.stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
+        with open(os.path.join(os.path.dirname(sha_path), "deployed.subject")) as fh:
+            info["subject"] = fh.read().strip() or None
+    except OSError:
         pass
     return info
 

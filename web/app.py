@@ -30,6 +30,7 @@ import queue
 from flask import (Flask, Response, jsonify, render_template, request,
                    stream_with_context)
 
+from chat import BridgeManager, ChatError
 from events import EventHub
 from observer import (Observer, ObserverError, deployment_info, derived_stats,
                       summarise)
@@ -48,6 +49,11 @@ sessions = SessionRegistry(
     max_total_streams=int(os.environ.get("UCONNECT_MAX_STREAMS", "24")),
 )
 hub = EventHub(observer, interval=float(os.environ.get("UCONNECT_FEED_INTERVAL", "3")))
+bridges = BridgeManager(
+    SERVER,
+    max_total=int(os.environ.get("UCONNECT_MAX_CHATS", "8")),
+    lifetime=int(os.environ.get("UCONNECT_CHAT_LIFETIME", "1800")),
+)
 
 TRUST_PROXY = trust_proxy_enabled()
 
@@ -186,6 +192,106 @@ def events():
     resp = Response(gen(), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Accel-Buffering"] = "no"   # nginx would otherwise buffer it
+    return _with_cookie(resp, sess)
+
+
+# --- chat -------------------------------------------------------------------
+# Everything below hands a topic key to this process. See chat.py: a browser
+# cannot run the handshake itself, so the gateway does it, and the gateway can
+# therefore read the conversation. The page states that before anyone types.
+@app.route("/chat")
+def chat_page():
+    sess, limited = _session()
+    resp = app.make_response(
+        render_template("chat.html", server=SERVER, build=deployment_info(),
+                        limited=limited, error=None, stale=False,
+                        chat=bridges.stats(),
+                        joined=(bridges.get(sess.sid) if sess else None))
+    )
+    return _with_cookie(resp, sess), (429 if limited else 200)
+
+
+@app.route("/api/chat/join", methods=["POST"])
+def chat_join():
+    sess, limited = _session()
+    if limited:
+        return jsonify({"ok": False, "error": limited}), 429
+
+    body = request.get_json(silent=True) or {}
+    try:
+        b = bridges.start(sess.sid, str(body.get("topic", "")), str(body.get("nick", "web")))
+    except ChatError as exc:
+        return _with_cookie(jsonify({"ok": False, "error": str(exc)}), sess), 400
+    return _with_cookie(
+        jsonify({"ok": True, "topic_id": b.topic_id, "nick": b.nick}), sess)
+
+
+@app.route("/api/chat/say", methods=["POST"])
+def chat_say():
+    sess, limited = _session()
+    if limited:
+        return jsonify({"ok": False, "error": limited}), 429
+    b = bridges.get(sess.sid)
+    if b is None:
+        return _with_cookie(jsonify({"ok": False, "error": "not in a topic"}), sess), 409
+
+    text = str((request.get_json(silent=True) or {}).get("text", "")).strip()
+    if not text:
+        return _with_cookie(jsonify({"ok": False, "error": "empty message"}), sess), 400
+    if len(text) > 2000:
+        text = text[:2000]
+    try:
+        b.say(text)
+    except ChatError as exc:
+        return _with_cookie(jsonify({"ok": False, "error": str(exc)}), sess), 409
+    return _with_cookie(jsonify({"ok": True}), sess)
+
+
+@app.route("/api/chat/leave", methods=["POST"])
+def chat_leave():
+    sess, limited = _session()
+    if limited:
+        return jsonify({"ok": False, "error": limited}), 429
+    bridges.stop(sess.sid)
+    return _with_cookie(jsonify({"ok": True}), sess)
+
+
+@app.route("/api/chat/stream")
+def chat_stream():
+    sess, limited = _session()
+    if limited:
+        return jsonify({"ok": False, "error": limited}), 429
+    b = bridges.get(sess.sid)
+    if b is None:
+        return _with_cookie(jsonify({"ok": False, "error": "not in a topic"}), sess), 409
+
+    try:
+        sessions.open_stream(sess.sid)
+    except LimitError as exc:
+        return _with_cookie(jsonify({"ok": False, "error": str(exc)}), sess), 429
+
+    q = b.subscribe()
+    sid = sess.sid
+
+    @stream_with_context
+    def gen():
+        try:
+            yield "retry: 3000\n\n"
+            while True:
+                try:
+                    ev = q.get(timeout=20)
+                    yield f"event: {ev.get('t', 'msg')}\ndata: {json.dumps(ev)}\n\n"
+                    if ev.get("t") == "closed":
+                        break
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            b.unsubscribe(q)
+            sessions.close_stream(sid)
+
+    resp = Response(gen(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
     return _with_cookie(resp, sess)
 
 

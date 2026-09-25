@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}uConnect — web chat{% endblock %}
+
+{% block body %}
+{% if limited %}<div class="banner bad">{{ limited }}</div>{% endif %}
+
+<div class="banner warn">
+  <strong>This chat trusts this server with your topic key.</strong>
+  A browser cannot be a uConnect peer — it has no UDP socket, cannot hole-punch
+  and cannot run the Noise handshake — so joining from a page means a process
+  <em>on this host</em> joins on your behalf. It holds <code>K</code> and can
+  read everything you send here. A native client
+  (<code>uconn-chat</code>) does not make that trade: there the key never leaves
+  your machine.
+  {% if request.scheme != 'https' %}
+    <br><br>
+    This page is served over <strong>plain HTTP</strong>, so the key also
+    crosses the network in the clear. Treat anything typed here as public.
+  {% endif %}
+</div>
+
+<h2>Join a topic</h2>
+<div class="panel">
+  <form id="join" onsubmit="return false">
+    <input type="text" id="uri" class="mono" placeholder="uconn://<32 hex>#<64 hex>"
+           value="{% if joined %}uconn://{{ joined.topic_id }}{% endif %}" required>
+    <input type="text" id="nick" placeholder="nickname" maxlength="24" style="max-width:9rem"
+           value="{{ joined.nick if joined else '' }}">
+    <button id="go">{{ 'Rejoin' if joined else 'Join' }}</button>
+    <button id="leave" style="background:var(--bad);{% if not joined %}display:none{% endif %}">
+      Leave
+    </button>
+  </form>
+  <p class="sub" style="margin:.6rem 0 0">
+    Need one? <a href="/app">Create a topic</a> — the key is generated in your
+    browser there. {{ chat.chats }}/{{ chat.max_chats }} chat sessions in use.
+  </p>
+</div>
+
+<h2>Conversation</h2>
+<div class="panel">
+  <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.6rem">
+    <span id="dot" class="tag">not joined</span>
+    <span id="roster" class="sub" style="margin:0"></span>
+  </div>
+
+  <div id="log" style="max-height:380px;overflow-y:auto;font-size:.9rem;line-height:1.65;
+       display:flex;flex-direction:column-reverse"></div>
+
+  <form id="sayf" onsubmit="return false" style="margin-top:.75rem">
+    <input type="text" id="text" placeholder="message" maxlength="2000" disabled>
+    <button id="send" disabled>Send</button>
+  </form>
+  <p class="sub" style="margin:.6rem 0 0">
+    Messages use the same framing as <code>uconn-chat</code>, so terminal peers
+    and this page are in one conversation rather than two that happen to share
+    a topic id.
+  </p>
+</div>
+
+<script>
+const log = document.getElementById('log');
+const dot = document.getElementById('dot');
+const rosterEl = document.getElementById('roster');
+const nicks = {};
+let es = null, selfDev = null, lines = 0;
+
+const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+const short = d => (d || '').slice(0, 8);
+const nameOf = d => nicks[d] || short(d);
+
+function line(html, dim) {
+  const el = document.createElement('div');
+  const t = new Date().toLocaleTimeString();
+  el.innerHTML = '<span style="color:var(--dim)">' + t + '</span> ' +
+                 (dim ? '<span style="color:var(--dim)">' + html + '</span>' : html);
+  log.prepend(el);
+  if (++lines > 300) { log.removeChild(log.lastChild); lines--; }
+}
+
+function refreshRoster() {
+  const names = Object.values(nicks);
+  rosterEl.textContent = names.length ? names.length + ' peer(s): ' + names.join(', ')
+                                      : 'no peers yet';
+}
+
+function connectStream() {
+  if (es) es.close();
+  es = new EventSource('/api/chat/stream');
+  es.onopen = () => { dot.textContent = 'joined'; dot.className = 'tag keyed'; };
+  es.onerror = () => { dot.textContent = 'reconnecting…'; dot.className = 'tag stale'; };
+
+  es.addEventListener('ready', e => {
+    const d = JSON.parse(e.data); selfDev = d.dev;
+    line('joined ' + esc(d.topic.slice(0, 12)) + '… as ' + short(d.dev) +
+         (d.keyed ? '' : ' <span class="tag open">open topic — no authentication</span>'), true);
+  });
+  es.addEventListener('peer', e => { const d = JSON.parse(e.data);
+    if (d.state === 'connected') line('* ' + nameOf(d.dev) + ' connected', true); });
+  es.addEventListener('gone', e => { const d = JSON.parse(e.data);
+    line('* ' + nameOf(d.dev) + ' left (' + esc(d.why) + ')', true);
+    delete nicks[d.dev]; refreshRoster(); });
+  es.addEventListener('nick', e => { const d = JSON.parse(e.data);
+    nicks[d.dev] = d.nick; refreshRoster();
+    line('* ' + short(d.dev) + ' is ' + esc(d.nick), true); });
+  es.addEventListener('msg', e => { const d = JSON.parse(e.data);
+    const who = d.self ? 'you' : nameOf(d.dev);
+    line('<strong>' + esc(who) + '</strong>: ' + esc(d.text)); });
+  es.addEventListener('error', e => { try {
+    line('error: ' + esc(JSON.parse(e.data).message), true); } catch (_) {} });
+  es.addEventListener('closed', () => {
+    dot.textContent = 'session ended'; dot.className = 'tag stale';
+    document.getElementById('text').disabled = true;
+    document.getElementById('send').disabled = true;
+    if (es) { es.close(); es = null; }
+  });
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                             body: JSON.stringify(body || {})});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+
+document.getElementById('go').onclick = async () => {
+  const uri = document.getElementById('uri').value.trim();
+  const nick = document.getElementById('nick').value.trim() || 'web';
+  dot.textContent = 'joining…'; dot.className = 'tag';
+  try {
+    await post('/api/chat/join', {topic: uri, nick: nick});
+    document.getElementById('text').disabled = false;
+    document.getElementById('send').disabled = false;
+    document.getElementById('leave').style.display = '';
+    connectStream();
+  } catch (e) {
+    dot.textContent = 'not joined'; dot.className = 'tag stale';
+    line('could not join: ' + esc(e.message), true);
+  }
+};
+
+document.getElementById('leave').onclick = async () => {
+  try { await post('/api/chat/leave'); } catch (e) {}
+  if (es) { es.close(); es = null; }
+  dot.textContent = 'left'; dot.className = 'tag stale';
+  document.getElementById('text').disabled = true;
+  document.getElementById('send').disabled = true;
+};
+
+async function send() {
+  const el = document.getElementById('text');
+  const text = el.value.trim();
+  if (!text) return;
+  el.value = '';
+  // No optimistic echo: the bridge echoes the message back once it has
+  // actually broadcast it, so the log shows what was sent rather than what
+  // was typed.
+  try { await post('/api/chat/say', {text: text}); }
+  catch (e) { line('not sent: ' + esc(e.message), true); }
+}
+document.getElementById('send').onclick = send;
+document.getElementById('text').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); send(); }
+});
+
+{% if joined %}
+document.getElementById('text').disabled = false;
+document.getElementById('send').disabled = false;
+connectStream();
+{% endif %}
+
+// A topic passed in the fragment by /app. Fragments are never sent to the
+// server, so arriving here does not put the key in an access log; pressing
+// Join is what hands it over, and the banner above says so.
+if (location.hash.length > 1) {
+  const pre = decodeURIComponent(location.hash.slice(1));
+  if (pre.startsWith('uconn://')) document.getElementById('uri').value = pre;
+  history.replaceState(null, '', location.pathname);
+}
+refreshRoster();
+</script>
+{% endblock %}

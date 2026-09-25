@@ -192,6 +192,42 @@ and reconnects by itself. A WebSocket would add a handshake, a second protocol
 and an async worker to operate, for a channel nothing ever sends up. The hub
 already speaks in discrete events, so swapping it later is contained.
 
+## Web chat (`/chat`) — and what it costs
+
+A browser **cannot be a uConnect peer**. No UDP socket, no hole punching, no
+Noise handshake. So chatting from a page means `uconn-bridge` — a real peer —
+runs on this host and relays between the topic and the browser.
+
+**That hands the topic key to this server.** Whatever runs the handshake must
+hold `K`, so the gateway can read every message in any topic you chat in.
+Native clients never make that trade; there the key does not leave your
+machine. Over plain HTTP the key also crosses the network in the clear. The
+page says all of this above the input box, not in a footnote.
+
+The key goes to the bridge on **stdin, never argv** — `argv` is visible in `ps`
+to every user on the box, and a key in a process listing is a key in logs,
+monitoring and support tickets. `/app` passes the URI to `/chat` in the URL
+*fragment*, which browsers never send to the server, so merely opening the page
+does not put it in an access log; pressing Join is what hands it over.
+
+Messages use the same framing as `uconn-chat` (a type byte then UTF-8), so a
+browser peer and a terminal peer are in one conversation rather than two that
+happen to share a topic id.
+
+Bridges are the most expensive thing here — each is a real UDP node that
+registers, punches and holds a session — so they are capped at 8 concurrently,
+one per session, with a 30-minute lifetime. Without that ceiling a browser that
+vanished mid-conversation would leave a node registered and punching until the
+host was rebooted.
+
+### Why a created topic does not show up in the list
+
+Because it does not exist yet. Creating a topic in `/app` produces two random
+numbers; the rendezvous server learns of a topic when a peer **registers** under
+it, and forgets it 90 seconds after the last one leaves. Join it — from `/chat`
+or from `uconn-chat` — and it appears. The page says so where the topic is
+created.
+
 ### Sessions and limits
 
 A session is a random id in a cookie. There is no login, and the session is not
@@ -223,6 +259,9 @@ IP" would really be forty.
 |---|---|
 | `/` | topics, members, server counters, derived stats |
 | `/app` | create a topic, live activity feed |
+| `/chat` | join a topic and talk, via a server-side bridge |
+| `/api/chat/join`, `/say`, `/leave` (POST) | bridge lifecycle |
+| `/api/chat/stream` | SSE of that session's conversation |
 | `/topic/<hex>` | one topic, listed or not |
 | `/api/overview` | the same data as JSON (`?members=0` to skip lookups) |
 | `/api/topic/<hex>` | one topic as JSON |

@@ -34,11 +34,19 @@
       server, can sit in the middle undetectably. Use a keyed topic for
       anything confidential.
     </p>
-    <p class="sub" style="margin:.6rem 0 0">
-      Nothing exists on the server yet — a topic comes into being when a peer
-      registers under it:
-      <br><code id="cmd" class="mono"></code>
-    </p>
+    <div class="banner warn" style="margin:.75rem 0 0">
+      <strong>This topic is not on the server yet, and will not appear in the
+      topic list.</strong>
+      Creating one here is two random numbers and nothing else — a topic comes
+      into being on the rendezvous server the moment a peer <em>registers</em>
+      under it, and vanishes 90 seconds after the last one stops. Join it with
+      either of these and it shows up:
+      <div style="margin-top:.6rem">
+        <a id="chat-link" href="/chat"><button type="button">Chat in it here</button></a>
+        <span class="sub">— or, without handing the key to this server:</span>
+      </div>
+      <div style="margin-top:.4rem"><code id="cmd" class="mono"></code></div>
+    </div>
   </div>
 </div>
 
@@ -99,6 +107,11 @@ async function create(keyed) {
   document.getElementById('warn-open').style.display = keyed ? 'none' : '';
   document.getElementById('cmd').textContent =
     "uconn-chat --server {{ server }} --topic '" + uri + "' --nick you";
+  // Carry the URI in the fragment, not the query: a fragment is never sent to
+  // the server and never lands in an access log. The key still reaches the
+  // server when you press Join -- that is unavoidable for a browser peer --
+  // but it should not be logged on the way to the page that says so.
+  document.getElementById('chat-link').href = '/chat#' + encodeURIComponent(uri);
 
   // Only the id. Sending the key would defeat the point of generating it here.
   try {

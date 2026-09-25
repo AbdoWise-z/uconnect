@@ -357,8 +357,8 @@ server/        record store (sans-IO) + UDP service + relay + binary
 third_party/   vendored X25519 and Poly1305
 tests/         unit suite + a simulated network
 examples/      uconn-demo, uconn-chat, uconn-stream
-tools/         uconn-observe -- reads a server's public view as JSON
-web/           Flask dashboard over uconn-observe
+tools/         uconn-observe (server view as JSON), uconn-bridge (a peer on stdio)
+web/           Flask dashboard, topic creator, and web chat
 deploy/        Oracle Cloud setup, systemd units, git watcher
 ```
 
@@ -484,11 +484,16 @@ it registers nothing and does not appear in the listings it reports. Nothing in
 Python speaks the wire protocol — it shells out to a binary that links this
 library, so the framing has exactly one implementation and cannot drift.
 
-There is also a small interactive app at `/app`: create a topic and watch
-signaling activity live. **Topic keys are generated in the browser and never
-sent to the server** — a server that minted them would know every secret it
-handed out. The feed carries registrations and membership changes, never
-message contents: those are end-to-end encrypted and never reach the server.
+There is also a small interactive app: `/app` creates a topic and streams live
+signaling activity, `/chat` joins a topic and talks. **Topic keys are generated
+in the browser and never sent to the server** — a server that minted them would
+know every secret it handed out.
+
+The chat is the one exception, and it is unavoidable. A browser cannot be a
+uConnect peer: no UDP socket, no hole punching, no Noise handshake. So `/chat`
+runs `tools/uconn-bridge` — a real peer — on the server's behalf, which means
+**the server holds `K` for any topic you chat in and can read it**. A native
+client never makes that trade. The page says so above the input box.
 
 Everything shown is already public to anyone who can reach the server: topics
 are listed unless a member opts out, LOOKUP needs no key because `K` never gets

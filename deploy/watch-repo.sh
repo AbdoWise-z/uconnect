@@ -46,6 +46,7 @@ LOCK="/var/lock/uconnect-watch.lock"
 WEB_SERVICE="${UCONNECT_WEB_SERVICE:-uconnect-web}"
 WEB_ROOT="${UCONNECT_WEB_ROOT:-/opt/uconnect/web}"
 OBSERVE_BIN="${UCONNECT_OBSERVE_BIN:-/usr/local/bin/uconn-observe}"
+BRIDGE_BIN="${UCONNECT_BRIDGE_BIN:-/usr/local/bin/uconn-bridge}"
 VENV="${UCONNECT_VENV:-/opt/uconnect/venv}"
 
 ONCE=0
@@ -89,6 +90,13 @@ deploy_web() {
     fi
     install -m 0755 "$build/tools/uconn-observe" "$OBSERVE_BIN" || {
         log "web: WARN could not install uconn-observe -- skipping"; return 0; }
+
+    # The chat gateway. Optional: an older commit has no bridge, and the
+    # dashboard is perfectly usable without one.
+    if [ -x "$build/tools/uconn-bridge" ]; then
+        install -m 0755 "$build/tools/uconn-bridge" "$BRIDGE_BIN" ||
+            log "web: WARN could not install uconn-bridge; chat will be unavailable"
+    fi
 
     # Python deps. Re-created only when requirements.txt actually changes: a
     # pip install on every commit would add tens of seconds to each deploy and

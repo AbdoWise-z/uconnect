@@ -55,6 +55,14 @@ Environment=UCONNECT_WEB_BIND=0.0.0.0:8080
 # busy dashboard cannot throttle real peers.
 Environment=UCONNECT_SERVER=127.0.0.1:4433
 Environment=UCONNECT_OBSERVE=/usr/local/bin/uconn-observe
+Environment=UCONNECT_BRIDGE=/usr/local/bin/uconn-bridge
+
+# Chat bridges are far heavier than anything else here: each is a real UDP peer
+# that registers, punches and holds a Noise session. Capped low on purpose, and
+# given a lifetime so a browser that vanished mid-conversation cannot leave one
+# registered and punching indefinitely.
+Environment=UCONNECT_MAX_CHATS=8
+Environment=UCONNECT_CHAT_LIFETIME=1800
 Environment=UCONNECT_CACHE_TTL=5
 Environment=PYTHONUNBUFFERED=1
 

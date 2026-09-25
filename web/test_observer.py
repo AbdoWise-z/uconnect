@@ -346,6 +346,136 @@ def test_slow_subscriber_does_not_grow_memory():
     check(len(hub._recent) <= 100, "history stayed bounded")
 
 
+
+
+# ---------------------------------------------------------------------------
+# Chat bridge management
+# ---------------------------------------------------------------------------
+from chat import BridgeManager, ChatError  # noqa: E402
+
+
+def fake_bridge(script: str) -> str:
+    """A stand-in for uconn-bridge: reads the URI line, then commands."""
+    fd, path = tempfile.mkstemp(suffix=".py")
+    os.write(fd, script.encode())
+    os.close(fd)
+    fd2, sh = tempfile.mkstemp(suffix=".sh")
+    os.write(fd2, f"#!/bin/sh\nexec {sys.executable} -u {path} \"$@\"\n".encode())
+    os.close(fd2)
+    os.chmod(sh, 0o755)
+    return sh
+
+
+ECHO_BRIDGE = r'''
+import sys, json
+uri = sys.stdin.readline().strip()
+tid = uri.replace("uconn://", "").split("#")[0]
+print(json.dumps({"t": "ready", "dev": "d" * 32, "topic": tid, "keyed": "#" in uri}))
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    m = json.loads(line)
+    if m.get("cmd") == "bye":
+        break
+    if m.get("cmd") == "say":
+        print(json.dumps({"t": "msg", "dev": "d" * 32, "text": m["text"], "self": True}))
+'''
+
+
+def test_chat_rejects_malformed_topics():
+    # The URI is written to the child's stdin as one line, so a newline in it
+    # would be read as a command rather than as part of the URI.
+    print("validates topic URIs before spawning anything")
+    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE))
+    for bad in ("", "http://x", "uconn://short",
+                "uconn://" + "a" * 32 + "\n{\"cmd\":\"say\"}",
+                "uconn://" + "g" * 32, "uconn://" + "a" * 31):
+        try:
+            m.start("s1", bad, "nick")
+            check(False, f"accepted {bad[:24]!r}")
+        except ChatError:
+            check(True, f"rejected {bad[:24]!r}")
+
+
+def test_chat_round_trip():
+    print("relays a message through the bridge")
+    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE))
+    b = m.start("s1", "uconn://" + "a" * 32 + "#" + "b" * 64, "alice")
+    q = b.subscribe()
+    deadline = time.time() + 5
+    ready = None
+    while time.time() < deadline and ready is None:
+        try:
+            ev = q.get(timeout=1)
+            if ev.get("t") == "ready":
+                ready = ev
+        except Exception:
+            break
+    check(ready is not None, "got a ready event")
+    check(ready and ready["topic"] == "a" * 32, "carries the topic id")
+
+    b.say("hello there")
+    got = None
+    deadline = time.time() + 5
+    while time.time() < deadline and got is None:
+        try:
+            ev = q.get(timeout=1)
+            if ev.get("t") == "msg":
+                got = ev
+        except Exception:
+            break
+    check(got is not None and got["text"] == "hello there", "message echoed back")
+    m.stop("s1")
+
+
+def test_chat_caps_total_sessions():
+    # Each bridge is a real UDP node -- far more expensive than a page view --
+    # so the cap is what stops a handful of tabs pinning the host.
+    print("caps concurrent chat sessions")
+    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE), max_total=2)
+    m.start("s1", "uconn://" + "a" * 32, "a")
+    m.start("s2", "uconn://" + "b" * 32, "b")
+    try:
+        m.start("s3", "uconn://" + "c" * 32, "c")
+        check(False, "should have refused a third")
+    except ChatError as e:
+        check("full" in str(e), "refuses with a message that suggests a native client")
+    # Rejoining an existing session replaces rather than counts again.
+    m.start("s1", "uconn://" + "a" * 32, "a")
+    check(True, "an existing session can rejoin at the cap")
+    m.stop("s1"); m.stop("s2")
+
+
+def test_chat_replays_history_to_a_second_tab():
+    print("replays history to a late subscriber")
+    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE))
+    b = m.start("s1", "uconn://" + "a" * 32, "a")
+    time.sleep(0.6)
+    b.say("first")
+    time.sleep(0.6)
+    q = b.subscribe()
+    seen = []
+    while True:
+        try:
+            seen.append(q.get_nowait())
+        except Exception:
+            break
+    check(any(e.get("t") == "ready" for e in seen), "second tab sees the ready event")
+    check(any(e.get("text") == "first" for e in seen), "and the message it missed")
+    m.stop("s1")
+
+
+def test_chat_missing_binary_is_explained():
+    print("explains a missing bridge binary")
+    m = BridgeManager("x:1", binary="/nonexistent/uconn-bridge")
+    try:
+        m.start("s1", "uconn://" + "a" * 32, "a")
+        check(False, "should have raised")
+    except ChatError as e:
+        check("not found" in str(e).lower(), "names the real problem")
+
+
 if __name__ == "__main__":
     for fn in [
         test_parses_and_summarises,
@@ -366,6 +496,11 @@ if __name__ == "__main__":
         test_diff_reports_joins_leaves_and_topics,
         test_sampled_topics_do_not_produce_phantom_events,
         test_slow_subscriber_does_not_grow_memory,
+        test_chat_rejects_malformed_topics,
+        test_chat_round_trip,
+        test_chat_caps_total_sessions,
+        test_chat_replays_history_to_a_second_tab,
+        test_chat_missing_binary_is_explained,
     ]:
         fn()
     print()

@@ -130,6 +130,24 @@ void StreamConnection::emit(StreamEventKind k, StreamId id, uint64_t code) {
     events_.push_back(StreamEvent{k, id, code});
 }
 
+void StreamConnection::notify_writable() {
+    // A short write has three causes: the connection window, our own
+    // stream_send_cap, and -- indirectly -- everything that keeps the send
+    // buffer full. The first is relieved by MAX_DATA, the second only by our
+    // data being acknowledged and the buffer draining.
+    //
+    // Emitting only on window updates meant the third case produced nothing at
+    // all, so an application that waited for Writable rather than polling --
+    // which is what the API tells it to do -- waited forever on a stream that
+    // had room. Asking writable() covers every cause, because it is the same
+    // question the application would ask.
+    for (auto& [id, s] : streams_) {
+        if (!s.was_blocked || !writable(id)) continue;
+        s.was_blocked = false;
+        emit(StreamEventKind::Writable, id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Application API
 // ---------------------------------------------------------------------------
@@ -287,6 +305,10 @@ void StreamConnection::on_datagram(uint64_t pn, std::span<const uint8_t> payload
 
     for (const auto& f : scratch_) handle_frame(f, now);
 
+    // Acks free send-buffer space and window updates raise limits, so this is
+    // where a blocked writer becomes unblocked, whichever the cause was.
+    notify_writable();
+
     // Acks and FINs both arrive here, so this is where most streams finish.
     retire_done_streams();
 
@@ -376,30 +398,16 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
         }
 
         case FrameType::MaxData: {
-            if (f.max_data.max > conn_send_max_) {
-                conn_send_max_ = f.max_data.max;
-                // Only streams that actually hit backpressure. Waking every
-                // stream on every window update turns Writable into noise the
-                // application has to filter itself.
-                for (auto& [id, s] : streams_) {
-                    if (!s.was_blocked) continue;
-                    s.was_blocked = false;
-                    emit(StreamEventKind::Writable, id);
-                }
-            }
+            // Raising the limit may unblock writers; notify_writable() decides
+            // which, once, at the end of the datagram.
+            if (f.max_data.max > conn_send_max_) conn_send_max_ = f.max_data.max;
             break;
         }
 
         case FrameType::MaxStreamData: {
             auto* sp = ensure_peer_stream(f.max_stream_data.id, now);
             if (!sp) break;
-            if (f.max_stream_data.max > sp->send.peer_max()) {
-                sp->send.set_peer_max(f.max_stream_data.max);
-                if (sp->was_blocked) {
-                    sp->was_blocked = false;
-                    emit(StreamEventKind::Writable, f.max_stream_data.id);
-                }
-            }
+            sp->send.set_peer_max(f.max_stream_data.max);
             break;
         }
 

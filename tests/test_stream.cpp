@@ -1361,3 +1361,39 @@ TEST(stop_sending_ends_the_peers_direction_without_ending_ours) {
     // b's own sending direction survives: this is not a full teardown.
     CHECK(b.writable(id));
 }
+
+TEST(writable_fires_when_acks_drain_the_local_send_buffer) {
+    // Three things can make write() short: the connection window, the peer's
+    // per-stream window, and our OWN stream_send_cap. The first two are
+    // relieved by a peer window update, which emits Writable. The third is
+    // relieved by our data being ACKED -- and nothing used to emit anything
+    // for it, so an application that waited for Writable instead of polling
+    // (which is exactly what the docs tell it to do) waited forever.
+    StreamConfig cfg = fast_cfg();
+    cfg.stream_send_cap = 4096;        // well below the peer's receive window,
+    StreamConnection a{cfg, Role::A};  // so only the local cap can block us
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open();
+    auto data = pattern(8192);
+
+    size_t off = a.write(id, data);
+    REQUIRE(off > 0);
+    CHECK_EQ(a.write(id, std::span(data).subspan(off)), 0u);   // local cap hit
+    (void)collect(a, StreamEventKind::Writable);
+
+    // Let it flush and be acknowledged. The receiver consumes far too little
+    // to trigger a MAX_STREAM_DATA, so an ack is the only thing that can
+    // unblock us -- which is precisely the case under test.
+    std::vector<uint8_t> got;
+    for (int i = 0; i < 20; ++i) {
+        link.advance(100ms);
+        drain(b, id, got);
+    }
+
+    CHECK(a.writable(id));   // there really is room now
+    auto w = collect(a, StreamEventKind::Writable);
+    CHECK(!w.empty());       // and the application was told
+    CHECK(a.write(id, std::span(data).subspan(off)) > 0);
+}

@@ -192,6 +192,11 @@ private:
     void retire_done_streams();
     size_t live_streams(Role opened_by) const;
 
+    // Tell any blocked stream that can now accept data. One place decides,
+    // because "why was the write short" has three answers and only two of them
+    // used to produce an event.
+    void notify_writable();
+
     void handle_frame(const Frame&, Instant now);
     void on_packet_acked(const SentPacket&);
     void on_packet_lost(const SentPacket&);

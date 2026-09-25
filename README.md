@@ -195,6 +195,18 @@ is not connected, or if this peer is already at `max_streams_per_peer`.
 A short `write()` is backpressure, not an error — wait for `on_stream_writable`
 rather than polling `writable()` on a timer.
 
+A write can fall short for three reasons, and `on_stream_writable` covers all
+of them: the connection-wide window, this stream's share of it, and
+`stream_send_cap` — the bound on how much unacknowledged data one stream may
+hold locally. The last is relieved by your own data being acknowledged rather
+than by anything the peer says, which is worth knowing if you are reasoning
+about why a transfer paused.
+
+Both directions of a bidirectional stream have their own independent
+backpressure. `writable()` and `on_stream_writable` always concern *our*
+sending direction; whether the peer can write to us is its own business and
+its own signal at its end.
+
 ### Ending a stream
 
 Four verbs, and the difference is worth reading once:

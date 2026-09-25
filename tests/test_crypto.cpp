@@ -6,6 +6,7 @@
 // the same broken code will complete a handshake and talk to each other. Only
 // the published vectors distinguish "works" from "correct".
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -370,17 +371,32 @@ TEST(hkdf_is_domain_separated) {
 }
 
 TEST(hkdf_produces_requested_length_across_block_boundaries) {
+    // RFC 5869 expands T(1) | T(2) | ... and returns the first L octets, so a
+    // shorter output must be a prefix of a longer one from the same inputs.
+    // That is the property this test's name is about, and it is what catches a
+    // mishandled block counter at the 32-byte BLAKE2s boundary.
+    //
+    // It replaces a "the output is not all zeroes" check, which asserted
+    // almost nothing and failed roughly one run in 256: the list of lengths
+    // includes 1, and a single random byte is legitimately zero that often.
     Key k{};
-    random_bytes(k);
+    k.fill(0x5A);   // fixed: this is about determinism, not randomness
+
+    std::vector<uint8_t> longest(100);
+    hkdf(k, {}, "test", longest);
+
     for (size_t len : {1u, 16u, 32u, 33u, 64u, 100u}) {
         std::vector<uint8_t> out(len);
         hkdf(k, {}, "test", out);
-        bool all_zero = true;
-        for (auto b : out) {
-            if (b != 0) { all_zero = false; break; }
-        }
-        CHECK(!all_zero);
+        CHECK_EQ(out.size(), len);
+        CHECK(std::equal(out.begin(), out.end(), longest.begin()));
     }
+
+    // And the info string actually separates: same key, different purpose,
+    // different bytes.
+    std::vector<uint8_t> other(100);
+    hkdf(k, {}, "different", other);
+    CHECK(other != longest);
 }
 
 TEST(noise_hkdf_outputs_differ_from_each_other) {

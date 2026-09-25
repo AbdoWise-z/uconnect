@@ -178,302 +178,31 @@ def test_garbage_output_is_explained():
         check("JSON" in str(exc), "names the real problem")
 
 
-
-# ---------------------------------------------------------------------------
-# Sessions and limits
-# ---------------------------------------------------------------------------
-from sessions import LimitError, SessionRegistry, client_ip  # noqa: E402
-from events import EventHub  # noqa: E402
-
-
-def test_session_cap_per_ip():
-    print("caps sessions per IP")
-    r = SessionRegistry(max_per_ip=3)
-    sids = [r.touch(None, "1.2.3.4").sid for _ in range(3)]
-    check(len(set(sids)) == 3, "issues distinct session ids")
-    try:
-        r.touch(None, "1.2.3.4")
-        check(False, "should have refused the 4th")
-    except LimitError as e:
-        check("too many" in str(e), "refuses past the cap with a usable message")
-    check(r.touch(None, "5.6.7.8") is not None, "a different address is unaffected")
-    check(r.touch(sids[0], "1.2.3.4").sid == sids[0], "an existing session still works")
+def test_derived_stats():
+    # Numbers a reader wants that the raw counters do not state outright.
+    print("derives the numbers the raw counters do not state")
+    from observer import derived_stats
+    d = derived_stats(json.loads(SAMPLE))
+    check(d["keyed_topics"] == 1 and d["open_topics"] == 1, "splits keyed from open")
+    check(d["largest_topic"] == 50, "finds the largest topic")
+    check(d["listed_peers"] == 52, "sums peers")
 
 
-def test_idle_sessions_expire():
-    # Without reaping, the cap becomes permanent: ten visits from an office NAT
-    # would lock out everyone behind it forever.
-    print("expires idle sessions so the cap is not permanent")
-    r = SessionRegistry(max_per_ip=2, idle_timeout=0.0)
-    r.touch(None, "1.1.1.1")
-    r.touch(None, "1.1.1.1")
-    try:
-        r.touch(None, "1.1.1.1")
-        check(True, "idle sessions were reaped, so a new one is allowed")
-    except LimitError:
-        check(False, "should have reaped idle sessions")
-
-
-def test_stream_limits():
-    print("caps live streams globally and per session")
-    r = SessionRegistry(max_per_ip=10, max_total_streams=2, max_streams_per_session=1)
-    a = r.touch(None, "1.1.1.1").sid
-    b = r.touch(None, "2.2.2.2").sid
-    c = r.touch(None, "3.3.3.3").sid
-    r.open_stream(a); r.open_stream(b)
-    try:
-        r.open_stream(c); check(False, "should have hit the global cap")
-    except LimitError as e:
-        check("capacity" in str(e), "global cap refuses with a clear message")
-    try:
-        r.open_stream(a); check(False, "should have hit the per-session cap")
-    except LimitError:
-        check(True, "per-session cap holds")
-    r.close_stream(a)
-    r.open_stream(c)
-    check(True, "closing a stream frees the slot")
-
-
-def test_stream_slot_is_not_leaked_by_a_reaped_session():
-    # A session reaped mid-stream must still return its slot, or the feed
-    # slowly closes itself to everyone.
-    print("does not leak a stream slot when the session is gone")
-    r = SessionRegistry(max_total_streams=1, idle_timeout=0.0)
-    s = r.touch(None, "1.1.1.1").sid
-    r.open_stream(s)
-    r._sessions.clear()          # simulate the reaper taking it mid-stream
-    r.close_stream(s)
-    check(r._live_streams == 0, "global counter returned to zero")
-
-
-def test_topic_cap_per_session():
-    print("caps topics recorded per session")
-    r = SessionRegistry(max_topics_per_session=2)
-    s = r.touch(None, "1.1.1.1").sid
-    r.record_topic(s, "a" * 32)
-    r.record_topic(s, "b" * 32)
-    try:
-        r.record_topic(s, "c" * 32)
-        check(False, "should have refused")
-    except LimitError:
-        check(True, "refuses past the cap")
-    r.record_topic(s, "a" * 32)
-    check(len(r._sessions[s].topics) == 2, "re-recording an existing id is a no-op")
-
-
-def test_forwarded_for_is_not_trusted_by_default():
-    # It is a header; anyone can send one. Trusting it by default would turn
-    # the per-IP limit into a suggestion.
-    print("ignores X-Forwarded-For unless told to trust it")
-    hdrs = {"X-Forwarded-For": "9.9.9.9"}
-    check(client_ip(hdrs, "1.2.3.4", trust_proxy=False) == "1.2.3.4", "uses the peer address")
-    check(client_ip(hdrs, "1.2.3.4", trust_proxy=True) == "9.9.9.9", "honours it when enabled")
-
-
-# ---------------------------------------------------------------------------
-# Event diffing
-# ---------------------------------------------------------------------------
-def _snap(topics):
-    return {"ok": True, "topics": topics, "stats": {"registers": 0, "lookups": 0}}
-
-
-def _topic(tid, peers, members):
-    return {"id": tid, "mode": "keyed", "peers": peers, "fresh_peers": peers,
-            "members": [{"dev_id": d, "meta_text": n} for d, n in members]}
-
-
-def test_first_snapshot_is_a_baseline():
-    print("does not replay the world as new events on first poll")
-    hub = EventHub.__new__(EventHub)
-    hub._lock = __import__("threading").Lock()
-    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
-    hub._diff(_snap([_topic("a" * 32, 2, [("d1", "alice"), ("d2", "bob")])]))
-    kinds = [e["kind"] for e in hub._recent]
-    check(kinds == ["ready"], f"only a baseline event, got {kinds}")
-
-
-def test_diff_reports_joins_leaves_and_topics():
-    print("reports joins, leaves and topic lifecycle")
-    hub = EventHub.__new__(EventHub)
-    hub._lock = __import__("threading").Lock()
-    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
-
-    hub._diff(_snap([_topic("a" * 32, 1, [("d1", "alice")])]))
-    hub._recent.clear()
-    hub._diff(_snap([_topic("a" * 32, 2, [("d1", "alice"), ("d2", "bob")]),
-                     _topic("b" * 32, 1, [("d3", "carol")])]))
-    kinds = {e["kind"] for e in hub._recent}
-    check("peer_join" in kinds, "reports a join")
-    check("topic_new" in kinds, "reports a new topic")
-    joined = [e for e in hub._recent if e["kind"] == "peer_join"]
-    check(any(e.get("name") == "bob" for e in joined), "carries the metadata name")
-
-    hub._recent.clear()
-    hub._diff(_snap([_topic("a" * 32, 1, [("d1", "alice")])]))
-    kinds = {e["kind"] for e in hub._recent}
-    check("peer_leave" in kinds, "reports a leave")
-    check("topic_gone" in kinds, "reports a topic disappearing")
-
-
-def test_sampled_topics_do_not_produce_phantom_events():
-    # LOOKUP samples. On a big topic a peer drops out of one sample and back
-    # into the next without having gone anywhere; reporting that as join/leave
-    # would be pure noise.
-    print("suppresses join/leave on sampled topics")
-    hub = EventHub.__new__(EventHub)
-    hub._lock = __import__("threading").Lock()
-    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
-
-    hub._diff(_snap([_topic("a" * 32, 500, [("d1", "x"), ("d2", "y")])]))
-    hub._recent.clear()
-    hub._diff(_snap([_topic("a" * 32, 500, [("d3", "z"), ("d4", "w")])]))
-    kinds = {e["kind"] for e in hub._recent}
-    check("peer_join" not in kinds and "peer_leave" not in kinds,
-          f"no membership events for a sampled topic, got {kinds}")
-
-
-def test_slow_subscriber_does_not_grow_memory():
-    print("drops events for a subscriber that stopped reading")
-    import queue as _q
-    hub = EventHub.__new__(EventHub)
-    hub._lock = __import__("threading").Lock()
-    hub._subscribers = set(); hub._recent = []; hub._seq = 0; hub._prev = None
-    q = _q.Queue(maxsize=2)
-    hub._subscribers.add(q)
-    for i in range(50):
-        hub._publish("activity", deltas={"lookups": i})
-    check(q.qsize() == 2, "queue stayed bounded")
-    check(len(hub._recent) <= 100, "history stayed bounded")
-
-
-
-
-# ---------------------------------------------------------------------------
-# Chat bridge management
-# ---------------------------------------------------------------------------
-from chat import BridgeManager, ChatError  # noqa: E402
-
-
-def fake_bridge(script: str) -> str:
-    """A stand-in for uconn-bridge: reads the URI line, then commands."""
-    fd, path = tempfile.mkstemp(suffix=".py")
-    os.write(fd, script.encode())
-    os.close(fd)
-    fd2, sh = tempfile.mkstemp(suffix=".sh")
-    os.write(fd2, f"#!/bin/sh\nexec {sys.executable} -u {path} \"$@\"\n".encode())
-    os.close(fd2)
-    os.chmod(sh, 0o755)
-    return sh
-
-
-ECHO_BRIDGE = r'''
-import sys, json
-uri = sys.stdin.readline().strip()
-tid = uri.replace("uconn://", "").split("#")[0]
-print(json.dumps({"t": "ready", "dev": "d" * 32, "topic": tid, "keyed": "#" in uri}))
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    m = json.loads(line)
-    if m.get("cmd") == "bye":
-        break
-    if m.get("cmd") == "say":
-        print(json.dumps({"t": "msg", "dev": "d" * 32, "text": m["text"], "self": True}))
-'''
-
-
-def test_chat_rejects_malformed_topics():
-    # The URI is written to the child's stdin as one line, so a newline in it
-    # would be read as a command rather than as part of the URI.
-    print("validates topic URIs before spawning anything")
-    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE))
-    for bad in ("", "http://x", "uconn://short",
-                "uconn://" + "a" * 32 + "\n{\"cmd\":\"say\"}",
-                "uconn://" + "g" * 32, "uconn://" + "a" * 31):
-        try:
-            m.start("s1", bad, "nick")
-            check(False, f"accepted {bad[:24]!r}")
-        except ChatError:
-            check(True, f"rejected {bad[:24]!r}")
-
-
-def test_chat_round_trip():
-    print("relays a message through the bridge")
-    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE))
-    b = m.start("s1", "uconn://" + "a" * 32 + "#" + "b" * 64, "alice")
-    q = b.subscribe()
-    deadline = time.time() + 5
-    ready = None
-    while time.time() < deadline and ready is None:
-        try:
-            ev = q.get(timeout=1)
-            if ev.get("t") == "ready":
-                ready = ev
-        except Exception:
-            break
-    check(ready is not None, "got a ready event")
-    check(ready and ready["topic"] == "a" * 32, "carries the topic id")
-
-    b.say("hello there")
-    got = None
-    deadline = time.time() + 5
-    while time.time() < deadline and got is None:
-        try:
-            ev = q.get(timeout=1)
-            if ev.get("t") == "msg":
-                got = ev
-        except Exception:
-            break
-    check(got is not None and got["text"] == "hello there", "message echoed back")
-    m.stop("s1")
-
-
-def test_chat_caps_total_sessions():
-    # Each bridge is a real UDP node -- far more expensive than a page view --
-    # so the cap is what stops a handful of tabs pinning the host.
-    print("caps concurrent chat sessions")
-    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE), max_total=2)
-    m.start("s1", "uconn://" + "a" * 32, "a")
-    m.start("s2", "uconn://" + "b" * 32, "b")
-    try:
-        m.start("s3", "uconn://" + "c" * 32, "c")
-        check(False, "should have refused a third")
-    except ChatError as e:
-        check("full" in str(e), "refuses with a message that suggests a native client")
-    # Rejoining an existing session replaces rather than counts again.
-    m.start("s1", "uconn://" + "a" * 32, "a")
-    check(True, "an existing session can rejoin at the cap")
-    m.stop("s1"); m.stop("s2")
-
-
-def test_chat_replays_history_to_a_second_tab():
-    print("replays history to a late subscriber")
-    m = BridgeManager("x:1", binary=fake_bridge(ECHO_BRIDGE))
-    b = m.start("s1", "uconn://" + "a" * 32, "a")
-    time.sleep(0.6)
-    b.say("first")
-    time.sleep(0.6)
-    q = b.subscribe()
-    seen = []
-    while True:
-        try:
-            seen.append(q.get_nowait())
-        except Exception:
-            break
-    check(any(e.get("t") == "ready" for e in seen), "second tab sees the ready event")
-    check(any(e.get("text") == "first" for e in seen), "and the message it missed")
-    m.stop("s1")
-
-
-def test_chat_missing_binary_is_explained():
-    print("explains a missing bridge binary")
-    m = BridgeManager("x:1", binary="/nonexistent/uconn-bridge")
-    try:
-        m.start("s1", "uconn://" + "a" * 32, "a")
-        check(False, "should have raised")
-    except ChatError as e:
-        check("not found" in str(e).lower(), "names the real problem")
+def test_deployment_info():
+    # The watcher writes the sha only after tests passed and the service came
+    # up, so this names the commit actually serving.
+    print("reads the deployed commit")
+    from observer import deployment_info
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "deployed.sha"), "w") as fh:
+        fh.write("abc123def4567890\n")
+    with open(os.path.join(d, "deployed.subject"), "w") as fh:
+        fh.write("a commit subject\n")
+    i = deployment_info(os.path.join(d, "deployed.sha"))
+    check(i["short"] == "abc123d", "shortens the sha")
+    check(i["subject"] == "a commit subject", "reads the subject without running git")
+    check(deployment_info("/nonexistent/x")["short"] is None,
+          "a missing file is not an error")
 
 
 if __name__ == "__main__":
@@ -486,21 +215,8 @@ if __name__ == "__main__":
         test_rejects_bad_topic_ids,
         test_missing_binary_is_explained,
         test_garbage_output_is_explained,
-        test_session_cap_per_ip,
-        test_idle_sessions_expire,
-        test_stream_limits,
-        test_stream_slot_is_not_leaked_by_a_reaped_session,
-        test_topic_cap_per_session,
-        test_forwarded_for_is_not_trusted_by_default,
-        test_first_snapshot_is_a_baseline,
-        test_diff_reports_joins_leaves_and_topics,
-        test_sampled_topics_do_not_produce_phantom_events,
-        test_slow_subscriber_does_not_grow_memory,
-        test_chat_rejects_malformed_topics,
-        test_chat_round_trip,
-        test_chat_caps_total_sessions,
-        test_chat_replays_history_to_a_second_tab,
-        test_chat_missing_binary_is_explained,
+        test_derived_stats,
+        test_deployment_info,
     ]:
         fn()
     print()

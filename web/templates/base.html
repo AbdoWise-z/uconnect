@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{# Plain reload rather than a held connection: records turn over on a 20s
+   keepalive, so a periodic refetch shows everything a stream would, and the
+   server's response cache absorbs it. #}
+{% if refresh|default(0) %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
 <title>{% block title %}uConnect{% endblock %}</title>
 <style>
   :root {
@@ -73,8 +77,6 @@
   <p class="sub">
     watching <code>{{ server }}</code>
     &nbsp;·&nbsp; <a href="/">topics</a>
-    &nbsp;·&nbsp; <a href="/app">create &amp; watch</a>
-    &nbsp;·&nbsp; <a href="/chat">chat</a>
     {% if build and build.short %}
       &nbsp;·&nbsp; running
       <a href="{{ build.url }}" title="{{ build.subject or build.sha }}"><code>{{ build.short }}</code></a>

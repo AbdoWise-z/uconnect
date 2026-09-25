@@ -357,8 +357,8 @@ server/        record store (sans-IO) + UDP service + relay + binary
 third_party/   vendored X25519 and Poly1305
 tests/         unit suite + a simulated network
 examples/      uconn-demo, uconn-chat, uconn-stream
-tools/         uconn-observe (server view as JSON), uconn-bridge (a peer on stdio)
-web/           Flask dashboard, topic creator, and web chat
+tools/         uconn-observe -- reads a server's public view as JSON
+web/           read-only Flask dashboard over uconn-observe
 deploy/        Oracle Cloud setup, systemd units, git watcher
 ```
 
@@ -484,17 +484,6 @@ it registers nothing and does not appear in the listings it reports. Nothing in
 Python speaks the wire protocol — it shells out to a binary that links this
 library, so the framing has exactly one implementation and cannot drift.
 
-There is also a small interactive app: `/app` creates a topic and streams live
-signaling activity, `/chat` joins a topic and talks. **Topic keys are generated
-in the browser and never sent to the server** — a server that minted them would
-know every secret it handed out.
-
-The chat is the one exception, and it is unavoidable. A browser cannot be a
-uConnect peer: no UDP socket, no hole punching, no Noise handshake. So `/chat`
-runs `tools/uconn-bridge` — a real peer — on the server's behalf, which means
-**the server holds `K` for any topic you chat in and can read it**. A native
-client never makes that trade. The page says so above the input box.
-
 Everything shown is already public to anyone who can reach the server: topics
 are listed unless a member opts out, LOOKUP needs no key because `K` never gets
 there, and metadata is plaintext by design. See [web/README.md](web/README.md).
@@ -516,16 +505,39 @@ one of these primitives is self-consistent when implemented wrongly, and two
 peers running the same broken code will complete a handshake and talk happily to
 each other. Only the vectors distinguish "works" from "correct".
 
+## Public servers
+
+| Rendezvous | Dashboard | Notes |
+|---|---|---|
+| `129.152.22.201:4433` (UDP) | http://129.152.22.201:8080 | Oracle Cloud, Ubuntu. Redeployed from `master` on every commit. |
+
+Try it against that one without running anything yourself:
+
+```sh
+./build/examples/uconn-demo --server 129.152.22.201:4433 --stats
+./build/examples/uconn-demo --server 129.152.22.201:4433 --create
+```
+
+It is a **best-effort public instance**, not a service: it holds no state worth
+keeping, restarts on every push, and may vanish. Run your own for anything that
+matters — it is one static binary with no configuration and no database.
+
+The rendezvous server cannot read your traffic either way. It holds a `dev_id`
+it derived itself, an IP:port, a `topic_id` and an opaque blob; `K` never
+reaches it.
+
 ## Status
 
 Working end to end: registration, keepalive with rebinding, lookup with
 sampling, topic listing, stats, candidate ranking, punching, the relay fallback
 for symmetric NAT, `Noise_NN`/`NNpsk0`, authenticated transport with replay
 protection, path migration, an N-peer mesh, reliable ordered streams with flow
-and congestion control, and an authenticated connection close.
+and congestion control, an authenticated connection close, and a read-only web
+dashboard.
 
-Verified against a live deployment as well as the simulator: byte-verified
-transfers of 512 KB–1 MB over both punched and relayed paths.
+Verified against the live deployment above as well as the simulator:
+byte-verified transfers of 512 KB–1 MB over both punched and relayed paths, and
+225 unit cases gating every deploy.
 
 Not yet implemented:
 

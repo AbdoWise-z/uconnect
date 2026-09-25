@@ -94,8 +94,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> chunk(32 * 1024);
 
     while (std::chrono::steady_clock::now() < deadline && !done) {
-        // No discovery loop here: set_auto_connect(true) below makes the
-        // library do it, on its own interval. Polling peers() by hand is what
+        // No discovery loop here: set_auto_connect(true) above makes the
+        // library do it on its own interval. Polling peers() by hand is what
         // this example used to do, and at a 20ms tick it produced well over a
         // thousand lookups in ten seconds.
 
@@ -125,7 +125,6 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(20ms);
     }
 
-    // Let the tail drain / acks settle.
     // Drain the tail.
     //
     // The receiver waits until the stream finishes, bounded by the deadline: a

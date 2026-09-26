@@ -32,6 +32,9 @@ s.finish();
 [Architecture](#architecture) ·
 [How a connection is made](#how-a-connection-is-made) ·
 [Security guarantees](#security-guarantees) · [Building](#building) ·
+[Running your own server](#running-your-own-server) ·
+[Auto-deploying from GitHub](#auto-deploying-from-github) ·
+[Customising](#customising) ·
 [Public servers](#public-servers) · [Status](#status)
 
 ---
@@ -812,6 +815,205 @@ registers nothing and does not appear in the listings it reports. Nothing in
 Python speaks the wire protocol — it shells out to a binary that links this
 library, so the framing has exactly one implementation and cannot drift. See
 [web/README.md](web/README.md).
+
+---
+
+# Running your own server
+
+The public instance is best-effort and restarts on every push. For anything that
+matters, run your own — it is one static binary with no configuration file, no
+database and no state worth backing up.
+
+## The short version
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/server/uconnect-rendezvous --port 4433
+```
+
+That is a working rendezvous server. Everything below is about keeping it up.
+
+**Open the UDP port.** This is the step people miss, and the failure mode is a
+server that starts cleanly, logs nothing wrong, and answers nobody:
+
+```sh
+ufw:       sudo ufw allow 4433/udp
+firewalld: sudo firewall-cmd --add-port=4433/udp --permanent && sudo firewall-cmd --reload
+```
+
+On a cloud VM the OS firewall is **not the only one in the path** — AWS, GCP,
+Azure and Oracle all have their own, and both must allow it.
+
+## As a service
+
+```sh
+sudo cp build/server/uconnect-rendezvous /usr/local/bin/
+sudo cp deploy/uconnect-rendezvous.service /etc/systemd/system/
+sudo systemctl enable --now uconnect-rendezvous
+```
+
+The unit is locked down hard — `DynamicUser`, `ProtectSystem=strict`,
+`MemoryDenyWriteExecute`, a `@system-service` syscall filter — because the server
+holds no keys, opens no files and writes nothing to disk.
+
+One counter-intuitive line in it is deliberate:
+
+```ini
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+```
+
+`AF_UNIX` and `AF_NETLINK` look unnecessary for a process that only speaks UDP,
+but glibc's resolver talks to `nscd`/`systemd-resolved` over a unix socket and
+`getifaddrs()` uses netlink. Restricting to the internet families alone makes the
+startup STUN lookup fail with a misleading "no reply".
+
+## Oracle Cloud
+
+Oracle puts **two** firewalls in front of an instance and its stock images ship
+an iptables chain that rejects everything but SSH. A script handles the instance
+side and prints exactly what to click for the cloud side:
+
+```sh
+git clone https://github.com/AbdoWise-z/uconnect && cd uconnect
+sudo bash deploy/oracle-setup.sh --port 4433
+```
+
+The ingress rule that catches people out is the direction: **Source `0.0.0.0/0`,
+Destination port 4433** — not source port 4433. A reversed rule looks plausible
+in the console and passes no traffic.
+
+## Docker
+
+```sh
+docker build -t uconnect-rendezvous .
+docker run --rm -p 4433:4433/udp uconnect-rendezvous
+```
+
+Note the **`/udp`** suffix. A plain `-p 4433:4433` publishes TCP, and the
+container will look perfectly healthy while being completely unreachable.
+
+The image is `FROM scratch` with a single static binary — no libc, no shell,
+nothing to mount. The build runs the test suite and fails if it does not pass.
+
+`deploy/fly.toml` covers Fly.io, which is one of the few PaaS platforms that
+carries raw UDP at all. Two things there will silently produce a healthy-looking
+server that answers nothing: UDP needs a **dedicated** IPv4 address (the shared
+one is HTTP-only), and the process must bind `fly-global-services` rather than
+`0.0.0.0`.
+
+---
+
+# Auto-deploying from GitHub
+
+A watcher polls the repo and redeploys when `master` moves.
+
+```sh
+sudo bash deploy/install-watcher.sh                    # server only
+sudo bash deploy/install-watcher.sh --with-web         # plus the dashboard
+sudo bash deploy/install-watcher.sh --branch dev --interval 300
+```
+
+It installs a systemd timer. To point it at a fork:
+
+```sh
+sudo bash deploy/install-watcher.sh \
+    --repo https://github.com/you/your-fork --branch main
+```
+
+## What it does on each tick
+
+1. Asks the remote for `master`'s sha — a conditional query, not a fetch, so a
+   network blip costs nothing
+2. If it moved: fetch, reset, and **build in a tree separate from the running
+   binary**
+3. **Run the test suite, and refuse to install a build that fails it.** This
+   process sits on the public internet; "it compiled" is not the bar
+4. Keep the outgoing binary, install the new one, restart
+5. **Roll back** if the service will not stay up
+
+It also **updates itself** from the commit it is deploying, so a fix to the
+deploy logic takes effect from the next tick. Two things it deliberately does
+not self-update, and which still need `install-watcher.sh` re-run:
+`uconnect-rendezvous.service` (the running server's lifeline — quietly
+rewriting it turns a bad edit into an outage instead of a failed deploy) and its
+own service/timer units (generated per host, so the repo copy is not
+authoritative).
+
+Restarting is cheap by design: records live in memory with a 90-second expiry
+and clients re-register within one 20-second keepalive, so a deploy costs a few
+seconds of re-registration and nothing else.
+
+```sh
+journalctl -u uconnect-watch -f      # deploys
+journalctl -u uconnect-rendezvous -f # the server
+sudo systemctl start uconnect-watch  # deploy now
+sudo /usr/local/bin/uconnect-watch --once --force   # rebuild the same commit
+sudo systemctl disable --now uconnect-watch.timer   # stop watching
+```
+
+## Why polling rather than a webhook
+
+A webhook needs an inbound HTTP listener, a second open port and a public
+endpoint, on a box whose whole point is that only UDP 4433 is exposed. Polling
+costs one conditional request a minute and needs nothing open.
+
+---
+
+# Customising
+
+## Server
+
+```sh
+uconnect-rendezvous --port 4433 \
+    --bind 0.0.0.0 \
+    --stale 45 \
+    --expiry 90 \
+    --max-per-ip 16 \
+    --quiet
+uconnect-rendezvous --nat-check     # report what this host's NAT does, then exit
+```
+
+`--stale` and `--expiry` are the two clocks worth understanding before changing
+either: a record goes stale at 45s (still returned, flagged) and is deleted at
+90s. Both sit close to the 20-second keepalive on purpose, because NAT mappings
+commonly die in 30s–5min and a record outliving its own NAT binding is worse than
+no record.
+
+Everything else lives in `StoreConfig` and `ServiceConfig` in `server/store.hpp`
+and `server/udp_service.hpp` — quotas, relay limits, cookie lifetime, token
+buckets. Tune those against real numbers rather than by guessing: unless
+`--quiet` is set the server prints a `[stats]` line every 30 seconds carrying
+the rejection counters, and the same figures are available remotely from
+`uconn-demo --stats`, `uconn-observe`, or the dashboard.
+
+To change the deployed flags, edit `ExecStart` in
+`deploy/uconnect-rendezvous.service` and re-run the installer. The watcher does
+not overwrite that unit.
+
+## Client
+
+Everything is in `Node::Config`:
+
+| Field | Default | Why you would change it |
+|---|---|---|
+| `server` | — | required |
+| `bind_port` | `0` | a fixed port for a manual firewall rule |
+| `keepalive` | `20s` | shorter on a mobile carrier with aggressive NAT timeouts |
+| `force_relay` | `false` | skip punching when you know it cannot work |
+| `verbose` | `false` | protocol tracing to stderr |
+| `stream_recv_window` | `256 KB` | raise for a long fat path; costs memory per stream |
+| `conn_recv_window` | `1 MB` | the aggregate across one peer's streams |
+| `max_streams_per_peer` | `64` | each stream costs two buffers |
+| `rekey_shift` | `16` | lower only to exercise the ratchet in a test |
+
+## Dashboard
+
+Environment variables, listed in [web/README.md](web/README.md). The ones that
+matter: `UCONNECT_SERVER`, `UCONNECT_CACHE_TTL`, `UCONNECT_REFRESH`, and `HOST`
+— which defaults to loopback deliberately, because this is an unauthenticated
+read-only view and defaulting to `0.0.0.0` would publish a topic directory from
+whatever host happened to run it.
 
 ## Layout
 

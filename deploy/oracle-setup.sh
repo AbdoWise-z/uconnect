@@ -160,9 +160,25 @@ cat <<EOF
        "udpOptions":{"destinationPortRange":{"min":$PORT,"max":$PORT}}}]'
 
  Then point a client at it:
+   uconn-demo --server $PUBLIC_IP:$PORT --create
    uconn-chat --server $PUBLIC_IP:$PORT --create --nick you
 
  Logs:     journalctl -u uconnect-rendezvous -f
  Restart:  systemctl restart uconnect-rendezvous
+
+----------------------------------------------------------------------------
+ OPTIONAL: redeploy automatically whenever master moves
+
+   sudo bash deploy/install-watcher.sh
+
+ Polls the repo once a minute, builds in a separate tree, refuses to install a
+ build whose tests fail, and rolls back if the new binary will not stay up.
+
+ Add --with-web for the read-only dashboard on :8080. That needs a SECOND
+ ingress rule (TCP 8080, both firewalls again) and it is unauthenticated, so
+ put it behind a proxy or bind it to loopback if that matters:
+
+   sudo bash deploy/install-watcher.sh --with-web
+   sudo bash deploy/install-watcher.sh --with-web --web-bind 127.0.0.1:8080
 ============================================================================
 EOF

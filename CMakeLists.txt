@@ -59,12 +59,17 @@ endfunction()
 # Layering. Each target declares what it may link. If a lower layer ever needs
 # to link a higher one, that is a layering violation and the build says so.
 #
-#   wire    <- nothing        (pure encode/decode)
-#   crypto  <- nothing        (pure primitives + noise state machine)
-#   path    <- wire           (candidate/punch state machine, sans-IO)
-#   session <- wire, crypto   (per-peer secure session, sans-IO)
-#   store   <- wire           (server-side record store, sans-IO)
-#   io      <- everything     (the ONLY target that may touch a socket)
+#   wire       <- nothing               (pure encode/decode, varints)
+#   primitives <- nothing               (vendored X25519 and Poly1305)
+#   crypto     <- primitives            (BLAKE2s, AEAD, Noise, HKDF)
+#   path       <- wire, crypto          (candidate ranking, punching, sans-IO)
+#   session    <- wire, crypto          (Noise session, replay, sans-IO)
+#   stream     <- wire                  (reliability and congestion control)
+#                                        NOT crypto: it sits above the session
+#                                        and never sees a key
+#   io         <- wire                  (the ONLY target that owns a socket)
+#   api        <- all of the above      (Node and Topic; threads and a clock)
+#   store      <- wire, crypto          (server-side record store, sans-IO)
 # ---------------------------------------------------------------------------
 
 add_subdirectory(src/wire)

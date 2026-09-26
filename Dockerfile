@@ -12,11 +12,16 @@ FROM alpine:3.20 AS build
 RUN apk add --no-cache build-base cmake ninja linux-headers
 
 WORKDIR /src
+# This list mirrors every add_subdirectory() in the root CMakeLists. Adding one
+# there and not here fails the configure step with "not an existing directory",
+# which is a confusing way to learn that a directory was never copied -- it is
+# how this Dockerfile silently stopped building when tools/ was added.
 COPY CMakeLists.txt ./
 COPY include/ include/
 COPY src/ src/
 COPY server/ server/
 COPY third_party/ third_party/
+COPY tools/ tools/
 COPY tests/ tests/
 COPY examples/ examples/
 COPY scripts/ scripts/

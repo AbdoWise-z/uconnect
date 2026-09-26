@@ -610,6 +610,54 @@ void StreamConnection::arm_loss_timer(Instant now) {
     loss_timer_armed_ = true;
 }
 
+void StreamConnection::on_session_restart(Instant now) {
+    if (dead_) return;
+
+    // Everything in flight belonged to the old number space. Declaring it lost
+    // is not bookkeeping tidiness: on_packet_lost moves those bytes from the
+    // send buffer's unacked set into its retransmit queue, and without that
+    // they sit in neither the retransmit queue nor the unsent range -- so
+    // next_chunk() would skip them and the data would simply never arrive.
+    for (const auto& p : sent_.take_all()) {
+        cc_.on_lost(p.size, p.sent_at, now);
+        on_packet_lost(p);
+        ++packets_lost_;
+    }
+
+    // Rebuilt rather than cleared, so a field added later cannot be forgotten
+    // here. Congestion state goes back to slow start: the path is the same one
+    // but nothing about the old window has been confirmed for this session.
+    acks_ = AckTracker{};
+    cc_   = Congestion{cfg_.max_payload};
+
+    // The RTT estimate is deliberately kept. It measures the path, and the
+    // path did not change -- throwing it away would make the first PTO after
+    // every re-handshake fire on a default guess instead of a measurement.
+
+    pto_count_        = 0;
+    loss_timer_armed_ = false;
+    last_ack_rx_      = now;
+    started_          = false;
+
+    // Retransmittable control frames have to go out again: reset_sent and
+    // stop_sent recorded that they were written into a packet that no longer
+    // exists.
+    for (auto& [id, s] : streams_) {
+        (void)id;
+        if (s.send_reset) s.reset_sent = false;
+        if (s.send_stop) s.stop_sent = false;
+    }
+
+    // Re-announce our receive windows. The peer keeps its own view of what we
+    // granted, but the frames that would have topped it up may have been in
+    // flight when the session went away.
+    send_max_data_ = true;
+    for (auto& [id, s] : streams_) {
+        (void)id;
+        s.recv.force_window_update();
+    }
+}
+
 void StreamConnection::on_timeout(Instant now) {
     if (dead_) return;
 

@@ -503,10 +503,21 @@ strictly-increasing check would drop legitimate packets and accepting anything
 would permit replay.
 
 Sessions have a 15-minute lifetime and then ask the layer above for a fresh
-handshake — there is no in-place rekey. Rekeying needs both ends to step in
-lockstep, and getting it wrong desynchronises a session in a way that looks
-exactly like packet loss. A fresh handshake on an already-validated path is
-cheap.
+handshake — there is no in-place rekey. Rekeying needs both ends to switch at
+the same point in a stream that reorders and loses, and if they disagree the
+receiver decrypts with the wrong key, the AEAD tag fails, and the packet is
+dropped silently — so a desynchronised rekey is indistinguishable from total
+packet loss, with no counter or log line anywhere to say otherwise. A fresh
+handshake on an already-validated path is cheap and either completes or does
+not.
+
+**Streams survive it.** The stream layer holds no keys — `uconnect_stream` does
+not even link `uconnect_crypto` — so offsets, buffers and flow-control credit
+carry straight across. Only the part keyed on the session's packet numbers is
+rebuilt, because those restart at zero and an ack naming an old number would
+acknowledge a packet the peer has not sent yet. Anything that was in flight is
+declared lost so its bytes are re-queued: without that they sit in neither the
+retransmit queue nor the unsent range, which is to say they are gone.
 
 The session survives an address change: matching on `conn_id` rather than the
 4-tuple means a NAT rebind or a Wi-Fi/LTE handoff keeps it alive, once the AEAD
@@ -782,7 +793,7 @@ deploy/        Oracle Cloud setup, systemd units, git watcher
 
 ## Tests
 
-225 unit cases plus two end-to-end smoke tests — one for punch + handshake +
+229 unit cases plus two end-to-end smoke tests — one for punch + handshake +
 messaging, one that moves a megabyte over a stream and verifies every byte.
 `python3 web/test_observer.py` covers the dashboard's data layer.
 
@@ -822,7 +833,7 @@ dashboard.
 
 Verified against the live deployment above as well as the simulator:
 byte-verified transfers of 512 KB–1 MB over both punched and relayed paths, and
-225 unit cases gating every deploy.
+229 unit cases gating every deploy.
 
 Not yet implemented:
 
@@ -830,9 +841,11 @@ Not yet implemented:
   UDP one. It must be read-only: the TCP source port an HTTP server observes is
   a different NAT mapping than the client's UDP socket, so a record registered
   that way would punch to nowhere.
-- **In-place rekey.** Sessions have a 15-minute lifetime and then ask for a
-  fresh handshake. Rekeying needs both ends to step in lockstep, and getting it
-  wrong desynchronises a session in a way that looks like packet loss.
+- **In-place rekey.** Sessions have a 15-minute lifetime and then re-handshake.
+  Streams now survive that, so it is no longer visible to an application; what
+  a ratchet would add is finer-grained forward secrecy *between* handshakes, not
+  continuity. It would also be strictly weaker than what the re-handshake
+  already gives, since a symmetric ratchet offers no post-compromise healing.
 - **Key rotation.** `key_epoch` is carried on the wire and in the prologue but
   nothing drives it yet.
 - **Path migration for network changes.** A device that switches Wi-Fi to
@@ -842,7 +855,9 @@ Not yet implemented:
 Known sharp edges:
 
 - A **bidirectional** stream is only released when both ends `finish()`. A
-  one-way transfer over one leaves state on both sides until the session ends.
-  Use a unidirectional stream, or `close()`.
+  one-way transfer over one leaves state on both sides until the peer actually
+  disconnects — and since streams now survive a re-handshake, that is no longer
+  bounded by the 15-minute session lifetime. Use a unidirectional stream, or
+  `close()`.
 - `SendBuffer` never returns its capacity to the allocator, so a stream that
   carried a large transfer holds its peak send buffer until it is retired.

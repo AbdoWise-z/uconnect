@@ -67,6 +67,20 @@ public:
 
     Instant now() const { return now_; }
 
+    // Discard everything currently on the wire.
+    //
+    // Models a session being replaced: those datagrams were sealed under keys
+    // the receiver has just destroyed, so they arrive as undecryptable noise
+    // and are dropped. Without this a restart test passes for the wrong reason
+    // -- the simulator happily delivers old-session packets, so the data
+    // arrives whether or not the restart re-queued it.
+    size_t drop_in_flight() {
+        const size_t n = queue_.size();
+        dropped_ += n;
+        queue_.clear();
+        return n;
+    }
+
     size_t sent() const { return sent_; }
     size_t dropped() const { return dropped_; }
 
@@ -1396,4 +1410,127 @@ TEST(writable_fires_when_acks_drain_the_local_send_buffer) {
     auto w = collect(a, StreamEventKind::Writable);
     CHECK(!w.empty());       // and the application was told
     CHECK(a.write(id, std::span(data).subspan(off)) > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Surviving a session re-handshake
+// ---------------------------------------------------------------------------
+TEST(a_stream_survives_a_session_restart_with_data_in_flight) {
+    // A session reaches its 15-minute lifetime and is replaced. The peer has
+    // not gone anywhere and the path is unchanged, so an in-progress transfer
+    // must continue rather than be abandoned -- which is what destroying the
+    // StreamConnection used to do, silently.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    // 40ms each way, so the pipe holds packets: the early ones are delivered
+    // and acknowledged while later ones are still out. A 5ms link acks
+    // everything between ticks and the restart would have nothing in flight to
+    // rescue, which is the whole point of the test.
+    Link link{a, b, Link::Config{0.0, 40ms, 0ms, 1}};
+
+    auto     data = pattern(60000);
+    StreamId id   = *a.open();
+    size_t   off  = 0;
+
+    // Get a transfer genuinely under way, with packets outstanding.
+    for (int i = 0; i < 3; ++i) {
+        off += a.write(id, std::span(data).subspan(off));
+        link.advance(45ms);
+    }
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    REQUIRE(!got.empty());
+    REQUIRE(got.size() < data.size());      // still going
+    REQUIRE(a.bytes_in_flight() > 0);       // and something is outstanding
+
+    // The session is replaced. Anything already on the wire was sealed under
+    // the old keys and is now undecryptable, so it never arrives.
+    REQUIRE(link.drop_in_flight() > 0);
+    a.on_session_restart(link.now());
+    b.on_session_restart(link.now());
+
+    // Finish the transfer across the boundary.
+    for (int i = 0; i < 200 && off < data.size(); ++i) {
+        off += a.write(id, std::span(data).subspan(off));
+        link.advance(50ms);
+        drain(b, id, got);
+    }
+    a.finish(id);
+    link.advance(5s);
+    drain(b, id, got);
+
+    CHECK_EQ(got.size(), data.size());
+    CHECK(got == data);          // byte for byte, across the restart
+    CHECK(!a.is_dead());
+    CHECK(!b.is_dead());
+}
+
+TEST(a_session_restart_does_not_lose_unacknowledged_bytes) {
+    // The specific hazard: bytes handed to the send buffer and put into a
+    // packet, but not yet acknowledged when the session went away. They are in
+    // neither the retransmit queue nor the unsent range, so unless the restart
+    // declares those packets lost they are skipped by next_chunk() and never
+    // arrive.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 200ms, 0ms, 1}};   // slow: acks lag behind
+
+    StreamId id = *a.open();
+    auto data = pattern(20000);
+    size_t off = a.write(id, data);
+    REQUIRE(off > 0);
+
+    // Let packets go out but deliberately not come back acknowledged.
+    link.advance(80ms);
+    REQUIRE(a.bytes_in_flight() > 0);
+
+    // Those packets die with the old session, so the only way their bytes ever
+    // reach the peer is if the restart puts them back in the retransmit queue.
+    REQUIRE(link.drop_in_flight() > 0);
+    a.on_session_restart(link.now());
+    b.on_session_restart(link.now());
+
+    a.finish(id);
+    link.advance(20s);
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+
+    CHECK_EQ(got.size(), off);
+    CHECK(std::equal(got.begin(), got.end(), data.begin()));
+}
+
+TEST(a_session_restart_clears_the_old_packet_number_space) {
+    // Acks and loss detection are keyed on session packet numbers, which
+    // restart at zero. Carrying either across would mean acknowledging packets
+    // the peer has not sent yet -- so it would drop them from its sent table
+    // and never retransmit.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    StreamId id = *a.open();
+    a.write(id, pattern(30000));
+    link.advance(300ms);
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    REQUIRE(a.packets_sent() > 1);
+
+    b.on_session_restart(link.now());
+
+    // b has received plenty under the old session. If its ack tracker carried
+    // over, the next ACK it builds would describe those old numbers.
+    std::vector<uint8_t> out(1200);
+    size_t n = b.poll_datagram(1, out, link.now());
+    if (n > 0) {
+        std::vector<Frame> frames;
+        REQUIRE(decode_frames(std::span<const uint8_t>(out.data(), n), frames));
+        for (const auto& f : frames) {
+            if (f.type == FrameType::Ack) {
+                // Nothing has arrived in the new space yet, so any ack must be
+                // about packet 1 -- the one just polled -- not the old run.
+                CHECK(f.ack.largest <= 1u);
+            }
+        }
+    }
+    CHECK(!b.is_dead());
 }

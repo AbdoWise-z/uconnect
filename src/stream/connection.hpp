@@ -131,6 +131,21 @@ public:
 
     void on_timeout(Instant now);
 
+    // The session underneath was replaced -- a re-handshake at the session's
+    // lifetime limit, not a failure. The path and the peer are the same.
+    //
+    // Streams survive this. Offsets, buffers and flow-control credit belong to
+    // this layer, which never sees a key and does not care which session
+    // carried its bytes. What does not survive is anything keyed on the
+    // session's packet numbers: they restart at zero, so an ack referring to
+    // an old number would acknowledge a packet the peer has not sent yet.
+    //
+    // Must be called while the new session exists but before it carries
+    // anything, and on BOTH ends -- each does so when its own session object
+    // changes, which is before either can decrypt the other's transport
+    // packets.
+    void on_session_restart(Instant now);
+
     // Build the next datagram payload to send. Returns the number of bytes
     // written into `out`, or 0 when nothing is due -- either everything is
     // sent and acknowledged, or the congestion window is full.

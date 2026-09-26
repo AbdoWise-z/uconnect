@@ -1116,6 +1116,17 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                         scfg.conn_recv_window        = cfg.conn_recv_window;
                         scfg.max_concurrent_streams  = cfg.max_streams_per_peer;
                         peer.streams.emplace(scfg, a ? stream::Role::A : stream::Role::B);
+                    } else {
+                        // Streams already exist, so this is a second session
+                        // with the same peer -- a re-handshake at the session
+                        // lifetime limit, or a glare resolution that swapped
+                        // which session we kept.
+                        //
+                        // They carry on. Only the part that was keyed on the
+                        // old session's packet numbers is rebuilt, and this is
+                        // the right moment: the new session exists and has not
+                        // carried a byte yet.
+                        peer.streams->on_session_restart(now);
                     }
                     set_peer_state(ti, peer, PeerState::Connected);
                     break;
@@ -1139,9 +1150,16 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     break;
                 case K::NeedsRehandshake:
                     // The path is still good; re-establish on it.
+                    //
+                    // peer.streams is deliberately KEPT. The session reached
+                    // its lifetime limit -- the peer has not gone anywhere, so
+                    // destroying its streams would abandon whatever was in
+                    // flight, and silently: no event fires on this path, so an
+                    // application would watch a transfer stop for no stated
+                    // reason every fifteen minutes. They are re-based on the
+                    // new session once it is established.
                     conns.erase(peer.sess->conn_id());
                     peer.sess.reset();
-                    peer.streams.reset();
                     if (peer.relayed) start_relay_session(ti, tid, peer, now);
                     else if (!peer.cands.empty()) start_punch(ti, tid, peer, now);
                     break;

@@ -173,6 +173,22 @@ std::optional<Instant> SentPackets::oldest_in_flight() const {
     return std::nullopt;
 }
 
+std::vector<SentPacket> SentPackets::take_all() {
+    std::vector<SentPacket> out;
+    out.reserve(sent_.size());
+    for (auto& [n, p] : sent_) {
+        (void)n;
+        out.push_back(std::move(p));
+    }
+    sent_.clear();
+    // largest_acked_ and any_acked_ refer to the old number space too, so loss
+    // detection must not carry them over: "everything below the largest ack"
+    // would otherwise condemn the first packets of the new session.
+    largest_acked_ = 0;
+    any_acked_     = false;
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // AckTracker
 // ---------------------------------------------------------------------------

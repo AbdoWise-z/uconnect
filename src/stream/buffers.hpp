@@ -63,6 +63,10 @@ public:
         return max_offset() >= announced_max_ + window_ / 2;
     }
     void window_announced() { announced_max_ = max_offset(); }
+
+    // Force the next poll to re-advertise, for when the frame that carried the
+    // last announcement went out on a session that no longer exists.
+    void force_window_update() { announced_max_ = 0; }
     uint64_t announced_max() const { return announced_max_; }
 
 private:

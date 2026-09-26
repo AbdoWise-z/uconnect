@@ -147,6 +147,16 @@ public:
     // should be armed against.
     std::optional<Instant> oldest_in_flight() const;
 
+    // Hand back everything still in flight and forget it.
+    //
+    // For the one case where packet numbers stop meaning anything: the session
+    // underneath was replaced, so nothing outstanding will ever be
+    // acknowledged and the numbers start again from zero. The caller must
+    // treat what it gets back as lost, or the bytes those packets carried are
+    // in neither the retransmit queue nor the unsent range -- which is to say,
+    // gone.
+    std::vector<SentPacket> take_all();
+
     bool   empty() const { return sent_.empty(); }
     size_t outstanding() const { return sent_.size(); }
     uint64_t largest_acked() const { return largest_acked_; }

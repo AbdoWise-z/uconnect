@@ -356,6 +356,16 @@ public:
         // and inbound frames past the peer's share are dropped -- each stream
         // costs buffers, and the peer chooses how many ids it puts on the wire.
         size_t max_streams_per_peer = 64;
+
+        // Ratchet the transport keys every 2^rekey_shift packets, so traffic
+        // older than the current generation cannot be recovered from a later
+        // compromise. Driven by the packet counter, which travels in every
+        // header, so both ends agree without negotiating anything.
+        //
+        // Must stay above 64 (the replay window width): that is what bounds a
+        // reordered packet to at most one generation old. Lower it only to
+        // exercise the boundary in a test.
+        uint8_t rekey_shift = 16;
     };
 
     explicit Node(Config);

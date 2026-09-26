@@ -738,3 +738,176 @@ TEST(a_close_before_the_handshake_completes_puts_nothing_on_the_wire) {
     CHECK(a.state() == SessionState::Closed);
     CHECK(!a.poll_transmit().has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Counter-derived key ratchet
+// ---------------------------------------------------------------------------
+namespace {
+
+// A pair with a deliberately tiny generation so boundaries are reachable in a
+// handful of packets. Production uses 2^16.
+std::optional<Pair> establish_with(SessionConfig cfg) {
+    auto psk = psk_of(0x5A);
+    auto a = Session::initiate(cfg, topic_of(1), 0, &psk, dev_of(1), dev_of(2),
+                               ep(5, 5000), txn_of(9), t0());
+    auto init = a.poll_transmit();
+    if (!init) return std::nullopt;
+    auto b = Session::accept(cfg, topic_of(1), 0, &psk, dev_of(1), ep(4, 4000),
+                             txn_of(9), init->data, t0() + 5ms);
+    if (!b) return std::nullopt;
+    auto resp = b->poll_transmit();
+    if (!resp) return std::nullopt;
+    a.on_datagram(ep(5, 5000), resp->data, t0() + 10ms);
+    if (a.state() != SessionState::Established) return std::nullopt;
+    return Pair{std::move(a), std::move(*b)};
+}
+
+std::vector<std::string> drain_data(Session& s) {
+    std::vector<std::string> out;
+    while (auto e = s.poll_event()) {
+        if (e->kind == SessionEvent::Kind::Data) {
+            out.emplace_back(e->data.begin(), e->data.end());
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(traffic_survives_many_key_generation_boundaries) {
+    // The ratchet is driven by the packet counter, so both ends compute the
+    // same generation from a value that arrived with the packet. Nothing is
+    // negotiated, so there is nothing to desynchronise -- and a desynchronised
+    // rekey would show up here as silent total loss, since a key mismatch fails
+    // the AEAD tag and a failed tag is dropped without a word.
+    SessionConfig cfg;
+    cfg.rekey_shift = 2;          // a new generation every 4 packets
+    auto p = establish_with(cfg);
+    REQUIRE(p.has_value());
+
+    std::vector<std::string> sent;
+    for (int i = 0; i < 40; ++i) {          // ten generations
+        sent.push_back("payload-" + std::to_string(i));
+        REQUIRE(p->a.send(bytes(sent.back()), t0() + 1s).has_value());
+    }
+    REQUIRE(deliver(p->a, p->b, ep(5, 5000), t0() + 1s) > 0);
+
+    auto got = drain_data(p->b);
+    CHECK_EQ(got.size(), sent.size());
+    CHECK(got == sent);
+}
+
+TEST(a_straggler_from_the_previous_generation_still_decrypts) {
+    // Reordering across a boundary is the case that needs the old key kept.
+    // One previous generation is provably enough: the replay window refuses
+    // anything more than 64 counters behind, so a straggler cannot be two
+    // generations old once a generation exceeds 64 packets.
+    SessionConfig cfg;
+    cfg.rekey_shift = 2;
+    auto p = establish_with(cfg);
+    REQUIRE(p.has_value());
+
+    // Counters 0..3 are generation 0; counter 4 opens generation 1.
+    std::vector<std::vector<uint8_t>> dgrams;
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(p->a.send(bytes("m" + std::to_string(i)), t0() + 1s).has_value());
+        auto o = p->a.poll_transmit();
+        REQUIRE(o.has_value());
+        dgrams.push_back(o->data);
+    }
+
+    // Deliver the first of the new generation, then the last of the old one.
+    p->b.on_datagram(ep(5, 5000), dgrams[4], t0() + 1s);
+    p->b.on_datagram(ep(5, 5000), dgrams[3], t0() + 1s);
+
+    auto got = drain_data(p->b);
+    REQUIRE(got.size() == 2);
+    CHECK(got[0] == "m4");
+    CHECK(got[1] == "m3");   // decrypted under the retained previous key
+}
+
+TEST(a_peer_that_jumps_too_many_generations_is_not_followed) {
+    // Key selection happens before the AEAD can verify anything, so an
+    // unauthenticated counter decides how much derivation work to do. The cap
+    // is what stops a packet claiming a far-future counter from walking the
+    // ratchet arbitrarily far.
+    SessionConfig cfg;
+    cfg.rekey_shift            = 2;
+    cfg.max_generations_ahead  = 2;
+    auto p = establish_with(cfg);
+    REQUIRE(p.has_value());
+
+    // Burn counters without delivering them: the sender races ahead.
+    std::vector<uint8_t> far;
+    for (int i = 0; i < 40; ++i) {
+        REQUIRE(p->a.send(bytes("skipped"), t0() + 1s).has_value());
+        auto o = p->a.poll_transmit();
+        REQUIRE(o.has_value());
+        far = o->data;             // the last one is ~generation 9
+    }
+
+    p->b.on_datagram(ep(5, 5000), far, t0() + 1s);
+    CHECK(drain_data(p->b).empty());       // beyond the cap: dropped unread
+    CHECK(p->b.state() == SessionState::Established);   // and harmless
+}
+
+TEST(a_generation_jump_within_the_cap_is_followed) {
+    // The other side of the same bound: losing a generation's worth of packets
+    // must not end the session, so a jump inside the cap has to be accepted.
+    SessionConfig cfg;
+    cfg.rekey_shift           = 2;
+    cfg.max_generations_ahead = 2;
+    auto p = establish_with(cfg);
+    REQUIRE(p.has_value());
+
+    std::vector<uint8_t> ahead;
+    for (int i = 0; i < 6; ++i) {           // counters 0..5 -> generation 1
+        REQUIRE(p->a.send(bytes("m" + std::to_string(i)), t0() + 1s).has_value());
+        auto o = p->a.poll_transmit();
+        REQUIRE(o.has_value());
+        ahead = o->data;
+    }
+
+    p->b.on_datagram(ep(5, 5000), ahead, t0() + 1s);
+    auto got = drain_data(p->b);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0] == "m5");
+}
+
+TEST(a_forged_far_future_counter_cannot_derail_the_key_schedule) {
+    // The rule that makes any of this safe: nothing mutates before the AEAD
+    // verifies. A forged packet must cost a dropped packet and nothing more --
+    // not an advanced generation, and not a discarded key real traffic needs.
+    SessionConfig cfg;
+    cfg.rekey_shift = 2;
+    auto p = establish_with(cfg);
+    REQUIRE(p.has_value());
+
+    REQUIRE(p->a.send(bytes("before"), t0() + 1s).has_value());
+    auto good = p->a.poll_transmit();
+    REQUIRE(good.has_value());
+
+    // Same packet, counter rewritten to a wild value. The counter is the AEAD
+    // nonce as well as the generation selector, so this fails twice over.
+    auto forged = good->data;
+    wire::Reader probe{forged};
+    auto h = wire::Header::decode(probe);
+    REQUIRE(h.has_value());
+    const size_t counter_off = forged.size() - probe.remaining() + 4;  // after conn_id
+    for (int i = 0; i < 8; ++i) forged[counter_off + i] = 0x7F;
+
+    p->b.on_datagram(ep(5, 5000), forged, t0() + 1s);
+    CHECK(drain_data(p->b).empty());
+
+    // The real packet, and everything after it, still works.
+    p->b.on_datagram(ep(5, 5000), good->data, t0() + 1s);
+    auto got = drain_data(p->b);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0] == "before");
+
+    for (int i = 0; i < 12; ++i) {
+        REQUIRE(p->a.send(bytes("after" + std::to_string(i)), t0() + 2s).has_value());
+    }
+    REQUIRE(deliver(p->a, p->b, ep(5, 5000), t0() + 2s) > 0);
+    CHECK_EQ(drain_data(p->b).size(), 12u);
+}

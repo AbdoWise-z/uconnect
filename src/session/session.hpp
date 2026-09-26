@@ -53,6 +53,34 @@ struct SessionConfig {
 
     Duration handshake_timeout{std::chrono::seconds(5)};
     int      handshake_retries = 4;
+
+    // Ratchet the transport keys every 2^rekey_shift packets.
+    //
+    // Driven by the packet counter rather than a clock, and that is the whole
+    // trick: the counter travels in every header, so both ends compute the same
+    // generation from data that arrived with the packet. There is no switch to
+    // coordinate and therefore nothing to desynchronise -- which is the failure
+    // this avoids, because a key mismatch shows up as a failed AEAD tag, and a
+    // failed tag is dropped silently. Disagreeing about the current key looks
+    // exactly like total packet loss, with no counter or log line to say so.
+    //
+    // 2^16 packets is roughly 78 MB at 1200-byte payloads. It must stay above
+    // ReplayWindow::kWidth: the replay window will not accept a packet more
+    // than 64 counters behind the high-water mark, which is what guarantees a
+    // straggler is at most ONE generation old and so only the previous key has
+    // to be kept.
+    uint8_t  rekey_shift = 16;
+
+    // How far ahead a received counter may jump before the packet is dropped
+    // unread. A legitimate jump of one generation means 2^rekey_shift
+    // consecutive packets lost, long after PTO would have given up.
+    //
+    // The cap exists because key selection necessarily happens BEFORE the AEAD
+    // can verify anything -- a key is needed to attempt decryption at all -- so
+    // an unauthenticated counter decides how much derivation work to do. Left
+    // unbounded, a packet claiming counter 2^60 would walk the ratchet 2^44
+    // times.
+    uint64_t max_generations_ahead = 2;
 };
 
 struct Outgoing {
@@ -198,6 +226,24 @@ private:
     void  queue_close(uint16_t reason);
     void  close_with_cause(Instant now, CloseCause, uint16_t peer_reason);
 
+    // Ratchet the send key forward to whatever generation `counter` belongs to.
+    // The counter advances by one per packet, so this steps at most once and
+    // forgets the old key immediately -- which is what makes past traffic
+    // unrecoverable after a later compromise.
+    void advance_send_keys(uint64_t counter);
+
+    // Decrypt a transport-class payload: pick the generation, verify, replay
+    // check, and only then adopt a new generation. Returns plaintext length, or
+    // nullopt if the packet must be dropped.
+    //
+    // Everything that mutates state lives after the AEAD here, deliberately.
+    // Key selection has to happen on an unauthenticated counter, so a forged
+    // packet must be able to cost a dropped packet and nothing more -- not a
+    // discarded key that real traffic still needed.
+    std::optional<size_t> open_packet(uint64_t counter, std::span<const uint8_t> ad,
+                                      std::span<const uint8_t> ciphertext,
+                                      std::span<uint8_t> out);
+
     SessionConfig cfg_;
     DevId         peer_{};
     Endpoint      path_{};
@@ -213,6 +259,14 @@ private:
 
     crypto::CipherState send_cs_;
     crypto::CipherState recv_cs_;
+
+    // Key generation, derived from the packet counter rather than tracked.
+    // recv_cs_ is generation recv_gen_; recv_cs_prev_ is the one before it and
+    // exists only so a straggler from just before a boundary still decrypts.
+    // One previous generation is provably enough -- see rekey_shift.
+    crypto::CipherState recv_cs_prev_;
+    uint64_t            send_gen_ = 0;
+    uint64_t            recv_gen_ = 0;
     crypto::Hash        handshake_hash_{};
     ReplayWindow        replay_;
 

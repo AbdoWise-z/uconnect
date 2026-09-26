@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     bool        force_relay = false;
     bool        verbose     = false;
     int         seconds = 40;
+    int         rekey_shift = 0;   // 0 = library default
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -44,6 +45,12 @@ int main(int argc, char** argv) {
         else if (a == "--relay") force_relay = true;
         else if (a == "--verbose") verbose = true;
         else if (a == "--seconds") { if (auto* v = next(i)) seconds = std::atoi(v); }
+        // Lowering this makes the transport key ratchet every few hundred
+        // packets instead of every 65536, so a one-megabyte transfer crosses
+        // several generation boundaries over a real socket. The unit tests
+        // cover the boundary logic against a simulated link; this covers it
+        // against a real one.
+        else if (a == "--rekey-shift") { if (auto* v = next(i)) rekey_shift = std::atoi(v); }
     }
     if (server.empty() || topic_uri.empty()) {
         std::fprintf(stderr, "need --server and --topic\n");
@@ -57,6 +64,7 @@ int main(int argc, char** argv) {
     cfg.server      = server;
     cfg.force_relay = force_relay;
     cfg.verbose     = verbose;
+    if (rekey_shift > 0) cfg.rekey_shift = static_cast<uint8_t>(rekey_shift);
     Node node{cfg};
     node.run_in_background();
     auto& topic = node.join(*creds);

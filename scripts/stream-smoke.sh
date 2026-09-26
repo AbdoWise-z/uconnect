@@ -72,6 +72,12 @@ leg() {
 leg punched 19500 ""
 leg relayed 19600 "--relay"
 
+# Same megabyte, but with the transport keys ratcheting every 128 packets
+# instead of every 65536, so the transfer crosses several key generations over a
+# real socket. The unit tests cover the boundary against a simulated link; this
+# is the only place it meets real loss, real reordering and a real NAT.
+leg ratchet 19700 "--rekey-shift 7"
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "STREAM SMOKE PASSED"; else echo "STREAM SMOKE FAILED"; fi
 exit $FAIL

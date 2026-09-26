@@ -238,13 +238,11 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
         // here rather than tearing the session down.
         const uint8_t        ad = static_cast<uint8_t>(wire::MsgType::Close);
         std::vector<uint8_t> plain(m->ciphertext.size());
-        auto n = recv_cs_.decrypt_at(m->counter, std::span<const uint8_t>(&ad, 1),
-                                     m->ciphertext, plain);
-        if (!n) return;  // forged or corrupt: drop, say nothing
-
-        // Same ordering as the data path: the counter is only trustworthy once
-        // the AEAD has verified it, or forged counters could poison the window.
-        if (!replay_.accept(m->counter)) return;
+        // Key generation, AEAD and replay window, in that order, inside
+        // open_packet. Forged or corrupt: drop, say nothing.
+        auto n = open_packet(m->counter, std::span<const uint8_t>(&ad, 1),
+                             m->ciphertext, plain);
+        if (!n) return;
 
         plain.resize(*n);
         const uint16_t peer_reason =
@@ -263,13 +261,12 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
     if (!t || t->conn_id != conn_id_) return;
 
     std::vector<uint8_t> plain(t->ciphertext.size());
-    auto n = recv_cs_.decrypt_at(t->counter, {}, t->ciphertext, plain);
-    if (!n) return;  // forged or corrupt: drop, say nothing
-
-    // Only after the AEAD verifies is the counter trustworthy enough to feed
-    // the replay window -- otherwise an attacker could poison it with forged
-    // high counters and lock out the real peer.
-    if (!replay_.accept(t->counter)) return;
+    // The counter selects a key generation, decrypts under it, and only then
+    // feeds the replay window and adopts a new generation -- nothing before the
+    // AEAD verifies, or a forged counter could poison the window or discard a
+    // key that real traffic still needs. Forged or corrupt: drop, say nothing.
+    auto n = open_packet(t->counter, {}, t->ciphertext, plain);
+    if (!n) return;
 
     ++received_;
     last_recv_ = now;
@@ -290,9 +287,64 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
 // ---------------------------------------------------------------------------
 // Sending
 // ---------------------------------------------------------------------------
+void Session::advance_send_keys(uint64_t counter) {
+    const uint64_t g = counter >> cfg_.rekey_shift;
+    while (send_gen_ < g) {
+        send_cs_.rekey();   // Noise s11.3; one-way, so the old key is gone
+        ++send_gen_;
+    }
+}
+
+std::optional<size_t> Session::open_packet(uint64_t counter, std::span<const uint8_t> ad,
+                                           std::span<const uint8_t> ciphertext,
+                                           std::span<uint8_t> out) {
+    const uint64_t g = counter >> cfg_.rekey_shift;
+
+    // --- select, without touching any state ------------------------------
+    const crypto::CipherState* use = nullptr;
+    crypto::CipherState        derived;   // only populated for a forward jump
+    bool                       jumped = false;
+
+    if (g == recv_gen_) {
+        use = &recv_cs_;
+    } else if (recv_gen_ > 0 && g + 1 == recv_gen_) {
+        // A straggler from just before the last boundary.
+        use = &recv_cs_prev_;
+    } else if (g > recv_gen_ && g - recv_gen_ <= cfg_.max_generations_ahead) {
+        derived = recv_cs_;
+        for (uint64_t i = recv_gen_; i < g; ++i) derived.rekey();
+        use    = &derived;
+        jumped = true;
+    } else {
+        // Older than any key still held, or further ahead than a real peer
+        // could legitimately be. The bound is the point: `g` came from an
+        // unauthenticated header and decides how much work we do.
+        return std::nullopt;
+    }
+
+    // --- verify ----------------------------------------------------------
+    auto n = use->decrypt_at(counter, ad, ciphertext, out);
+    if (!n) return std::nullopt;
+    if (!replay_.accept(counter)) return std::nullopt;
+
+    // --- only now adopt --------------------------------------------------
+    if (jumped) {
+        // The generation immediately below g becomes the one we keep for
+        // stragglers. Re-derived from the old current rather than kept from
+        // the probe, which is at g itself.
+        crypto::CipherState prev = recv_cs_;
+        for (uint64_t i = recv_gen_; i + 1 < g; ++i) prev.rekey();
+        recv_cs_prev_ = prev;
+        recv_cs_      = derived;
+        recv_gen_     = g;
+    }
+    return n;
+}
+
 std::optional<uint64_t> Session::send(std::span<const uint8_t> payload, Instant now) {
     if (state_ != SessionState::Established) return std::nullopt;
 
+    advance_send_keys(send_counter_);
     std::vector<uint8_t> ct(payload.size() + crypto::kTagLen);
     send_cs_.encrypt_at(send_counter_, {}, payload, ct);
 
@@ -333,6 +385,8 @@ void Session::queue_close(uint16_t reason) {
     // a data packet being re-typed into a close by anyone on path.
     const uint8_t ad = static_cast<uint8_t>(wire::MsgType::Close);
 
+    // Shares the transport counter space, so it shares the key schedule too.
+    advance_send_keys(send_counter_);
     std::vector<uint8_t> ct(sizeof(plain) + crypto::kTagLen);
     send_cs_.encrypt_at(send_counter_, std::span<const uint8_t>(&ad, 1),
                         std::span<const uint8_t>(plain, sizeof(plain)), ct);
@@ -375,6 +429,7 @@ void Session::close_with_cause(Instant now, CloseCause cause, uint16_t peer_reas
     state_ = SessionState::Closed;
     send_cs_.clear();
     recv_cs_.clear();
+    recv_cs_prev_.clear();   // the straggler key is key material too
 
     SessionEvent e;
     e.kind        = SessionEvent::Kind::Closed;

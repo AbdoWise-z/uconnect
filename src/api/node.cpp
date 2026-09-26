@@ -303,6 +303,14 @@ struct Node::Impl {
     std::atomic<bool> stop{false};
 
     // --- helpers ----------------------------------------------------------
+    // One place builds it, so a knob added to Node::Config cannot reach some
+    // sessions and miss others depending on which path established them.
+    session::SessionConfig session_cfg() const {
+        session::SessionConfig sc;
+        sc.rekey_shift = cfg.rekey_shift;
+        return sc;
+    }
+
     void send_raw(const Endpoint& to, std::span<const uint8_t> d) {
         sock.send_to(to, d);
     }
@@ -831,7 +839,7 @@ void Node::Impl::on_handshake_dgram(const Endpoint& from, std::span<const uint8_
         DevId placeholder{};
         std::memcpy(placeholder.data(), &hi->conn_id, sizeof(hi->conn_id));
 
-        auto s = session::Session::accept(session::SessionConfig{}, tid, 0, ti.psk(),
+        auto s = session::Session::accept(session_cfg(), tid, 0, ti.psk(),
                                           placeholder, from, hi->probe_txn, dgram, now);
         if (!s) return false;
 
@@ -1014,7 +1022,7 @@ void Node::Impl::start_relay_session(Topic::Impl& ti, const TopicId& tid, Peer& 
         txn[i + 8] = txn[i];
     }
 
-    auto s = session::Session::initiate(session::SessionConfig{}, tid, 0, ti.psk(),
+    auto s = session::Session::initiate(session_cfg(), tid, 0, ti.psk(),
                                         ti.self ? *ti.self : DevId{}, peer.dev_id,
                                         server, txn, now);
     conns[s.conn_id()] = {tid, peer.dev_id};
@@ -1048,7 +1056,7 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                 // Hand the validated path and its transaction to the session
                 // layer; the prologue binds the handshake to both.
                 auto s = session::Session::initiate(
-                    session::SessionConfig{}, tid, 0, ti.psk(),
+                    session_cfg(), tid, 0, ti.psk(),
                     ti.self ? *ti.self : DevId{}, peer.dev_id, e->path, e->txn, now);
                 conns[s.conn_id()] = {tid, peer.dev_id};
                 peer.sess          = std::move(s);

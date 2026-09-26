@@ -90,6 +90,7 @@ cfg.verbose     = false;                   // protocol tracing to stderr
 cfg.stream_recv_window   = 256 * 1024;     // per stream
 cfg.conn_recv_window     = 1024 * 1024;    // across all streams on one peer
 cfg.max_streams_per_peer = 64;
+cfg.rekey_shift          = 16;             // ratchet keys every 2^16 packets
 
 Node node{cfg};
 node.run_in_background();      // or node.run() to block on this thread
@@ -502,14 +503,54 @@ high-water mark plus a bitmap of the counters below it. UDP reorders, so a
 strictly-increasing check would drop legitimate packets and accepting anything
 would permit replay.
 
-Sessions have a 15-minute lifetime and then ask the layer above for a fresh
-handshake — there is no in-place rekey. Rekeying needs both ends to switch at
-the same point in a stream that reorders and loses, and if they disagree the
-receiver decrypts with the wrong key, the AEAD tag fails, and the packet is
-dropped silently — so a desynchronised rekey is indistinguishable from total
-packet loss, with no counter or log line anywhere to say otherwise. A fresh
-handshake on an already-validated path is cheap and either completes or does
-not.
+### Key generations, driven by the counter
+
+Transport keys ratchet every 2¹⁶ packets, so traffic older than the current
+generation cannot be recovered from a later compromise:
+
+```
+gen  = counter >> rekey_shift
+k(0) = the key from the Noise split
+k(n) = rekey(k(n-1))              // Noise s11.3, one-way
+```
+
+**The generation is a function of the packet counter, which is already in every
+header.** That is the whole design. The usual way to rekey is to coordinate a
+switch — a key-phase bit, a rule for retiring the old key, a rule for when it is
+safe to discard it. Here there is nothing to coordinate, because both ends
+compute the generation from a value that arrived with the packet. Each direction
+ratchets independently on its own counter.
+
+That matters because of how the failure would present. If two ends disagree
+about the current key, the receiver decrypts with the wrong one, the AEAD tag
+fails, and a failed tag is dropped silently — so a desynchronised rekey is
+indistinguishable from total packet loss, with no counter or log line anywhere
+to say otherwise. The symptom points at the network; the cause is in the crypto
+state machine.
+
+Two details carry the safety:
+
+- **Nothing mutates before the AEAD verifies.** Key selection has to happen on
+  an unauthenticated counter, so a forged packet must cost a dropped packet and
+  nothing more — never an advanced generation, and never a discarded key that
+  real traffic still needed. Same rule the replay window already follows.
+- **The forward jump is bounded.** An unauthenticated counter decides how much
+  derivation to do, so a packet claiming counter 2⁶⁰ would otherwise walk the
+  ratchet 2⁴⁴ times. Removing that bound does not fail the test suite, it hangs
+  it — which is the denial of service, demonstrated.
+
+Only the previous generation is kept, and that is provable rather than guessed:
+the replay window refuses anything more than 64 counters behind the high-water
+mark, so once a generation exceeds 64 packets a straggler can be at most one
+generation old.
+
+### And still a re-handshake
+
+Sessions also have a 15-minute lifetime, after which they ask the layer above
+for a fresh handshake. The two are complementary, not alternatives: a symmetric
+ratchet protects *past* traffic, but `k(n)` derives every future key, so it
+offers no healing after a compromise. Only a fresh DH does that. Streams survive
+the re-handshake, so it is invisible to an application.
 
 **Streams survive it.** The stream layer holds no keys — `uconnect_stream` does
 not even link `uconnect_crypto` — so offsets, buffers and flow-control credit
@@ -793,7 +834,7 @@ deploy/        Oracle Cloud setup, systemd units, git watcher
 
 ## Tests
 
-229 unit cases plus two end-to-end smoke tests — one for punch + handshake +
+234 unit cases plus two end-to-end smoke tests — one for punch + handshake +
 messaging, one that moves a megabyte over a stream and verifies every byte.
 `python3 web/test_observer.py` covers the dashboard's data layer.
 
@@ -833,7 +874,7 @@ dashboard.
 
 Verified against the live deployment above as well as the simulator:
 byte-verified transfers of 512 KB–1 MB over both punched and relayed paths, and
-229 unit cases gating every deploy.
+234 unit cases gating every deploy.
 
 Not yet implemented:
 
@@ -841,13 +882,9 @@ Not yet implemented:
   UDP one. It must be read-only: the TCP source port an HTTP server observes is
   a different NAT mapping than the client's UDP socket, so a record registered
   that way would punch to nowhere.
-- **In-place rekey.** Sessions have a 15-minute lifetime and then re-handshake.
-  Streams now survive that, so it is no longer visible to an application; what
-  a ratchet would add is finer-grained forward secrecy *between* handshakes, not
-  continuity. It would also be strictly weaker than what the re-handshake
-  already gives, since a symmetric ratchet offers no post-compromise healing.
-- **Key rotation.** `key_epoch` is carried on the wire and in the prologue but
-  nothing drives it yet.
+- **Key rotation driven by `key_epoch`.** The epoch is carried on the wire and
+  mixed into the prologue, but nothing rotates it. Transport keys do ratchet
+  within a session; what is missing is rotating `K` itself across sessions.
 - **Path migration for network changes.** A device that switches Wi-Fi to
   cellular gets a new mapping, and there is no migration for it — both ends time
   out and reconnect from scratch.

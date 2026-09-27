@@ -149,11 +149,12 @@ int main(int argc, char** argv) {
         Node node{cfg};
         node.run_in_background();
 
-        std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
 
         if (!one_topic.empty()) {
             auto id = from_hex<16>(one_topic);
-            if (!id) { std::printf("}\n"); return fail("bad topic id"); }
+            if (!id) { return fail("bad topic id"); }
+
+            std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
             auto peers = members_of(node, *id, static_cast<uint8_t>(limit), timeout);
             std::printf(",\n  \"topic\":{\"id\":\"%s\",\"members\":[\n",
                         to_hex(*id).c_str());
@@ -162,6 +163,8 @@ int main(int argc, char** argv) {
             node.shutdown();
             return 0;
         }
+
+        std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
 
         if (auto s = node.stats(timeout)) {
             std::printf(
@@ -189,7 +192,8 @@ int main(int argc, char** argv) {
         // topic is still reachable by id -- see --topic -- exactly as it is for
         // any other client; "unlisted" means absent from the directory, not
         // secret.
-        auto topics = node.explore(100, timeout);
+        // Every listed topic, not just the first page -- up to a sanity cap.
+        auto topics = node.explore(0, 10000, timeout);
         std::printf(",\n  \"topics\":[\n");
         for (size_t i = 0; i < topics.size(); ++i) {
             const auto& t = topics[i];

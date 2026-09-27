@@ -377,8 +377,13 @@ public:
     Node& operator=(const Node&) = delete;
 
     // --- discovery without joining ----------------------------------------
-    std::vector<TopicSummary> explore(size_t limit = 100,
-                                      std::chrono::milliseconds timeout = std::chrono::seconds(3));
+    // Listed topics, up to `limit`, starting from `cursor` (0 = the start of
+    // the listing). Follows the server's paging across as many requests as
+    // `limit` needs, within one overall `timeout`.
+    std::vector<TopicSummary> explore(
+        uint32_t cursor = 0,
+        size_t limit = 100,
+        std::chrono::milliseconds timeout = std::chrono::seconds(3));
     std::optional<ServerStats> stats(std::chrono::milliseconds timeout = std::chrono::seconds(3));
 
     // --- topics ------------------------------------------------------------

@@ -218,6 +218,7 @@ struct Pending {
     TopicMode                 mode  = TopicMode::Open;
     uint8_t                   parts_seen = 0, parts_total = 1;
     std::vector<TopicSummary> summaries;
+    uint32_t                  next_cursor = 0;  // TopicsOk: where the next page starts; 0 = end
     std::optional<PeerInfo>   one;
     std::optional<ServerStats> stats;
     std::optional<DevId>      dev_id;
@@ -886,6 +887,7 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
             auto ok = wire::TopicsOk::decode(r);
             if (!ok) return;
             p.parts_total = ok->parts;
+            p.next_cursor = ok->next_cursor;
             ++p.parts_seen;
             for (auto& t : ok->topics) {
                 p.summaries.push_back(TopicSummary{t.id, t.mode, t.peers, t.fresh_peers});
@@ -2182,42 +2184,61 @@ const TopicCreds* Node::creds(const TopicId& id) const {
     return it == impl_->topics.end() ? nullptr : &it->second->impl_->creds;
 }
 
-std::vector<TopicSummary> Node::explore(size_t limit, std::chrono::milliseconds timeout) {
+std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit, std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(impl_->mu);
-    uint32_t                     txn = impl_->alloc_txn();
+    const auto                   deadline = std::chrono::steady_clock::now() + timeout;
 
-    auto build = [txn, limit](const std::vector<uint8_t>& ck) {
-        std::vector<uint8_t> buf(wire::kMaxDatagram);
-        wire::Writer         w{buf};
-        wire::Header{wire::MsgType::Topics, wire::kVersion, 0, txn}.encode(w);
-        wire::Topics m;
-        m.limit  = static_cast<uint8_t>(std::min<size_t>(limit, 255));
-        m.cookie = ck;
-        m.encode(w);
-        if (!w.ok()) return std::vector<uint8_t>{};
-        // Padded: see wire::kMinUnvalidatedRequest.
-        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
-        return buf;
-    };
-
-    Pending p;
-    p.expect           = wire::MsgType::TopicsOk;
-    p.rebuild          = build;
-    impl_->pending[txn] = std::move(p);
-    impl_->send_raw(impl_->server, build(impl_->cookie));
-
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto it = impl_->pending.find(txn);
-        if (it != impl_->pending.end() && it->second.done) break;
-        impl_->cv.wait_for(lk, 50ms);
-    }
-
+    // One TOPICS request carries at most 255, and the server pages its answer
+    // besides. Follow next_cursor until `limit` is met or the listing ends --
+    // taking only the first request's worth left every caller, the dashboard
+    // included, unable to see past it.
     std::vector<TopicSummary> out;
-    auto                      it = impl_->pending.find(txn);
-    if (it != impl_->pending.end()) {
-        out = std::move(it->second.summaries);
+    uint32_t                  at = cursor;
+    while (out.size() < limit) {
+        const uint32_t txn  = impl_->alloc_txn();
+        const size_t   want = std::min<size_t>(limit - out.size(), 255);
+
+        auto build = [at, txn, want](const std::vector<uint8_t>& ck) {
+            std::vector<uint8_t> buf(wire::kMaxDatagram);
+            wire::Writer         w{buf};
+            wire::Header{wire::MsgType::Topics, wire::kVersion, 0, txn}.encode(w);
+            wire::Topics m;
+            m.cursor = at;
+            m.limit  = static_cast<uint8_t>(want);
+            m.cookie = ck;
+            m.encode(w);
+            if (!w.ok()) return std::vector<uint8_t>{};
+            // Padded: see wire::kMinUnvalidatedRequest.
+            buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
+            return buf;
+        };
+
+        Pending p;
+        p.expect            = wire::MsgType::TopicsOk;
+        p.rebuild           = build;
+        impl_->pending[txn] = std::move(p);
+        impl_->send_raw(impl_->server, build(impl_->cookie));
+
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto it = impl_->pending.find(txn);
+            if (it != impl_->pending.end() && it->second.done) break;
+            impl_->cv.wait_for(lk, 50ms);
+        }
+
+        auto it = impl_->pending.find(txn);
+        if (it == impl_->pending.end()) break;
+        const bool     done = it->second.done;
+        const uint32_t next = it->second.next_cursor;
+        const size_t   got  = it->second.summaries.size();
+        for (auto& s : it->second.summaries) {
+            if (out.size() >= limit) break;
+            out.push_back(s);
+        }
         impl_->pending.erase(it);
+
+        // Out of time, at the end of the listing, or no progress: stop.
+        if (!done || next == 0 || got == 0) break;
+        at = next;
     }
     return out;
 }

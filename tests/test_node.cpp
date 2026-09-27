@@ -6,6 +6,7 @@
 // loopback against a rendezvous server hosted in-process (LocalServer below),
 // built from the same Store and UdpService the real server binary uses.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -33,7 +34,7 @@ namespace {
 // test needs to control: a restart that forgets everything, and latency.
 class LocalServer {
 public:
-    LocalServer() {
+    explicit LocalServer(server::StoreConfig scfg = {}) : scfg_(scfg) {
         if (!sock_.open(0, "127.0.0.1")) throw std::runtime_error("LocalServer: bind failed");
         reset_state();
         thread_ = std::thread([this] { run(); });
@@ -82,7 +83,7 @@ private:
 
     void reset_state() {
         svc_.reset();
-        store_ = std::make_unique<server::Store>();
+        store_ = std::make_unique<server::Store>(scfg_);
         svc_   = std::make_unique<server::UdpService>(*store_);
         held_.clear();
     }
@@ -117,6 +118,7 @@ private:
         }
     }
 
+    server::StoreConfig                 scfg_;
     io::UdpSocket                       sock_;
     std::mutex                          mu_;
     std::unique_ptr<server::Store>      store_;
@@ -870,6 +872,36 @@ TEST(a_probe_flood_does_not_grow_the_answered_table_without_bound) {
     std::this_thread::sleep_for(300ms);
 
     CHECK(na.answered_probes() <= 1024u);
+}
+
+TEST(explore_follows_the_cursor_past_one_request) {
+    // #32. explore() sent one TOPICS request and returned whatever came back,
+    // ignoring next_cursor -- so no caller, the dashboard included, could see
+    // past the first page, and a limit above one request's 255 was silently
+    // cut to it.
+    server::StoreConfig scfg;
+    scfg.max_per_ip_total = 1000;  // every registrant here is 127.0.0.1
+    LocalServer srv{scfg};
+
+    RawClient registrar{srv};
+    for (int i = 0; i < 300; ++i) {
+        REQUIRE(registrar.register_in(TopicCreds::generate_open().id));
+    }
+
+    Node observer{config_for(srv)};
+    observer.run_in_background();
+
+    auto all = observer.explore(0, 1000, 10s);
+    CHECK_EQ(all.size(), 300u);
+
+    // Distinct topics, not one page seen twice.
+    std::vector<TopicId> ids;
+    for (const auto& t : all) ids.push_back(t.id);
+    std::sort(ids.begin(), ids.end());
+    CHECK(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+
+    // And a limit is still a limit.
+    CHECK_EQ(observer.explore(0, 40, 10s).size(), 40u);
 }
 
 TEST(a_relayed_peer_can_be_reconnected_after_its_session_ends) {

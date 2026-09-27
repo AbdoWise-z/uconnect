@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "sanitize.hpp"
 #include "terminal.hpp"
 #include "uconnect/uconnect.hpp"
 
@@ -75,10 +76,7 @@ bool decode(std::span<const uint8_t> in, MsgType& t, std::string& body) {
     if (body.size() > 4000) body.resize(4000);
     // Strip control characters so a peer cannot rewrite our terminal with
     // escape sequences.
-    std::erase_if(body, [](char c) {
-        auto u = static_cast<unsigned char>(c);
-        return u < 0x20 && c != '\t';
-    });
+    body = chat::sanitize_for_terminal(body);
     return true;
 }
 

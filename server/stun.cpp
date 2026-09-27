@@ -7,6 +7,7 @@
 #include <span>
 #include <vector>
 
+#include "primitives.hpp"
 #include "socket.hpp"
 #include "uconnect/types.hpp"
 
@@ -70,12 +71,7 @@ std::array<uint8_t, kTransactionIdSize> generate_transaction_id()
 {
     std::array<uint8_t, kTransactionIdSize> id{};
 
-    std::random_device rd;
-
-    // random_device is sufficient here as a source of transaction-ID
-    // unpredictability. The transaction ID isn't used as a cryptographic key.
-    for (size_t i = 0; i < id.size(); ++i)
-        id[i] = static_cast<uint8_t>(rd());
+    uconnect::crypto::random_bytes(id);
 
     return id;
 }
@@ -509,34 +505,30 @@ NatReport probe_nat(uconnect::io::UdpSocket& socket,
     }
 
     report.port_preserved = report.observed.front().port == report.local_port;
+    report.mapping = classify_mapping(report.observed, report.local_port, io::local_addresses());
+    return report;
+}
 
+Mapping classify_mapping(const std::vector<uconnect::Endpoint>& observed, uint16_t local_port,
+                         const std::vector<uconnect::IpAddr>& local_ips)
+{
     // A single reachable server cannot distinguish the two NAT behaviours: we
     // need at least two destinations to see whether the mapping changes.
-    if (report.observed.size() < 2) {
-        report.mapping = Mapping::Unknown;
-        return report;
+    if (observed.size() < 2) return Mapping::Unknown;
+
+    for (size_t i = 1; i < observed.size(); ++i) {
+        // A fresh mapping per destination: the address any third party was
+        // told is not the one a peer must hit, so punching cannot work.
+        if (!(observed[i] == observed[0])) return Mapping::EndpointDependent;
     }
 
-    bool all_same = true;
-    for (size_t i = 1; i < report.observed.size(); ++i) {
-        if (!(report.observed[i] == report.observed[0])) {
-            all_same = false;
-            break;
-        }
+    // The same mapping everywhere. If it is our own address and port, nothing
+    // translated us at all; otherwise a NAT did, consistently -- and punching
+    // works either way.
+    for (const auto& ip : local_ips) {
+        if (observed[0].ip == ip && observed[0].port == local_port) return Mapping::Open;
     }
-
-    if (!all_same) {
-        report.mapping = Mapping::EndpointDependent;
-    } else if (report.observed[0].ip.is_private() ||
-               report.observed[0].port == report.local_port) {
-        // Same mapping everywhere. Whether there is a NAT at all is a separate
-        // question from whether it is cone-shaped; either way punching works.
-        report.mapping = Mapping::EndpointIndependent;
-    } else {
-        report.mapping = Mapping::EndpointIndependent;
-    }
-
-    return report;
+    return Mapping::EndpointIndependent;
 }
 
 } // namespace stun

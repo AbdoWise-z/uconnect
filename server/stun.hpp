@@ -36,6 +36,13 @@ namespace stun {
 
     const char* to_string(Mapping);
 
+    // The classification alone, from what the STUN servers reported: pure, so
+    // it can be tested without a network. `observed` holds one mapped address
+    // per distinct server reached; `local_ips` are this host's own addresses.
+    Mapping classify_mapping(const std::vector<uconnect::Endpoint>& observed,
+                             uint16_t                                local_port,
+                             const std::vector<uconnect::IpAddr>&    local_ips);
+
     struct NatReport {
         Mapping                             mapping = Mapping::Unknown;
         std::vector<uconnect::Endpoint>     observed;     // one per STUN server reached

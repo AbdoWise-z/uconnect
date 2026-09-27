@@ -1,6 +1,7 @@
 #include "buffers.hpp"
 
 #include <algorithm>
+#include <iterator>
 
 namespace uconnect::stream {
 
@@ -26,10 +27,13 @@ bool RecvBuffer::insert(uint64_t offset, std::span<const uint8_t> data, bool fin
     // Entirely in the past: a retransmission of data we already hold.
     if (end <= contiguous_end) return true;
 
-    if (offset <= contiguous_end) {
-        // Overlaps or extends the contiguous region. Append only the new tail.
-        const uint64_t skip = contiguous_end - offset;
-        ready_.insert(ready_.end(), data.begin() + static_cast<ptrdiff_t>(skip), data.end());
+    // Whatever part of the chunk is already contiguous is old news; only the
+    // tail beyond the edge is new.
+    const uint64_t start = std::max(offset, contiguous_end);
+    const auto     fresh = data.subspan(static_cast<size_t>(start - offset));
+
+    if (start == contiguous_end) {
+        ready_.insert(ready_.end(), fresh.begin(), fresh.end());
         drain_pending();
         return true;
     }
@@ -37,38 +41,73 @@ bool RecvBuffer::insert(uint64_t offset, std::span<const uint8_t> data, bool fin
     // A genuine gap: hold it until the missing piece arrives. This is the
     // structure that turns "datagrams arrive in any order" into "the
     // application sees an ordered stream".
-    auto& slot = pending_[offset];
-    if (slot.size() < data.size()) slot.assign(data.begin(), data.end());
+    return hold(start, fresh);
+}
+
+bool RecvBuffer::hold(uint64_t start, std::span<const uint8_t> bytes) {
+    // pending_ is a set of disjoint runs, merged wherever they touch, so every
+    // byte is held at most once and the bytes held can never exceed the
+    // window. Keyed by start offset with overlaps kept, a peer sending chunks
+    // one byte apart made each of them a full copy: ~280 MB for one 256 KB
+    // window.
+    const uint64_t end = start + bytes.size();
+
+    // The first run this chunk touches: the one beginning at or before
+    // `start`, if it reaches that far, or else the first one after it.
+    auto it = pending_.upper_bound(start);
+    if (it != pending_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second.size() >= start) it = prev;
+    }
+
+    if (it == pending_.end() || it->first > end) {
+        // Touches nothing, so this is a new hole's worth of bookkeeping --
+        // the only way the run count grows, and so the only place to cap it.
+        if (pending_.size() >= kMaxFragments) return false;
+        pending_.emplace(start, std::vector<uint8_t>(bytes.begin(), bytes.end()));
+        return true;
+    }
+
+    // Merge into a single run. If the first run it touches begins after
+    // `start`, the chunk itself becomes the head of the run.
+    if (it->first > start) {
+        it = pending_.emplace_hint(it, start, std::vector<uint8_t>(bytes.begin(), bytes.end()));
+    }
+    auto&          run       = it->second;
+    const uint64_t run_start = it->first;
+
+    // Append whatever of [from, from + src.size()) lies beyond the run's
+    // current end. Bytes the run already holds are kept as they are.
+    auto extend = [&](uint64_t from, std::span<const uint8_t> src) {
+        const uint64_t run_end = run_start + run.size();
+        if (from + src.size() <= run_end) return;
+        const auto skip = static_cast<ptrdiff_t>(run_end - from);
+        run.insert(run.end(), src.begin() + skip, src.end());
+    };
+
+    extend(start, bytes);
+    for (auto next = std::next(it);
+         next != pending_.end() && next->first <= run_start + run.size();) {
+        extend(next->first, next->second);
+        next = pending_.erase(next);
+    }
     return true;
 }
 
 void RecvBuffer::drain_pending() {
-    // Repeatedly absorb any held chunk that now begins at or before the edge
-    // of the contiguous region.
-    bool progressed = true;
-    while (progressed) {
-        progressed = false;
+    // Runs are disjoint and ordered, so only the first can reach the edge of
+    // the contiguous region. Once it does not, none of the others can either.
+    while (!pending_.empty()) {
+        auto           it   = pending_.begin();
         const uint64_t edge = consumed_ + ready_.size();
+        if (it->first > edge) break;
 
-        for (auto it = pending_.begin(); it != pending_.end();) {
-            const uint64_t off = it->first;
-            const uint64_t end = off + it->second.size();
-
-            if (end <= edge) {
-                it = pending_.erase(it);  // fully superseded
-                continue;
-            }
-            if (off <= edge) {
-                const uint64_t skip = edge - off;
-                ready_.insert(ready_.end(),
-                              it->second.begin() + static_cast<ptrdiff_t>(skip),
-                              it->second.end());
-                it         = pending_.erase(it);
-                progressed = true;
-                break;  // edge moved; restart the scan
-            }
-            ++it;
+        const uint64_t end = it->first + it->second.size();
+        if (end > edge) {
+            const auto skip = static_cast<ptrdiff_t>(edge - it->first);
+            ready_.insert(ready_.end(), it->second.begin() + skip, it->second.end());
         }
+        pending_.erase(it);
     }
 }
 

@@ -88,7 +88,13 @@ struct AckFrame {
     // Smallest packet number this frame acknowledges.
     uint64_t smallest() const;
 
-    // Invoke fn(packet_number) for every acknowledged packet, newest first.
+    // True when every range fits below `largest` without underflowing. Our own
+    // encoder never produces anything else, so a frame that fails this is
+    // malformed and the decoder refuses it.
+    bool well_formed() const;
+
+    // Invoke fn(lo, hi) once per acknowledged range, newest first, with both
+    // bounds inclusive.
     //
     // Ranges are encoded descending and relative, per RFC 9000 s19.3.1. The
     // first range is [largest - first_range, largest]; thereafter each `gap`
@@ -96,16 +102,15 @@ struct AckFrame {
     // a gap of zero still means one missing packet. Every step is guarded
     // against underflow -- these values come off the wire from a peer that is
     // authenticated but not trusted to be sane.
+    //
+    // This is the one to use on anything that came off the wire: it costs one
+    // call per range, however many packet numbers the range spans.
     template <typename F>
-    void for_each(F&& fn) const {
+    void for_each_range(F&& fn) const {
         if (first_range > largest) return;
 
-        uint64_t hi = largest;
         uint64_t lo = largest - first_range;
-        for (uint64_t p = hi;; --p) {
-            fn(p);
-            if (p == lo) break;
-        }
+        fn(lo, largest);
 
         uint64_t prev_lo = lo;
         for (const auto& r : ranges) {
@@ -113,12 +118,25 @@ struct AckFrame {
             uint64_t range_hi = prev_lo - r.gap - 2;
             if (r.len > range_hi) return;
             uint64_t range_lo = range_hi - r.len;
-            for (uint64_t p = range_hi;; --p) {
-                fn(p);
-                if (p == range_lo) break;
-            }
+            fn(range_lo, range_hi);
             prev_lo = range_lo;
         }
+    }
+
+    // Invoke fn(packet_number) for every acknowledged packet, newest first.
+    //
+    // Costs one call per packet number, and the width of a range is the peer's
+    // choice: a single range may legitimately span every number back to zero.
+    // Fine for a frame we built ourselves; never for one off the wire, where
+    // it hands the peer a loop of any length it likes. Use for_each_range.
+    template <typename F>
+    void for_each(F&& fn) const {
+        for_each_range([&](uint64_t lo, uint64_t hi) {
+            for (uint64_t p = hi;; --p) {
+                fn(p);
+                if (p == lo) break;
+            }
+        });
     }
 };
 

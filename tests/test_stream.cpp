@@ -1534,3 +1534,228 @@ TEST(a_session_restart_clears_the_old_packet_number_space) {
     }
     CHECK(!b.is_dead());
 }
+
+// ---------------------------------------------------------------------------
+// Hostile peers. An authenticated peer is still not a trusted one -- on an open
+// topic it is anyone at all -- so the work and memory a frame costs must be
+// bounded by what WE sent and advertised, never by numbers the peer chose.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Have `a` put `count` data-bearing packets in flight, numbered from `first_pn`.
+void send_packets(StreamConnection& a, uint64_t first_pn, uint64_t count, Instant now) {
+    StreamId id = *a.open();
+    a.write(id, pattern(static_cast<size_t>(count) * 1100));
+    std::vector<uint8_t> buf(1200);
+    for (uint64_t i = 0; i < count; ++i) {
+        REQUIRE(a.poll_datagram(first_pn + i, buf, now) > 0);
+    }
+}
+
+// Feed `c` a datagram, numbered `pn`, that carries nothing but this ACK.
+void deliver_ack(StreamConnection& c, const AckFrame& ack, uint64_t pn, Instant now) {
+    std::vector<uint8_t> buf(64);
+    wire::Writer         w{buf};
+    REQUIRE(encode_ack(w, ack));
+    c.on_datagram(pn, std::span(buf).first(w.size()), now);
+}
+
+std::vector<uint8_t> encoded(const AckFrame& a) {
+    std::vector<uint8_t> buf(64);
+    wire::Writer         w{buf};
+    encode_ack(w, a);
+    buf.resize(w.size());
+    return buf;
+}
+
+}  // namespace
+
+TEST(ack_decoder_rejects_ranges_that_do_not_fit_below_largest) {
+    // for_each tolerates these by stopping early, so they used to decode as
+    // valid. Our own encoder can never produce one, which makes it malformed,
+    // and the decoder's rule for malformed is to refuse the whole datagram.
+    std::vector<Frame> frames;
+
+    AckFrame below_zero;
+    below_zero.largest     = 5;
+    below_zero.first_range = 100;
+    CHECK(!decode_frames(encoded(below_zero), frames));
+
+    AckFrame gap_past_origin;
+    gap_past_origin.largest = 10;
+    gap_past_origin.ranges.push_back(AckRange{1000, 0});
+    CHECK(!decode_frames(encoded(gap_past_origin), frames));
+
+    AckFrame len_past_origin;
+    len_past_origin.largest = 10;                          // first range is just 10
+    len_past_origin.ranges.push_back(AckRange{0, 9});      // 9 is skipped, so 8 down to -1
+    CHECK(!decode_frames(encoded(len_past_origin), frames));
+
+    // The boundary itself is fine: a range that ends exactly at zero.
+    AckFrame to_zero;
+    to_zero.largest = 10;
+    to_zero.ranges.push_back(AckRange{0, 8});              // 8 down to 0
+    CHECK(decode_frames(encoded(to_zero), frames));
+}
+
+TEST(an_ack_for_packets_never_sent_is_ignored) {
+    // A peer acking numbers we never used is lying, and believing any of it --
+    // even the part naming packets that do exist -- lets it inflate our
+    // congestion window by acknowledging data it never received.
+    StreamConnection a{fast_cfg(), Role::A};
+    send_packets(a, 1, 3, t0());
+    const size_t in_flight = a.bytes_in_flight();
+    REQUIRE(in_flight > 0);
+
+    AckFrame lie;
+    lie.largest     = 100;
+    lie.first_range = 99;  // 1..100: the three real packets and 97 that never existed
+    deliver_ack(a, lie, 1, t0() + 20ms);
+    CHECK_EQ(a.bytes_in_flight(), in_flight);
+
+    // An honest ack for the same three packets still lands.
+    AckFrame honest;
+    honest.largest     = 3;
+    honest.first_range = 2;
+    deliver_ack(a, honest, 2, t0() + 25ms);
+    CHECK_EQ(a.bytes_in_flight(), 0u);
+}
+
+TEST(ack_cost_is_bounded_by_packets_sent_not_by_the_ranges_claimed) {
+    // Packet numbers are the session's AEAD counter, so a long-lived connection
+    // legitimately reaches large ones, and an ACK can legitimately describe one
+    // range reaching all the way back to zero. Walking that range a number at a
+    // time costs whatever the peer wrote, which is a remote hang.
+    constexpr uint64_t kBase = uint64_t{1} << 40;
+
+    StreamConnection a{fast_cfg(), Role::A};
+    send_packets(a, kBase, 3, t0());
+    REQUIRE(a.bytes_in_flight() > 0);
+
+    AckFrame wide;
+    wide.largest     = kBase + 2;
+    wide.first_range = kBase + 2;  // every number from zero up
+    const auto start = std::chrono::steady_clock::now();
+    deliver_ack(a, wide, 1, t0() + 20ms);
+    const auto took = std::chrono::steady_clock::now() - start;
+
+    CHECK_EQ(a.bytes_in_flight(), 0u);  // the three real packets are acked
+    CHECK(took < 100ms);
+}
+
+TEST(recv_buffer_holds_each_byte_once_however_the_peer_overlaps_chunks) {
+    // Chunks one byte apart overlap their neighbours almost completely. Kept
+    // per start offset, every one of them was stored in full: a 64 KB window
+    // pinned ~70 MB, and a 256 KB one ~280 MB, per stream.
+    constexpr uint64_t kWindow = 64 * 1024;
+    constexpr size_t   kChunk  = 1100;
+    RecvBuffer rb{kWindow};
+    auto data = pattern(kWindow);
+
+    // Offset 0 is withheld, so nothing becomes contiguous yet.
+    for (uint64_t off = 1; off + kChunk <= kWindow; ++off) {
+        REQUIRE(rb.insert(off, std::span(data).subspan(off, kChunk), false));
+    }
+    CHECK(rb.pending_bytes() <= kWindow);
+    CHECK_EQ(rb.fragment_count(), 1u);  // every chunk touched the last: one run
+
+    REQUIRE(rb.insert(0, std::span(data).first(1), false));
+    CHECK_EQ(rb.readable(), kWindow);
+    CHECK_EQ(rb.fragment_count(), 0u);
+
+    std::vector<uint8_t> out(kWindow);
+    rb.read(out);
+    CHECK(out == data);
+}
+
+TEST(recv_buffer_merges_fragments_that_touch) {
+    RecvBuffer rb{64 * 1024};
+    auto data = pattern(400);
+
+    REQUIRE(rb.insert(100, std::span(data).subspan(100, 100), false));
+    REQUIRE(rb.insert(300, std::span(data).subspan(300, 100), false));
+    CHECK_EQ(rb.fragment_count(), 2u);
+
+    REQUIRE(rb.insert(200, std::span(data).subspan(200, 100), false));  // bridges both
+    CHECK_EQ(rb.fragment_count(), 1u);
+    CHECK_EQ(rb.pending_bytes(), 300u);
+
+    REQUIRE(rb.insert(0, std::span(data).first(100), false));
+    CHECK_EQ(rb.readable(), 400u);
+    std::vector<uint8_t> out(400);
+    rb.read(out);
+    CHECK(out == data);
+}
+
+TEST(recv_buffer_refuses_a_peer_that_fragments_without_limit) {
+    // One-byte chunks with a one-byte hole between each can never merge, so
+    // every one is a new fragment. Bytes stay within the window; bookkeeping
+    // would not, and it is the count the cap exists to bound.
+    RecvBuffer rb{64 * 1024};
+    auto one = pattern(1);
+
+    bool refused = false;
+    for (uint64_t i = 1; i <= RecvBuffer::kMaxFragments + 16; ++i) {
+        if (!rb.insert(2 * i, one, false)) {
+            refused = true;
+            break;
+        }
+    }
+    CHECK(refused);
+    CHECK(rb.fragment_count() <= RecvBuffer::kMaxFragments);
+}
+
+TEST(recv_buffer_reassembles_randomly_overlapping_fragments) {
+    // The merging above must not cost correctness: whatever the overlap, the
+    // application reads back exactly the bytes that were sent.
+    std::mt19937_64 rng(7);
+    for (int round = 0; round < 20; ++round) {
+        constexpr size_t n = 20000;
+        auto data = pattern(n, static_cast<uint8_t>(round));
+        RecvBuffer rb{64 * 1024};
+
+        // Random overlapping chunks, plus a clean tiling so every byte is
+        // covered at least once, all delivered in one shuffled order.
+        std::vector<std::pair<size_t, size_t>> chunks;
+        std::uniform_int_distribution<size_t> pick_off(0, n - 1), pick_len(1, 1500);
+        for (int i = 0; i < 200; ++i) {
+            size_t o = pick_off(rng);
+            chunks.emplace_back(o, std::min(pick_len(rng), n - o));
+        }
+        for (size_t o = 0; o < n; o += 1000) chunks.emplace_back(o, std::min<size_t>(1000, n - o));
+        std::shuffle(chunks.begin(), chunks.end(), rng);
+
+        for (auto [o, l] : chunks) {
+            REQUIRE(rb.insert(o, std::span(data).subspan(o, l), o + l == n));
+        }
+        REQUIRE(rb.readable() == n);
+        CHECK_EQ(rb.fragment_count(), 0u);
+
+        std::vector<uint8_t> out(n);
+        rb.read(out);
+        CHECK(out == data);
+        CHECK(rb.finished());
+    }
+}
+
+TEST(a_peer_that_fragments_a_stream_without_limit_gets_it_reset) {
+    // The cap is only worth something if the connection acts on it. Dropping
+    // the excess is not an option: the packet carrying it is already acked, so
+    // the sender would never retransmit and the stream would silently stall.
+    StreamConnection b{fast_cfg(), Role::B};
+    const StreamId id = make_stream_id(Role::A, true, 0);
+    auto one = pattern(1);
+
+    uint64_t offset = 2;
+    for (uint64_t pn = 1; pn <= 40; ++pn) {
+        std::vector<uint8_t> frame(1100);
+        wire::Writer w{frame};
+        while (w.remaining() > 16) {
+            if (encode_stream(w, id, offset, false, one) == 0) break;
+            offset += 2;
+        }
+        b.on_datagram(pn, std::span(frame).first(w.size()), t0());
+    }
+
+    CHECK(!collect(b, StreamEventKind::Reset).empty());
+}

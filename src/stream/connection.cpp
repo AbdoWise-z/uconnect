@@ -322,13 +322,25 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
             break;
 
         case FrameType::Ack: {
-            std::vector<uint64_t> acked;
-            f.ack.for_each([&](uint64_t pn) { acked.push_back(pn); });
+            // An ack naming a number we never used is a lie, and none of it is
+            // worth believing: the rest of the frame could just as well be
+            // acknowledging data the peer never received, to inflate our
+            // congestion window.
+            const auto sent_max = sent_.largest_sent();
+            if (!sent_max || f.ack.largest > *sent_max) break;
+
+            // Ranges, never individual numbers: one range may span every
+            // number back to zero, and walking it would cost what the peer
+            // chose rather than what we sent.
+            std::vector<PacketRange> acked;
+            f.ack.for_each_range([&](uint64_t lo, uint64_t hi) {
+                acked.push_back(PacketRange{lo, hi});
+            });
             if (acked.empty()) break;
 
-            auto outcome = sent_.on_ack(f.ack.largest,
-                                        Duration{static_cast<int64_t>(f.ack.delay_us / 1000)},
-                                        acked, rtt_, now);
+            auto outcome = sent_.on_ack_ranges(f.ack.largest,
+                                               Duration{static_cast<int64_t>(f.ack.delay_us / 1000)},
+                                               acked, rtt_, now);
 
             if (outcome.has_rtt_sample) {
                 rtt_.sample(outcome.rtt_sample,
@@ -360,8 +372,10 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
 
             const size_t before = s.recv.readable();
             if (!s.recv.insert(f.stream.offset, f.stream.data, f.stream.fin)) {
-                // Flow-control violation. Tear the stream down rather than
-                // grow a buffer the peer controls the size of.
+                // Flow-control violation, or fragmenting past the cap. Tear
+                // the stream down rather than grow a buffer the peer controls
+                // the size of. Dropping the chunk quietly is not an option:
+                // its packet is already acked, so it would never be resent.
                 s.send_reset      = true;
                 s.send_reset_code = 1;
                 s.reset_notified  = true;

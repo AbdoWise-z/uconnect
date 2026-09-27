@@ -91,26 +91,43 @@ void Congestion::on_persistent_congestion() {
 // ---------------------------------------------------------------------------
 // SentPackets
 // ---------------------------------------------------------------------------
-void SentPackets::on_sent(SentPacket p) { sent_[p.number] = std::move(p); }
+void SentPackets::on_sent(SentPacket p) {
+    if (!largest_sent_ || p.number > *largest_sent_) largest_sent_ = p.number;
+    sent_[p.number] = std::move(p);
+}
 
 AckOutcome SentPackets::on_ack(uint64_t largest, Duration ack_delay,
                                const std::vector<uint64_t>& acked_numbers,
                                const RttEstimator& rtt, Instant now) {
+    std::vector<PacketRange> ranges;
+    ranges.reserve(acked_numbers.size());
+    for (uint64_t n : acked_numbers) ranges.push_back(PacketRange{n, n});
+    return on_ack_ranges(largest, ack_delay, ranges, rtt, now);
+}
+
+AckOutcome SentPackets::on_ack_ranges(uint64_t largest, Duration ack_delay,
+                                      const std::vector<PacketRange>& acked,
+                                      const RttEstimator& rtt, Instant now) {
     AckOutcome out;
 
-    for (uint64_t n : acked_numbers) {
-        auto it = sent_.find(n);
-        if (it == sent_.end()) continue;  // already acked, or never sent
-
-        // An RTT sample is only valid from the largest newly-acked packet, and
-        // only if it elicited the ack. Sampling from an older packet in the
-        // same frame would measure how long it sat waiting, not the path.
-        if (n == largest && it->second.ack_eliciting) {
-            out.has_rtt_sample = true;
-            out.rtt_sample     = std::chrono::duration_cast<Duration>(now - it->second.sent_at);
+    for (const auto& r : acked) {
+        if (r.lo > r.hi) continue;
+        // Walk only the packets we actually hold inside the range. Anything
+        // else in it is already acked or was never sent, and visiting those
+        // numbers one by one is the cost the peer gets to choose.
+        for (auto it = sent_.lower_bound(r.lo); it != sent_.end() && it->first <= r.hi;) {
+            // An RTT sample is only valid from the largest newly-acked packet,
+            // and only if it elicited the ack. Sampling from an older packet in
+            // the same frame would measure how long it sat waiting, not the
+            // path.
+            if (it->first == largest && it->second.ack_eliciting) {
+                out.has_rtt_sample = true;
+                out.rtt_sample =
+                    std::chrono::duration_cast<Duration>(now - it->second.sent_at);
+            }
+            out.newly_acked.push_back(it->second);
+            it = sent_.erase(it);
         }
-        out.newly_acked.push_back(it->second);
-        sent_.erase(it);
     }
 
     if (!out.newly_acked.empty()) {
@@ -183,7 +200,10 @@ std::vector<SentPacket> SentPackets::take_all() {
     sent_.clear();
     // largest_acked_ and any_acked_ refer to the old number space too, so loss
     // detection must not carry them over: "everything below the largest ack"
-    // would otherwise condemn the first packets of the new session.
+    // would otherwise condemn the first packets of the new session. The same
+    // goes for largest_sent_, or an ack for numbers the new session has not
+    // reached yet would pass as genuine.
+    largest_sent_.reset();
     largest_acked_ = 0;
     any_acked_     = false;
     return out;

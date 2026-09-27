@@ -26,6 +26,18 @@ uint64_t AckFrame::smallest() const {
     return lo;
 }
 
+bool AckFrame::well_formed() const {
+    if (first_range > largest) return false;
+    uint64_t prev_lo = largest - first_range;
+    for (const auto& r : ranges) {
+        if (prev_lo < r.gap + 2) return false;
+        uint64_t hi = prev_lo - r.gap - 2;
+        if (r.len > hi) return false;
+        prev_lo = hi - r.len;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Encoding
 // ---------------------------------------------------------------------------
@@ -225,6 +237,10 @@ bool decode_frames(std::span<const uint8_t> payload, std::vector<Frame>& out) {
                     if (!r.ok()) return false;
                     f.ack.ranges.push_back(range);
                 }
+                // A range reaching below zero is something our encoder never
+                // writes. Tolerating it downstream by stopping early would
+                // accept a frame that means nothing.
+                if (!f.ack.well_formed()) return false;
                 out.push_back(std::move(f));
                 break;
             }

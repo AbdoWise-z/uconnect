@@ -38,8 +38,9 @@ public:
     explicit RecvBuffer(uint64_t window) : window_(window) {}
 
     // Accepts a chunk at an absolute stream offset. Returns false if it would
-    // exceed the advertised flow-control limit -- a peer doing that is either
-    // broken or hostile, and the caller should tear the stream down.
+    // exceed the advertised flow-control limit, or open more than
+    // kMaxFragments holes -- a peer doing either is broken or hostile, and the
+    // caller should tear the stream down.
     bool insert(uint64_t offset, std::span<const uint8_t> data, bool fin);
 
     // Copies out the contiguous prefix, which is the only part the application
@@ -69,14 +70,31 @@ public:
     void force_window_update() { announced_max_ = 0; }
     uint64_t announced_max() const { return announced_max_; }
 
+    // Most out-of-order fragments held at once. Each is a hole's worth of
+    // bookkeeping, and an honest sender cannot open more holes than it has
+    // packets in flight -- about 240 for a 256 KB window. Past this the peer is
+    // fragmenting on purpose, and insert() refuses it.
+    static constexpr size_t kMaxFragments = 1024;
+
+    // Introspection, so tests can hold the memory bound to account.
+    size_t fragment_count() const { return pending_.size(); }
+    size_t pending_bytes() const {
+        size_t n = 0;
+        for (const auto& [off, bytes] : pending_) n += bytes.size();
+        return n;
+    }
+
 private:
     uint64_t                           window_;
     uint64_t                           consumed_ = 0;   // bytes handed to the application
     uint64_t                           announced_max_ = 0;
     std::deque<uint8_t>                ready_;          // contiguous, unread
-    std::map<uint64_t, std::vector<uint8_t>> pending_;  // out-of-order, by offset
+    // Out-of-order runs, by start offset: disjoint, merged wherever they touch,
+    // and all beyond the contiguous edge -- so never more bytes than the window.
+    std::map<uint64_t, std::vector<uint8_t>> pending_;
     std::optional<uint64_t>            fin_offset_;
 
+    bool hold(uint64_t start, std::span<const uint8_t> bytes);
     void drain_pending();
 };
 

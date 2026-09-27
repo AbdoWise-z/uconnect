@@ -108,6 +108,12 @@ struct SentPacket {
     std::vector<StreamChunk> chunks;
 };
 
+// An inclusive run of packet numbers, the way an ACK frame describes them.
+struct PacketRange {
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+};
+
 // Outcome of processing one incoming ACK frame.
 struct AckOutcome {
     std::vector<SentPacket> newly_acked;
@@ -129,6 +135,19 @@ public:
     AckOutcome on_ack(uint64_t largest, Duration ack_delay,
                       const std::vector<uint64_t>& acked_numbers,
                       const RttEstimator& rtt, Instant now);
+
+    // The same, with the acknowledged numbers given as ranges. The cost is the
+    // number of ranges plus the packets actually acked -- NOT the width of the
+    // ranges, which is the peer's choice and may span every number back to
+    // zero.
+    AckOutcome on_ack_ranges(uint64_t largest, Duration ack_delay,
+                             const std::vector<PacketRange>& acked,
+                             const RttEstimator& rtt, Instant now);
+
+    // Highest packet number handed to on_sent() in this number space, or
+    // nullopt before the first. An ack naming anything above it is naming a
+    // packet that does not exist.
+    std::optional<uint64_t> largest_sent() const { return largest_sent_; }
 
     // Packets that have now aged out, independent of any ACK arriving.
     std::vector<SentPacket> detect_lost(const RttEstimator& rtt, Instant now);
@@ -166,6 +185,7 @@ private:
     // Ordered by packet number so loss detection can walk "everything below
     // the largest ack" without scanning.
     std::map<uint64_t, SentPacket> sent_;
+    std::optional<uint64_t>        largest_sent_;
     uint64_t                       largest_acked_ = 0;
     bool                           any_acked_     = false;
     Instant                        largest_acked_at_{};

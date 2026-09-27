@@ -92,7 +92,16 @@ void Congestion::on_persistent_congestion() {
 // SentPackets
 // ---------------------------------------------------------------------------
 void SentPackets::on_sent(SentPacket p) {
+    // The number is used either way, so a peer acking it is telling the truth.
     if (!largest_sent_ || p.number > *largest_sent_) largest_sent_ = p.number;
+
+    // A packet that elicits no ack will never get one, so it is not held. Held,
+    // it sat here for good: the receiving end of a one-way stream, which sends
+    // nothing else, looked like a sender with work outstanding and declared
+    // its peer dead one idle timeout in. And when a later ack did happen to
+    // cover it, it was released as though it had been counted in flight --
+    // which it never was.
+    if (!p.ack_eliciting) return;
     sent_[p.number] = std::move(p);
 }
 

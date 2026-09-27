@@ -66,6 +66,11 @@ constexpr auto kDiscoveryInterval = 5s;
 
 constexpr auto kProbeMemory = 30s;  // how long an answered probe_txn stays usable
 
+// An established session that has heard its peer this recently is live, and no
+// incoming handshake may replace it. The session keepalive is 20s, so a peer
+// that is really there always refreshes it within this window.
+constexpr auto kLiveSession = 30s;
+
 // One byte at the front of every session payload says which of the two
 // transports it belongs to.
 //
@@ -232,13 +237,44 @@ struct Pending {
     // Set on a LOOKUP issued by auto-connect, so its result can drive
     // connections rather than being handed back to a waiting caller.
     std::optional<TopicId> auto_discover;
+
+    // Set on a KEEPALIVE, so a refusal can be traced back to the topic whose
+    // registration the server no longer honours.
+    std::optional<TopicId> keepalive_for;
+
+    // Set on a REGISTER the loop issued itself to replace a lost registration.
+    // publish() applies its own reply; nobody is waiting on this one, so the
+    // reply handler applies it.
+    std::optional<TopicId> reregister_for;
+
+    // When the loop first saw this request, for retiring the ones it owns.
+    Instant first_seen{};
+
+    // Issued by the loop for itself, not by a caller blocked on the reply. A
+    // caller erases its own request when it stops waiting; nobody does that
+    // for these, so the loop must, or the table grows for as long as the node
+    // runs -- a keepalive every interval, a LOOKUP every discovery round.
+    bool owned_by_loop() const {
+        return keepalive_for || auto_discover || relay_for || reregister_for;
+    }
 };
 
 struct AnsweredProbe {
     Endpoint               from{};
     Instant                when{};
     std::optional<TopicId> topic;  // known only for keyed topics
+
+    // Answered for an open topic, where a probe proves nothing and anyone may
+    // send one. Only these are capped: a keyed probe carries a valid tag, and
+    // a relay's entry comes from the server.
+    bool unvouched = false;
 };
+
+// Most unvouched probe transactions remembered at once. Without a cap memory
+// grew with whatever rate anyone cared to probe at. Past it, probes are still
+// answered -- that is what opens NATs -- but not remembered, so a sustained
+// flood can crowd out an open-topic handshake, which then tries again.
+constexpr size_t kMaxUnvouchedProbes = 1024;
 
 }  // namespace
 
@@ -254,6 +290,7 @@ struct Topic::Impl {
     uint64_t             seq       = 0;
     bool                 published = false;
     bool                 unlisted  = false;
+    bool                 reregistering = false;  // a replacement REGISTER is in flight
     std::vector<uint8_t> meta;
     Instant              next_keepalive{};
     Instant              next_discovery{};
@@ -293,6 +330,13 @@ struct Node::Impl {
     uint32_t                                 next_txn = 1;
     std::unordered_map<uint32_t, Pending>    pending;
     std::unordered_map<wire::ProbeTxn, AnsweredProbe, ArrayHash> answered;
+    size_t answered_unvouched = 0;  // how many of `answered` are unvouched
+
+    // Every insert into and erase from `answered` goes through these, so the
+    // unvouched count -- and with it the cap -- stays exact.
+    using AnsweredIt = decltype(answered)::iterator;
+    void       remember_probe(const wire::ProbeTxn&, const AnsweredProbe&);
+    AnsweredIt forget_probe(AnsweredIt);
     std::unordered_map<wire::ConnId, std::pair<TopicId, DevId>>  conns;
 
     // Callbacks queued while `mu` is held, invoked after it is released.
@@ -320,6 +364,7 @@ struct Node::Impl {
     void     gather_host_candidates();
     void     loop();
     void     pump(Instant now);
+    void     abandon(const Pending&);
     void     dispatch(const Endpoint& from, std::span<const uint8_t> dgram, Instant now);
     void     on_signaling(const Endpoint& from, std::span<const uint8_t>, Instant now);
     void     on_probe_dgram(const Endpoint& from, std::span<const uint8_t>, Instant now);
@@ -344,7 +389,10 @@ struct Node::Impl {
     void     start_punch(Topic::Impl&, const TopicId&, Peer&, Instant now);
     void     send_connect_relay(Topic::Impl&, const TopicId&, const DevId& to, Instant now);
     void     send_keepalive(Topic::Impl&, Instant now);
-    void     send_register(Topic::Impl&, const TopicId&, Instant now);
+    // Returns the txn. With `replacing` the loop owns the reply: it is applied
+    // to the topic when it arrives, instead of by a waiting publish().
+    uint32_t send_register(Topic::Impl&, const TopicId&, Instant now, bool replacing = false);
+    void     reregister(const TopicId&, Instant now);
 
 };
 
@@ -445,8 +493,25 @@ void Node::Impl::pump(Instant now) {
     // than "the question never arrived".
     constexpr auto kRetransmit  = 400ms;
     constexpr int  kMaxAttempts = 4;
-    for (auto& [txn, p] : pending) {
-        (void)txn;
+
+    // Long past the last retransmit, so a request still here is unanswered for
+    // good rather than slow.
+    constexpr auto kLoopRequestLifetime = 30s;
+
+    for (auto it = pending.begin(); it != pending.end();) {
+        auto& p = it->second;
+        if (p.first_seen == Instant{}) p.first_seen = now;
+
+        // Retire what the loop issued for itself: once answered -- the reply
+        // handler has already applied it -- or once it has had its chance.
+        if (p.owned_by_loop() &&
+            (p.done || now - p.first_seen > kLoopRequestLifetime)) {
+            if (!p.done) abandon(p);
+            it = pending.erase(it);
+            continue;
+        }
+        ++it;
+
         if (p.done || !p.rebuild) continue;
         if (p.attempts >= kMaxAttempts) continue;
 
@@ -474,8 +539,46 @@ void Node::Impl::pump(Instant now) {
 
     // Forget stale answered probes so the map does not grow without bound.
     for (auto it = answered.begin(); it != answered.end();) {
-        if (now - it->second.when > kProbeMemory) it = answered.erase(it);
+        if (now - it->second.when > kProbeMemory) it = forget_probe(it);
         else ++it;
+    }
+}
+
+void Node::Impl::remember_probe(const wire::ProbeTxn& txn, const AnsweredProbe& a) {
+    auto it = answered.find(txn);
+    if (it != answered.end()) {
+        if (it->second.unvouched) --answered_unvouched;
+        it->second = a;
+    } else {
+        if (a.unvouched && answered_unvouched >= kMaxUnvouchedProbes) return;
+        answered.emplace(txn, a);
+    }
+    if (a.unvouched) ++answered_unvouched;
+}
+
+Node::Impl::AnsweredIt Node::Impl::forget_probe(AnsweredIt it) {
+    if (it->second.unvouched) --answered_unvouched;
+    return answered.erase(it);
+}
+
+void Node::Impl::abandon(const Pending& p) {
+    // A request that never got an answer is released the way a refusal would
+    // be, so whatever was waiting on it can move on.
+    if (p.reregister_for) {
+        if (auto tit = topics.find(*p.reregister_for); tit != topics.end()) {
+            tit->second->impl_->reregistering = false;  // the next keepalive may retry
+        }
+    }
+    if (p.relay_for) {
+        if (auto tit = topics.find(p.relay_for->first); tit != topics.end()) {
+            auto& ti     = *tit->second->impl_;
+            auto  target = ti.peers.find(p.relay_for->second);
+            if (target != ti.peers.end() && !target->second.relayed) {
+                // Reported, not left in Probing forever -- same as a refusal.
+                target->second.relay_asked = false;
+                set_peer_state(ti, target->second, PeerState::Failed);
+            }
+        }
     }
 }
 
@@ -497,6 +600,12 @@ void Node::Impl::dispatch(const Endpoint& from, std::span<const uint8_t> dgram, 
 
 void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgram,
                               Instant now) {
+    // Signaling comes from the server or not at all. Without this, anyone who
+    // knew our IP:port -- which LOOKUP hands to anyone holding the topic id --
+    // could forge its messages: invent peers, point us at relay bindings that
+    // go nowhere, or answer our pending requests for it.
+    if (!(from == server)) return;
+
     wire::Reader r{dgram};
     auto         h = wire::Header::decode(r);
     if (!h) return;
@@ -507,6 +616,16 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
     if (h->type == wire::MsgType::RelayData) {
         auto rd = wire::RelayData::decode(r);
         if (!rd || rd->payload.empty()) return;
+
+        // The payload is whatever the PEER at the other end of the binding
+        // put there, though it arrives from the server's address. Only
+        // peer-to-peer traffic may ride inside: dispatching anything else
+        // would let that peer speak as the server.
+        auto inner = wire::peek_type(rd->payload);
+        if (!inner) return;
+        const auto cls = wire::classify(static_cast<uint8_t>(*inner));
+        if (cls != wire::MsgClass::Handshake && cls != wire::MsgClass::Transport) return;
+
         dispatch(server, rd->payload, now);
         return;
     }
@@ -546,9 +665,9 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
                     txn[i]     = static_cast<uint8_t>(offered_relay >> (8 * (7 - i)));
                     txn[i + 8] = txn[i];
                 }
-                answered[txn] = AnsweredProbe{server, now,
-                                              ti.keyed ? std::optional<TopicId>(topic)
-                                                       : std::nullopt};
+                remember_probe(txn, AnsweredProbe{server, now,
+                                                  ti.keyed ? std::optional<TopicId>(topic)
+                                                           : std::nullopt});
                 set_peer_state(ti, peer, PeerState::Handshaking);
             }
             return;
@@ -600,8 +719,31 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
                 }
             }
 
+            // A replacement registration that was itself refused: let the
+            // next failed keepalive try again.
+            if (p.reregister_for) {
+                if (auto tit = topics.find(*p.reregister_for); tit != topics.end()) {
+                    tit->second->impl_->reregistering = false;
+                }
+                pending.erase(pit);
+                return;
+            }
+
+            // The server no longer honours this topic's registration: it
+            // restarted and forgot the record (NotFound), or holds a different
+            // lease than ours (BadAuth). Keepalives cannot fix either, and
+            // until something does the node is unfindable and can sign
+            // nothing -- so register again.
+            //
+            // Copied out first: reregister() adds to `pending`, which may
+            // rehash and invalidate `p`.
+            const auto lost = (p.error == ErrorCode::NotFound || p.error == ErrorCode::BadAuth)
+                                  ? p.keepalive_for
+                                  : std::nullopt;
+
             p.done  = true;
             cv.notify_all();
+            if (lost) reregister(*lost, now);
             return;
         }
 
@@ -638,10 +780,29 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
         case wire::MsgType::RegisterOk: {
             auto ok = wire::RegisterOk::decode(r);
             if (!ok) return;
+            srflx = ok->srflx;
+
+            // A replacement the loop issued: nobody is waiting in publish(),
+            // so apply it here. Unless the application unpublished meanwhile,
+            // in which case the fresh record simply expires unused.
+            if (p.reregister_for) {
+                if (auto tit = topics.find(*p.reregister_for); tit != topics.end()) {
+                    auto& ti2         = *tit->second->impl_;
+                    ti2.reregistering = false;
+                    if (ti2.published) {
+                        ti2.self           = ok->dev_id;
+                        ti2.lease          = ok->lease_token;
+                        ti2.seq            = 0;
+                        ti2.next_keepalive = now + cfg.keepalive;
+                    }
+                }
+                pending.erase(pit);
+                return;
+            }
+
             p.dev_id = ok->dev_id;
             p.lease  = ok->lease_token;
             p.srflx  = ok->srflx;
-            srflx    = ok->srflx;
             p.done   = true;
             cv.notify_all();
             return;
@@ -768,36 +929,68 @@ void Node::Impl::on_signaling(const Endpoint& from, std::span<const uint8_t> dgr
 
 void Node::Impl::on_probe_dgram(const Endpoint& from, std::span<const uint8_t> dgram,
                                 Instant now) {
-    // Answer with whichever topic's key validates. A keyed topic's probe cannot
-    // be forged by a non-member, so a match also tells us which topic this is.
-    for (auto& [tid, topic] : topics) {
-        auto& ti = *topic->impl_;
-        auto  reply = path::PunchSession::answer_probe(from, dgram, ti.probe_key(),
-                                                       alloc_txn());
-        if (!reply) continue;
-
-        send_raw(reply->to, reply->data);
-
-        wire::Reader r{dgram};
-        if (wire::Header::decode(r)) {
-            if (auto probe = wire::Probe::decode(r)) {
-                // Remember the transaction so a HandshakeInit bound to it can
-                // be accepted. Without this gate a replayed HandshakeInit would
-                // cost us a DH on demand.
-                answered[probe->txn] = AnsweredProbe{from, now,
-                                                     ti.keyed ? std::optional<TopicId>(tid)
-                                                              : std::nullopt};
+    if (wire::peek_type(dgram) != wire::MsgType::Probe) {
+        // A ProbeOk: it belongs to whichever attempt issued the txn.
+        for (auto& [tid, topic] : topics) {
+            (void)tid;
+            for (auto& [dev, peer] : topic->impl_->peers) {
+                (void)dev;
+                if (peer.punch) peer.punch->on_datagram(from, dgram, now);
             }
         }
-        if (ti.keyed) break;  // a keyed match is unambiguous
+        return;
     }
 
-    // Feed any in-flight attempt: their probe proves the path works one way.
+    // Answer each probe exactly once. It used to be answered once per open
+    // topic -- every open topic accepts any probe -- and again by every punch
+    // session in flight, and each ProbeOk is larger than the Probe: one
+    // spoofed probe came back several times over at whoever it claimed to be.
+    //
+    // Keyed topics first: their tag is unambiguous, so a match also tells us
+    // which topic this is. Failing that, one answer stands for every open
+    // topic, since it is the same answer.
+    std::optional<path::Outgoing> reply;
+    std::optional<TopicId>        keyed_topic;
+    for (auto& [tid, topic] : topics) {
+        auto& ti = *topic->impl_;
+        if (!ti.keyed) continue;
+        reply = path::PunchSession::answer_probe(from, dgram, ti.probe_key(), alloc_txn());
+        if (reply) {
+            keyed_topic = tid;
+            break;
+        }
+    }
+    if (!reply) {
+        const bool any_open = std::any_of(topics.begin(), topics.end(), [](const auto& kv) {
+            return !kv.second->impl_->keyed;
+        });
+        if (any_open) reply = path::PunchSession::answer_probe(from, dgram, nullptr, alloc_txn());
+    }
+    if (!reply) return;  // no topic of ours would answer: say nothing
+
+    send_raw(reply->to, reply->data);
+
+    wire::Reader r{dgram};
+    if (wire::Header::decode(r)) {
+        if (auto probe = wire::Probe::decode(r)) {
+            // Remember the transaction so a HandshakeInit bound to it can be
+            // accepted. Without this gate a replayed HandshakeInit would cost
+            // us a DH on demand.
+            // Unvouched unless a keyed topic's tag verified: anyone may probe
+            // an open topic, so those are the entries the cap bounds.
+            AnsweredProbe a{from, now, keyed_topic};
+            a.unvouched = !keyed_topic.has_value();
+            remember_probe(probe->txn, a);
+        }
+    }
+
+    // Tell any in-flight attempt the path works one way -- noted, not answered
+    // again.
     for (auto& [tid, topic] : topics) {
         (void)tid;
         for (auto& [dev, peer] : topic->impl_->peers) {
             (void)dev;
-            if (peer.punch) peer.punch->on_datagram(from, dgram, now);
+            if (peer.punch) peer.punch->on_peer_probe(from, now);
         }
     }
 }
@@ -826,14 +1019,44 @@ void Node::Impl::on_handshake_dgram(const Endpoint& from, std::span<const uint8_
     auto hi = wire::HandshakeInit::decode(r);
     if (!hi) return;
 
-    // Gate: the probe_txn must be one WE issued and answered, recently, and not
-    // yet consumed. This is what makes a replayed HandshakeInit useless.
+    // A conn_id we already hold a session for is never a new handshake. It is
+    // the initiator retransmitting because our HandshakeResp was lost -- so
+    // answer it again. Sent through the glare branch below instead, it was
+    // taken for a competing handshake, and when we held the smaller dev_id we
+    // kept "ours" and said nothing: the initiator gave up while we showed
+    // Connected. Checked before the probe gate and before accept(), so a
+    // retransmit costs no DH and cannot be starved by an expired txn.
+    if (auto cit = conns.find(hi->conn_id); cit != conns.end()) {
+        auto tit = topics.find(cit->second.first);
+        if (tit == topics.end()) return;
+        auto pe = tit->second->impl_->peers.find(cit->second.second);
+        if (pe == tit->second->impl_->peers.end() || !pe->second.sess) return;
+        if (pe->second.sess->resend_handshake_response()) {
+            while (auto o = pe->second.sess->poll_transmit()) send_to_peer(pe->second, o->to, o->data);
+        }
+        return;
+    }
+
+    // Gate: the probe_txn must be one WE answered, recently, for the address
+    // this init comes from, and not yet consumed. This is what makes a
+    // replayed HandshakeInit useless -- the conn_id sits outside the Noise
+    // message, so a replay with a fresh conn_id otherwise verifies as a brand
+    // new handshake, costs a DH, and on the larger dev_id wins the glare rule
+    // against the live session.
     auto ait = answered.find(hi->probe_txn);
     if (ait == answered.end()) return;
     if (now - ait->second.when > kProbeMemory) {
-        answered.erase(ait);
+        forget_probe(ait);
         return;
     }
+    // A relayed handshake arrives from the server, exactly as its binding was
+    // recorded; a direct one from the peer we probed with.
+    if (!(from == ait->second.from)) return;
+
+    // Copied out: accepting can add to `answered` (a relay session records its
+    // own txn), which may rehash and invalidate `ait`.
+    const wire::ProbeTxn         txn        = hi->probe_txn;
+    const std::optional<TopicId> topic_hint = ait->second.topic;
 
     auto try_topic = [&](const TopicId& tid, Topic::Impl& ti) -> bool {
         DevId placeholder{};
@@ -853,6 +1076,21 @@ void Node::Impl::on_handshake_dgram(const Endpoint& from, std::span<const uint8_
 
         auto& peer  = ti.peers[owner];
         peer.dev_id = owner;
+
+        // A live session is never given up for a handshake that merely claims
+        // the same dev_id. The claim proves nothing -- on an open topic it
+        // travels in plaintext, and on a keyed one any holder of K can make it
+        // -- so replacing on it let anyone hijack a working session, streams
+        // included. Only one still handshaking (glare, below) or gone quiet
+        // (the peer restarted, say) can be replaced. The cost is that a peer
+        // which restarts within kLiveSession waits out the rest of it.
+        if (peer.sess) {
+            const auto st   = peer.sess->state();
+            const bool live = (st == session::SessionState::Established ||
+                               st == session::SessionState::NeedsRehandshake) &&
+                              now - peer.sess->last_received() < kLiveSession;
+            if (live) return true;  // handled: refused
+        }
 
         // Glare. Both peers call connect() at once, so both initiate, and
         // without a tie-break each would replace its own session with the one
@@ -878,14 +1116,24 @@ void Node::Impl::on_handshake_dgram(const Endpoint& from, std::span<const uint8_
         return true;
     };
 
-    if (ait->second.topic) {
-        auto tit = topics.find(*ait->second.topic);
-        if (tit != topics.end()) try_topic(tit->first, *tit->second->impl_);
-        return;
+    bool accepted = false;
+    if (topic_hint) {
+        auto tit = topics.find(*topic_hint);
+        if (tit != topics.end()) accepted = try_topic(tit->first, *tit->second->impl_);
+    } else {
+        // Open topic: the prologue carries topic_id, so only the right one accepts.
+        for (auto& [tid, topic] : topics) {
+            if (try_topic(tid, *topic->impl_)) {
+                accepted = true;
+                break;
+            }
+        }
     }
-    // Open topic: the prologue carries topic_id, so only the right one accepts.
-    for (auto& [tid, topic] : topics) {
-        if (try_topic(tid, *topic->impl_)) break;
+
+    // Spent. The initiator's own retransmits carry the conn_id we now hold,
+    // and are answered above without coming back through this gate.
+    if (accepted) {
+        if (auto it = answered.find(txn); it != answered.end()) forget_probe(it);
     }
 }
 
@@ -1031,8 +1279,8 @@ void Node::Impl::start_relay_session(Topic::Impl& ti, const TopicId& tid, Peer& 
 
     // The responder must accept a handshake bound to this transaction, so
     // record it as though we had answered a probe for it.
-    answered[txn] = AnsweredProbe{server, now, ti.keyed ? std::optional<TopicId>(tid)
-                                                        : std::nullopt};
+    remember_probe(txn, AnsweredProbe{server, now, ti.keyed ? std::optional<TopicId>(tid)
+                                                            : std::nullopt});
     set_peer_state(ti, peer, PeerState::Handshaking);
 }
 
@@ -1146,12 +1394,14 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                         peer.streams->on_datagram(
                             e->packet_number,
                             std::span<const uint8_t>(e->data).subspan(1), now);
-                    } else if (ti.on_data) {
+                    } else if (e->data[0] == payload_kind::kDatagram && ti.on_data) {
                         deferred.push_back([cb = ti.on_data, dev = peer.dev_id,
                                             bytes = std::vector<uint8_t>(
                                                 e->data.begin() + 1, e->data.end())] {
                             cb(dev, bytes);
                         });
+                    } else {
+                        // drop it if we don't know the type.
                     }
                     break;
                 case K::PathChanged:
@@ -1181,6 +1431,17 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     conns.erase(peer.sess->conn_id());
                     peer.sess.reset();
                     peer.streams.reset();
+
+                    // The relay binding belonged to the session that just
+                    // ended, and may be gone too -- expired, lost in a server
+                    // restart, or out of quota. Left set, these flags made
+                    // begin_connect refuse the peer for the life of the node.
+                    // A new connection decides afresh whether it needs one.
+                    peer.relayed         = false;
+                    peer.relay_id        = 0;
+                    peer.relay_asked     = false;
+                    peer.relay_backup_at = Instant{};
+
                     if (ti.on_peer_closed) {
                         deferred.push_back(
                             [cb = ti.on_peer_closed, dev = peer.dev_id, why] { cb(dev, why); });
@@ -1289,11 +1550,20 @@ void Node::Impl::drive_streams(Topic::Impl& ti, const TopicId& tid, Peer& peer, 
     (void)tid;
 }
 
-void Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, Instant now) {
+uint32_t Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, Instant now,
+                                   bool replacing) {
     (void)now;
+    (void)ti;
     uint32_t txn = alloc_txn();
 
-    auto build = [this, &ti, tid, txn](const std::vector<uint8_t>& ck) {
+    // Looks the topic up on every build rather than capturing it: the Pending
+    // (and its retransmissions) can outlive the topic if it is left while a
+    // loop-issued registration is still in flight.
+    auto build = [this, tid, txn](const std::vector<uint8_t>& ck) {
+        auto it = topics.find(tid);
+        if (it == topics.end()) return std::vector<uint8_t>{};
+        const auto& ti = *it->second->impl_;
+
         std::vector<uint8_t> buf(wire::kMaxDatagram);
         wire::Writer         w{buf};
         uint8_t flags = ti.unlisted ? wire::flags::kUnlisted : 0;
@@ -1307,15 +1577,33 @@ void Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, Instant now)
         m.cookie     = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};
-        buf.resize(w.size());
+        // Padded: see wire::kMinUnvalidatedRequest.
+        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
         return buf;
     };
 
     Pending p;
     p.expect  = wire::MsgType::RegisterOk;
     p.rebuild = build;
+    if (replacing) p.reregister_for = tid;
     pending[txn] = std::move(p);
     send_raw(server, build(cookie));
+    return txn;
+}
+
+void Node::Impl::reregister(const TopicId& tid, Instant now) {
+    auto it = topics.find(tid);
+    if (it == topics.end()) return;
+    auto& ti = *it->second->impl_;
+    // Only for a topic the application still wants published, and only once
+    // at a time: every keepalive refused before the reply lands would
+    // otherwise start its own.
+    if (!ti.published || ti.reregistering) return;
+    ti.reregistering = true;
+    if (cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] server lost our registration; registering again\n");
+    }
+    send_register(ti, tid, now, /*replacing=*/true);
 }
 
 void Node::Impl::send_keepalive(Topic::Impl& ti, Instant now) {
@@ -1335,8 +1623,9 @@ void Node::Impl::send_keepalive(Topic::Impl& ti, Instant now) {
     buf.resize(w.size());
 
     Pending p;
-    p.expect     = wire::MsgType::KeepaliveOk;
-    pending[txn] = std::move(p);
+    p.expect        = wire::MsgType::KeepaliveOk;
+    p.keepalive_for = ti.creds.id;
+    pending[txn]    = std::move(p);
     send_raw(server, buf);
     ti.next_keepalive = now + cfg.keepalive;
 }
@@ -1435,7 +1724,8 @@ void Node::Impl::discover(Topic::Impl& ti, const TopicId& tid, Instant now) {
         m.cookie = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};
-        buf.resize(w.size());
+        // Padded: see wire::kMinUnvalidatedRequest.
+        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
         return buf;
     };
 
@@ -1502,20 +1792,21 @@ bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
     impl_->meta.assign(meta.begin(), meta.end());
     impl_->unlisted = unlisted;
 
-    uint32_t txn_before = n.next_txn;
-    n.send_register(*impl_, impl_->creds.id, std::chrono::steady_clock::now());
+    const uint32_t txn =
+        n.send_register(*impl_, impl_->creds.id, std::chrono::steady_clock::now());
 
     // Wait for RegisterOk (possibly after a Retry round trip).
     auto deadline = std::chrono::steady_clock::now() + 5s;
     while (std::chrono::steady_clock::now() < deadline) {
-        auto it = n.pending.find(txn_before);
+        auto it = n.pending.find(txn);
         if (it != n.pending.end() && it->second.done) {
             bool ok = it->second.dev_id.has_value();
             if (ok) {
-                impl_->self      = *it->second.dev_id;
-                impl_->lease     = it->second.lease;
-                impl_->seq       = 0;
-                impl_->published = true;
+                impl_->self          = *it->second.dev_id;
+                impl_->lease         = it->second.lease;
+                impl_->seq           = 0;
+                impl_->published     = true;
+                impl_->reregistering = false;  // this registration supersedes any
                 impl_->next_keepalive =
                     std::chrono::steady_clock::now() + n.cfg.keepalive;
             }
@@ -1524,7 +1815,7 @@ bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
         }
         n.cv.wait_for(lk, 50ms);
     }
-    n.pending.erase(txn_before);
+    n.pending.erase(txn);
     return false;
 }
 
@@ -1573,7 +1864,8 @@ std::vector<PeerInfo> Topic::peers(uint8_t max, bool want_meta,
         m.cookie = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};
-        buf.resize(w.size());
+        // Padded: see wire::kMinUnvalidatedRequest.
+        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
         return buf;
     };
 
@@ -1619,7 +1911,8 @@ std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::millisecon
         m.cookie = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};
-        buf.resize(w.size());
+        // Padded: see wire::kMinUnvalidatedRequest.
+        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
         return buf;
     };
 
@@ -1674,7 +1967,10 @@ void Topic::drop_peer_locked(const DevId& dev, uint16_t reason) {
         // Queue the notice, then drain: close_with_notice() seals it before
         // tearing down, because close() clears the send keys.
         it->second.sess->close_with_notice(reason, std::chrono::steady_clock::now());
-        while (auto o = it->second.sess->poll_transmit()) n.send_raw(o->to, o->data);
+        // Through send_to_peer, like every other peer-bound datagram: on a
+        // relayed peer the session's path is the server itself, and a raw
+        // Close sent there is dropped, so the peer never heard the goodbye.
+        while (auto o = it->second.sess->poll_transmit()) n.send_to_peer(it->second, o->to, o->data);
         n.conns.erase(it->second.sess->conn_id());
     }
     impl_->peers.erase(it);
@@ -1752,7 +2048,10 @@ bool Topic::send(const DevId& dev, std::span<const uint8_t> payload) {
     framed.push_back(payload_kind::kDatagram);
     framed.insert(framed.end(), payload.begin(), payload.end());
     if (!it->second.sess->send(framed, now)) return false;
-    while (auto o = it->second.sess->poll_transmit()) n.send_raw(o->to, o->data);
+    // Through send_to_peer so a relayed peer gets it wrapped in RelayData.
+    // Sent raw, it reached the server bare and was dropped -- while this
+    // returned true.
+    while (auto o = it->second.sess->poll_transmit()) n.send_to_peer(it->second, o->to, o->data);
     return true;
 }
 
@@ -1805,6 +2104,15 @@ std::optional<std::array<uint8_t, 32>> Topic::channel_binding(const DevId& dev) 
 // Node public API
 // ---------------------------------------------------------------------------
 Node::Node(Config cfg) : impl_(std::make_unique<Impl>()) {
+    // Validated before anything touches the network. A generation must span
+    // more than the 64-packet replay window (a shift of at least 7), or a
+    // reordered packet can be two generations old and is dropped without a
+    // word; at 64 or more the shift is undefined behaviour.
+    if (cfg.rekey_shift < 7 || cfg.rekey_shift > 63) {
+        throw std::invalid_argument("uconnect: rekey_shift must be in 7..63, got " +
+                                    std::to_string(cfg.rekey_shift));
+    }
+
     impl_->cfg = std::move(cfg);
     io::init_networking();
 
@@ -1887,7 +2195,8 @@ std::vector<TopicSummary> Node::explore(size_t limit, std::chrono::milliseconds 
         m.cookie = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};
-        buf.resize(w.size());
+        // Padded: see wire::kMinUnvalidatedRequest.
+        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
         return buf;
     };
 
@@ -1925,7 +2234,8 @@ std::optional<ServerStats> Node::stats(std::chrono::milliseconds timeout) {
         m.cookie = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};
-        buf.resize(w.size());
+        // Padded: see wire::kMinUnvalidatedRequest.
+        buf.resize(std::max(w.size(), wire::kMinUnvalidatedRequest));
         return buf;
     };
 
@@ -1994,6 +2304,16 @@ uint16_t Node::local_port() const { return impl_->sock.local_port(); }
 std::optional<Endpoint> Node::reflexive() const {
     std::lock_guard<std::mutex> lk(impl_->mu);
     return impl_->srflx;
+}
+
+size_t Node::pending_requests() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->pending.size();
+}
+
+size_t Node::answered_probes() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->answered.size();
 }
 
 

@@ -213,12 +213,16 @@ void SendBuffer::on_sent(uint64_t offset, uint64_t length) {
     if (fin_written_ && offset + length >= written_) fin_sent_ = true;
 }
 
-void SendBuffer::on_acked(uint64_t offset, uint64_t length) {
+void SendBuffer::on_acked(uint64_t offset, uint64_t length, bool fin) {
     unacked_.erase(offset);
     // A retransmission may have been queued before this ack arrived.
     retransmit_.erase(offset);
     if (length > 0) acked_[offset] = std::max(acked_[offset], length);
-    if (fin_written_ && offset + length >= written_) fin_acked_ = true;
+    // Only an acked frame that CARRIED the FIN delivers it. Inferring it from
+    // "this ack reaches the end of the stream" was wrong whenever the last
+    // data went out before finish() and its ack arrived after: the stream
+    // then counted as complete, and retired, before the FIN was even sent.
+    if (fin) fin_acked_ = true;
     recompute_prefix();
     release_acked();
 }

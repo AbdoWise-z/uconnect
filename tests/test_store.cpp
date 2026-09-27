@@ -179,6 +179,51 @@ TEST(register_twice_from_the_same_address_refreshes_rather_than_duplicating) {
     CHECK(!(r1.lease_token == r2.lease_token));
 }
 
+TEST(a_retransmitted_register_gets_the_same_lease_not_a_new_one) {
+    // #8. A client retransmits REGISTER with the same txn_id when the reply is
+    // slow. Treated as a new registration, the retransmit replaced the lease,
+    // so the client -- which keeps whichever reply arrives first -- held a
+    // token the server had already thrown away, and every MAC failed.
+    auto s   = make_store();
+    auto src = ep(7, 39412);
+    auto r1  = s.register_entry(reg_msg(topic_of(1)), src, t0(), /*txn_id=*/42);
+
+    // The client signs with the first reply's lease before the retransmit lands.
+    auto ka1 = build_keepalive(r1.dev_id, 1, r1.lease_token);
+    REQUIRE(s.keepalive(r1.dev_id, 1, ka1.authed(), mac_over(r1.lease_token, ka1.authed()),
+                        src, t0() + 300ms).code == ErrorCode::None);
+
+    auto r2 = s.register_entry(reg_msg(topic_of(1)), src, t0() + 400ms, 42);
+    CHECK(r2.lease_token == r1.lease_token);
+
+    // Not a new registration, so the sequence did not reset either: the same
+    // keepalive replayed is still a replay.
+    CHECK(s.keepalive(r1.dev_id, 1, ka1.authed(), mac_over(r1.lease_token, ka1.authed()),
+                      src, t0() + 500ms).code == ErrorCode::BadAuth);
+    auto ka2 = build_keepalive(r1.dev_id, 2, r1.lease_token);
+    CHECK(s.keepalive(r1.dev_id, 2, ka2.authed(), mac_over(r1.lease_token, ka2.authed()),
+                      src, t0() + 600ms).code == ErrorCode::None);
+}
+
+TEST(a_genuinely_new_register_still_gets_a_fresh_lease) {
+    // #8, the boundary: only a retransmission is deduplicated. A different
+    // txn is a new registration, and so is the same txn long after -- a
+    // restarted client counts its txns from 1 again, and must not inherit a
+    // lease it no longer has.
+    auto s   = make_store();
+    auto src = ep(7, 39412);
+    auto r1  = s.register_entry(reg_msg(topic_of(1)), src, t0(), 42);
+    auto r2  = s.register_entry(reg_msg(topic_of(1)), src, t0() + 1s, 43);
+    CHECK(!(r2.lease_token == r1.lease_token));
+
+    auto r3 = s.register_entry(reg_msg(topic_of(1)), src, t0() + 120s, 43);
+    CHECK(!(r3.lease_token == r2.lease_token));
+
+    // And a different source is never someone's retransmission.
+    auto r4 = s.register_entry(reg_msg(topic_of(1)), ep(8, 39412), t0() + 121s, 43);
+    CHECK(!(r4.lease_token == r3.lease_token));
+}
+
 TEST(register_stores_host_candidates_and_prepends_srflx_on_lookup) {
     auto s = make_store();
     auto m = reg_msg(topic_of(1));
@@ -774,19 +819,74 @@ TEST(every_amplifying_request_is_refused_without_a_validated_address) {
 
     for (auto& c : cases) {
         auto out = svc.handle(src, c.dgram, t0());
-        auto rt  = reply_type(out);
+        // Silence is a refusal too: nothing reflected, nothing amplified.
+        if (out.empty()) continue;
+        auto rt = reply_type(out);
         if (!rt || *rt != wire::MsgType::Retry) {
             ::testing::fail(__FILE__, __LINE__,
                             std::string(c.name) + " answered without a cookie");
             continue;
         }
         // And the Retry must be no larger than the request that provoked it,
-        // or the defence is itself an amplifier.
-        if (out[0].data.size() > c.dgram.size() + 16) {
+        // or the defence is itself an amplifier. (#12: this once allowed 16
+        // bytes of slack, which let a 9-byte Stats draw a 25-byte Retry.)
+        if (out[0].data.size() > c.dgram.size()) {
             ::testing::fail(__FILE__, __LINE__,
                             std::string(c.name) + " Retry is larger than the request");
         }
     }
+}
+
+TEST(a_tiny_unvalidated_request_draws_no_reply_larger_than_itself) {
+    // #12. A cookie-less Stats is 9 bytes and a Topics 14; the Retry that
+    // answers either is 25. A request too small to be answered without
+    // amplifying is dropped -- the client pads its requests so it never is.
+    auto       s = make_store();
+    UdpService svc{s};
+    auto       src = ep(7, 40000);
+
+    wire::Stats  st;
+    wire::Topics tp;
+    for (const auto& dgram : {req(wire::MsgType::Stats, st), req(wire::MsgType::Topics, tp)}) {
+        size_t replied = 0;
+        for (const auto& r : svc.handle(src, dgram, t0())) replied += r.data.size();
+        CHECK(replied <= dgram.size());
+    }
+
+    // Padded to the minimum a client sends, the same request gets its Retry.
+    auto padded = req(wire::MsgType::Stats, st);
+    padded.resize(wire::kMinUnvalidatedRequest, 0);
+    auto out = svc.handle(src, padded, t0());
+    auto rt  = reply_type(out);
+    REQUIRE(rt.has_value());
+    CHECK(*rt == wire::MsgType::Retry);
+    CHECK(out[0].data.size() <= padded.size());
+}
+
+TEST(a_rate_limited_source_is_not_answered_with_more_than_it_sent) {
+    // #12. Over its budget, a source got an Error(RateLimited) for every
+    // datagram -- sent before anything was decoded, to an address nothing had
+    // validated. An 8-byte header drew a ~23-byte reply, and the path opened
+    // exactly when the budget ran out, so the limiter bounded nothing: a
+    // spoofed flood was reflected at the victim at about 3x.
+    auto          s = make_store();
+    ServiceConfig cfg;
+    cfg.rate_bytes_per_sec = 1;
+    cfg.rate_burst_bytes   = 640;  // ten requests' worth
+    UdpService svc{s, cfg};
+    const auto victim = ep(7, 40000);  // the spoofed source
+
+    std::vector<uint8_t> tiny(wire::Header::kSize);
+    wire::Writer         w{tiny};
+    wire::Header{wire::MsgType::Keepalive, wire::kVersion, 0, 1}.encode(w);
+    REQUIRE(w.ok());
+
+    size_t sent = 0, replied = 0;
+    for (int i = 0; i < 200; ++i) {
+        sent += tiny.size();
+        for (const auto& r : svc.handle(victim, tiny, t0())) replied += r.data.size();
+    }
+    CHECK(replied <= sent);
 }
 
 TEST(a_validated_address_gets_the_real_answer) {
@@ -933,6 +1033,25 @@ TEST(relay_enforces_a_bandwidth_ceiling) {
     // Next one crosses the ceiling.
     CHECK(!s.relay_forward(rp.id, ep(7, 4000), 400, t0()).has_value());
     CHECK(s.stats(t0()).rej_relay_quota >= 1u);
+}
+
+TEST(an_exhausted_relay_is_refused_rather_than_handed_back) {
+    // #11. Allocation is idempotent for a pair, which used to include a pair
+    // whose binding had spent its quota: the client asked again and was handed
+    // the same dead binding, so every relayed datagram vanished with no error
+    // anywhere. A refusal it can report is the honest answer.
+    StoreConfig cfg;
+    cfg.relay_max_bytes = 1000;
+    auto s  = make_store(cfg);
+    auto rp = make_relay(s);
+
+    CHECK(s.relay_forward(rp.id, ep(8, 5000), 400, t0()).has_value());
+    CHECK(s.relay_forward(rp.id, ep(7, 4000), 400, t0()).has_value());
+    CHECK(!s.relay_forward(rp.id, ep(7, 4000), 400, t0()).has_value());  // spent
+
+    auto again = s.relay_alloc(rp.a.dev_id, rp.b.dev_id, ep(7, 4000), t0() + 1s);
+    CHECK(again.code == ErrorCode::QuotaExceeded);
+    CHECK(again.relay_id != rp.id);
 }
 
 TEST(relay_bindings_expire_when_idle) {

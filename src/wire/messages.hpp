@@ -38,6 +38,13 @@ inline constexpr size_t kMaxCandidates   = 8;
 inline constexpr uint8_t kLookupDefault = 30;   // hard default
 inline constexpr uint8_t kLookupMax     = 100;  // client may request up to this
 
+// Every request whose reply is larger than itself is sent at least this long,
+// zero-padded at the end (decoders ignore trailing bytes). A server answers an
+// unvalidated address with a Retry -- header, length byte and a 16-byte cookie,
+// 25 bytes -- and never sends one larger than the request that provoked it, so
+// a request shorter than that is dropped rather than amplified.
+inline constexpr size_t kMinUnvalidatedRequest = 32;
+
 inline constexpr size_t kMacLen        = 16;
 inline constexpr size_t kLeaseTokenLen = 32;
 inline constexpr size_t kProbeTxnLen   = 16;

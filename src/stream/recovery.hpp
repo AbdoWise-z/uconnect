@@ -106,6 +106,13 @@ struct SentPacket {
         bool     fin       = false;
     };
     std::vector<StreamChunk> chunks;
+
+    // Window updates this packet carried. They are retransmittable state too:
+    // lose one without re-announcing and the sender stays at the old limit
+    // for good. On loss the current, larger limit is re-armed rather than the
+    // old value resent.
+    bool                  max_data = false;
+    std::vector<uint64_t> max_stream_data;  // stream ids
 };
 
 // An inclusive run of packet numbers, the way an ACK frame describes them.
@@ -128,6 +135,8 @@ public:
     // have been acknowledged. Reordering below this threshold is tolerated.
     static constexpr uint64_t kPacketThreshold = 3;
 
+    // Records a sent packet. Only ack-eliciting packets are held: nothing
+    // acknowledges the others, so they would never leave.
     void on_sent(SentPacket p);
 
     // Feeds an ACK. `largest` must already have been validated as a packet we

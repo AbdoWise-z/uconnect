@@ -51,6 +51,14 @@ struct StoreConfig {
 
     std::chrono::seconds cookie_lifetime{30};
 
+    // How long after a registration a REGISTER from the same address with the
+    // same txn_id counts as its retransmission, and gets the same lease back
+    // rather than a new one. Comfortably past a client's retransmit schedule
+    // (four tries 400 ms apart, after a Retry round trip); well short of the
+    // time a restarted client, whose txns count from 1 again, takes to come
+    // back.
+    std::chrono::seconds register_retransmit_window{10};
+
     // --- relay -------------------------------------------------------------
     // The fallback for pairs that cannot punch. Unlike registration, relaying
     // keeps the server in the data path, so every limit here is about making
@@ -73,6 +81,10 @@ struct Record {
     std::vector<uint8_t>   meta;          // opaque; plaintext by design
     wire::LeaseToken       lease_token{};
     uint64_t               last_seq  = 0;
+    // The REGISTER that minted lease_token, so a retransmission of it can be
+    // recognised and answered with the same lease.
+    uint32_t               reg_txn   = 0;
+    Instant                reg_at{};
     Instant                last_seen{};
     Instant                created{};
     uint8_t                key_epoch = 0;
@@ -98,6 +110,9 @@ struct RelayBinding {
     Instant       created{};
     Instant       last_seen{};
     uint64_t      bytes = 0;
+    // Has refused a datagram for its byte quota. From then on it is dead
+    // weight, and re-allocating it must say so rather than hand it back.
+    bool          exhausted = false;
 };
 
 // --- stats -----------------------------------------------------------------
@@ -192,7 +207,8 @@ public:
     bool validate_cookie(std::span<const uint8_t> cookie, const Endpoint&, Instant now) const;
 
     // --- mutations ---------------------------------------------------------
-    RegisterResult register_entry(const wire::Register&, const Endpoint& src, Instant now);
+    RegisterResult register_entry(const wire::Register&, const Endpoint& src, Instant now,
+                                  uint32_t txn_id = 0);
 
     // Authenticated operations. `authed` is the exact byte range the MAC
     // covers, handed up from the wire decoder.

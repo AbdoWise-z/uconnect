@@ -238,13 +238,7 @@ void PunchSession::on_datagram(const Endpoint& from, std::span<const uint8_t> dg
         // so this matters even mid-attempt.
         auto reply = answer_probe(from, dgram, keyed_ ? &probe_key_ : nullptr, txn_counter_++);
         if (reply) out_.push_back(std::move(*reply));
-
-        // Their probe arriving proves they are live and that the path works in
-        // at least one direction. Bring our next probe to that address forward
-        // instead of waiting out the backoff.
-        for (auto& p : pairs_) {
-            if (p.remote.ep == from && !p.validated && !p.exhausted) p.next_send = now;
-        }
+        on_peer_probe(from, now);
         return;
     }
 
@@ -277,6 +271,15 @@ void PunchSession::on_datagram(const Endpoint& from, std::span<const uint8_t> dg
             }
         }
         return;
+    }
+}
+
+void PunchSession::on_peer_probe(const Endpoint& from, Instant now) {
+    // Their probe arriving proves they are live and that the path works in at
+    // least one direction. Bring our next probe to that address forward
+    // instead of waiting out the backoff.
+    for (auto& p : pairs_) {
+        if (p.remote.ep == from && !p.validated && !p.exhausted) p.next_send = now;
     }
 }
 

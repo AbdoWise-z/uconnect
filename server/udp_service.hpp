@@ -60,7 +60,9 @@ private:
     // address in its own handler before replying -- Register, Lookup, Topics,
     // Resolve and Stats. Without that this server is a UDP amplifier pointed at
     // whoever the attacker spoofed.
-    Reply make_retry(const Endpoint&, uint32_t txn_id, Instant now);
+    // Nullopt when the Retry would be larger than the request: drop instead.
+    std::optional<Reply> make_retry(const Endpoint&, uint32_t txn_id, Instant now,
+                                    size_t request_size);
     Reply make_error(const Endpoint&, uint32_t txn_id, ErrorCode);
 
     bool consume_budget(const Endpoint&, size_t bytes, Instant now);
@@ -73,6 +75,7 @@ private:
     struct Bucket {
         double  tokens = 0;
         Instant last{};
+        Instant last_refusal{};  // when this source was last told it is limited
     };
     struct IpHash {
         size_t operator()(const std::array<uint8_t, 16>& a) const noexcept {

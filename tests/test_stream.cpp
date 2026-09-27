@@ -459,7 +459,7 @@ TEST(send_buffer_reports_completion_only_after_fin_is_acked) {
     sb.on_sent(c->offset, c->data.size());
     CHECK(!sb.complete());  // sent is not delivered
 
-    sb.on_acked(c->offset, c->data.size());
+    sb.on_acked(c->offset, c->data.size(), c->fin);
     CHECK(sb.complete());
 }
 
@@ -1758,4 +1758,329 @@ TEST(a_peer_that_fragments_a_stream_without_limit_gets_it_reset) {
     }
 
     CHECK(!collect(b, StreamEventKind::Reset).empty());
+}
+
+// ---------------------------------------------------------------------------
+// Reported issues. Each test names the GitHub issue it reproduces.
+// ---------------------------------------------------------------------------
+TEST(a_peer_that_only_receives_is_not_declared_dead) {
+    // #3. The receiving end of a one-way stream sends nothing but ACKs, and an
+    // ACK is never itself acknowledged. Held in the sent table, those made the
+    // receiver look like a sender whose peer had gone silent, and it declared
+    // the connection dead one idle timeout in -- while data was still arriving.
+    StreamConfig cfg;  // the real 30s idle timeout; fast_cfg()'s 60s hid this
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{cfg, Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    // A small message every 2s for 90s: three idle timeouts' worth. B reads it
+    // all, and never enough to owe A a window update, so B has nothing to send
+    // but ACKs.
+    StreamId id = *a.open();
+    std::vector<uint8_t> got;
+    for (int i = 0; i < 45; ++i) {
+        a.write(id, pattern(100, static_cast<uint8_t>(i)));
+        link.advance(2s);
+        drain(b, id, got);
+    }
+
+    CHECK(!a.is_dead());
+    CHECK(!b.is_dead());
+    CHECK(collect(b, StreamEventKind::ConnDead).empty());
+    CHECK_EQ(got.size(), 4500u);
+}
+
+TEST(packets_that_elicit_no_ack_are_not_held_awaiting_one) {
+    // #3. Nothing ever acknowledges an ACK-only packet, so holding it waiting
+    // for an ack means holding it forever -- and letting whatever reads the
+    // table believe work is outstanding.
+    SentPackets sp;
+    SentPacket  p;
+    p.number        = 7;
+    p.sent_at       = t0();
+    p.size          = 40;
+    p.ack_eliciting = false;
+    sp.on_sent(p);
+
+    CHECK(sp.empty());
+    // The number was still used, so a peer acking it is telling the truth.
+    REQUIRE(sp.largest_sent().has_value());
+    CHECK_EQ(*sp.largest_sent(), 7u);
+}
+
+namespace {
+
+// Hand `c` a datagram of pure padding. It carries nothing, but like any
+// arriving datagram it gives the connection a chance to retire streams.
+void poke(StreamConnection& c, uint64_t pn, Instant now) {
+    const std::array<uint8_t, 1> padding{0x00};
+    c.on_datagram(pn, padding, now);
+}
+
+bool saw_finished(StreamConnection& c, StreamId id) {
+    for (const auto& e : collect(c, StreamEventKind::Finished)) {
+        if (e.id == id) return true;
+    }
+    return false;
+}
+
+// A bidi stream where A has written 100 bytes and had them all acked, and B
+// has written and FINished its own direction, which A has read to the end.
+// What remains is A's FIN.
+StreamId everything_done_but_a_fin(StreamConnection& a, StreamConnection& b, Link& link) {
+    StreamId id = *a.open();
+    a.write(id, pattern(100));
+    link.advance(200ms);
+
+    std::vector<uint8_t> at_b;
+    drain(b, id, at_b);
+    b.write(id, pattern(100, 1));
+    b.finish(id);
+    link.advance(200ms);
+
+    std::vector<uint8_t> at_a;
+    drain(a, id, at_a);
+    (void)collect(b, StreamEventKind::Finished);  // start from a clean slate
+    return id;
+}
+
+}  // namespace
+
+TEST(send_buffer_is_not_complete_until_the_fin_itself_is_acked) {
+    // #10. The last data chunk can be sent before finish() and acked after
+    // it. That ack reaches the end of the stream, but it did not carry the
+    // FIN, and the FIN has not even been sent yet.
+    SendBuffer sb{1 << 20};
+    sb.write(pattern(100), 1 << 20);
+    auto data = sb.next_chunk(1000);
+    REQUIRE(data.has_value());
+    REQUIRE(!data->fin);
+    sb.on_sent(data->offset, data->data.size());
+
+    sb.finish();
+    sb.on_acked(data->offset, data->data.size(), /*fin=*/false);
+    CHECK(!sb.complete());
+
+    auto fin = sb.next_chunk(1000);
+    REQUIRE(fin.has_value());
+    CHECK(fin->fin);
+    CHECK(fin->data.empty());
+    sb.on_sent(fin->offset, 0);
+    CHECK(!sb.complete());  // sent is not delivered
+
+    sb.on_acked(fin->offset, 0, /*fin=*/true);
+    CHECK(sb.complete());
+}
+
+TEST(finishing_after_everything_is_acked_still_delivers_the_fin) {
+    // #10. With every byte already acked, finish() made the send side look
+    // complete at once, so the first datagram to arrive retired the stream --
+    // before the FIN was ever sent. The peer never saw the stream end.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+    StreamId id = everything_done_but_a_fin(a, b, link);
+    REQUIRE(a.finished(id));
+
+    a.finish(id);
+    poke(a, 0, link.now());  // something arrives before A gets to send
+
+    link.advance(2s);
+    CHECK(saw_finished(b, id));
+    CHECK(!a.exists(id));  // and once the FIN is acked, the stream does retire
+}
+
+TEST(a_lost_fin_is_resent_even_when_other_traffic_arrives_first) {
+    // #10. A lost FIN-only frame is re-armed on loss, but the stream had
+    // already retired by then, so nothing was left to resend it.
+    StreamConnection a{fast_cfg(), Role::A};
+    StreamConnection b{fast_cfg(), Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+    StreamId id = everything_done_but_a_fin(a, b, link);
+    REQUIRE(a.finished(id));
+
+    a.finish(id);
+    link.advance(1ms);                    // A sends the FIN...
+    REQUIRE(link.drop_in_flight() > 0);   // ...and it is lost
+    poke(a, 0, link.now());
+
+    link.advance(3s);
+    CHECK(saw_finished(b, id));
+}
+
+namespace {
+
+// Push `total` bytes from A to B, with B reading as it goes, but lose the one
+// datagram B sends right after it first drains a full window -- the one that
+// carries the window update. Returns how many bytes B ends up with.
+size_t transfer_losing_the_first_window_update(StreamConfig cfg, size_t total) {
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{cfg, Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    auto     data = pattern(total);
+    StreamId id   = *a.open();
+    size_t   off  = a.write(id, data);
+
+    // Run until A is out of credit, then let B read everything it holds.
+    link.advance(300ms);
+    std::vector<uint8_t> got;
+    drain(b, id, got);
+    if (got.empty() || got.size() >= total) return got.size();
+
+    // B's next datagram announces the room it just made. Lose it.
+    link.advance(1ms);
+    if (link.drop_in_flight() == 0) return got.size();
+
+    for (int i = 0; i < 100 && got.size() < total; ++i) {
+        off += a.write(id, std::span(data).subspan(off));
+        link.advance(100ms);
+        drain(b, id, got);
+    }
+    return got.size();
+}
+
+}  // namespace
+
+TEST(a_lost_stream_window_update_is_resent) {
+    // #4. Window updates were fire-and-forget: the new limit was recorded as
+    // announced when written, not when acked, so losing that one datagram
+    // left the sender at the old limit for good -- and since the receiver's
+    // "moved far enough to announce" test was measured against the lost
+    // value, it never tried again. The transfer stopped dead.
+    StreamConfig cfg = fast_cfg();
+    cfg.stream_recv_window = 4096;
+    CHECK_EQ(transfer_losing_the_first_window_update(cfg, 20000), 20000u);
+}
+
+TEST(a_flow_control_violation_is_reported_once_and_stops_the_peer) {
+    // #25. Overrunning the window reset our sending direction and reported
+    // it, but left the peer's direction open: the peer kept sending, every
+    // further frame was a fresh violation and a fresh Reset event, and the
+    // receive side never ended, so the stream never retired.
+    StreamConfig cfg       = fast_cfg();
+    cfg.stream_recv_window = 1000;
+    StreamConnection b{cfg, Role::B};
+    const StreamId   id    = make_stream_id(Role::A, true, 0);
+    auto             chunk = pattern(600);
+
+    // Offsets 0, 600, 1200, ...: the second frame already runs past 1000.
+    for (uint64_t pn = 1; pn <= 5; ++pn) {
+        std::vector<uint8_t> frame(1200);
+        wire::Writer         w{frame};
+        REQUIRE(encode_stream(w, id, (pn - 1) * 600, false, chunk) > 0);
+        b.on_datagram(pn, std::span(frame).first(w.size()), t0());
+    }
+    CHECK_EQ(collect(b, StreamEventKind::Reset).size(), 1u);
+
+    // B must tell A to stop, not just abort its own direction.
+    std::vector<uint8_t> out(1200);
+    size_t n = b.poll_datagram(1, out, t0());
+    REQUIRE(n > 0);
+    std::vector<Frame> frames;
+    REQUIRE(decode_frames(std::span<const uint8_t>(out.data(), n), frames));
+    bool stop = false;
+    for (const auto& f : frames) {
+        if (f.type == FrameType::StopSending && f.stop.id == id) stop = true;
+    }
+    CHECK(stop);
+
+    // With both directions over, the stream retires rather than holding a slot.
+    poke(b, 6, t0() + 10ms);
+    CHECK(!b.exists(id));
+}
+
+namespace {
+
+// Abandon `rounds` one-way streams of `each` bytes, in the way `abandon`
+// chooses, then try to push `last` bytes on a fresh stream. Returns how many
+// of those the receiver gets.
+template <typename Abandon>
+size_t transfer_after_abandoning_streams(int rounds, size_t each, size_t last,
+                                         Abandon&& abandon) {
+    StreamConfig cfg       = fast_cfg();
+    cfg.conn_recv_window   = 8192;
+    cfg.stream_recv_window = 64 * 1024;
+    StreamConnection a{cfg, Role::A};
+    StreamConnection b{cfg, Role::B};
+    Link link{a, b, Link::Config{0.0, 5ms, 0ms, 1}};
+
+    for (int i = 0; i < rounds; ++i) {
+        StreamId s = *a.open(/*bidirectional=*/false);
+        auto     d = pattern(each);
+        size_t   off = 0;
+        for (int t = 0; t < 50 && off < each; ++t) {
+            off += a.write(s, std::span(d).subspan(off));
+            link.advance(20ms);
+        }
+        abandon(a, b, s);
+        link.advance(300ms);
+    }
+
+    StreamId s    = *a.open(/*bidirectional=*/false);
+    auto     data = pattern(last);
+    size_t   off  = 0;
+    std::vector<uint8_t> got;
+    for (int t = 0; t < 100 && got.size() < last; ++t) {
+        off += a.write(s, std::span(data).subspan(off));
+        link.advance(50ms);
+        drain(b, s, got);
+    }
+    return got.size();
+}
+
+}  // namespace
+
+TEST(resetting_streams_does_not_leak_connection_credit) {
+    // #14. The sender counts connection credit when it writes; the receiver
+    // gave it back only as the application read. Bytes a reset threw away
+    // were counted on one side and never on the other, so each abandoned
+    // stream shrank the connection window for good -- here, after ~8 KB of
+    // them, nothing more could be sent on any stream.
+    size_t got = transfer_after_abandoning_streams(
+        10, 3000, 5000, [](StreamConnection& a, StreamConnection&, StreamId s) {
+            a.reset(s, 7);
+        });
+    CHECK_EQ(got, 5000u);
+}
+
+TEST(closing_unread_streams_does_not_leak_connection_credit) {
+    // #14, from the other end: the receiver closes streams without reading
+    // them. Those bytes arrived and were counted, but will never be consumed.
+    size_t got = transfer_after_abandoning_streams(
+        10, 3000, 5000, [](StreamConnection&, StreamConnection& b, StreamId s) {
+            b.close(s, 7);
+        });
+    CHECK_EQ(got, 5000u);
+}
+
+TEST(the_connection_receive_window_is_enforced_across_streams) {
+    // #15. Only the per-stream windows were checked on receive, so a peer
+    // could fill every stream to its own limit at once: 64 x 256 KB = 16 MB
+    // buffered per connection, against a documented 1 MB.
+    StreamConfig cfg       = fast_cfg();
+    cfg.conn_recv_window   = 4096;
+    cfg.stream_recv_window = 64 * 1024;
+    StreamConnection b{cfg, Role::B};
+    auto chunk = pattern(1000);
+
+    for (uint64_t i = 0; i < 10; ++i) {
+        std::vector<uint8_t> frame(1200);
+        wire::Writer         w{frame};
+        REQUIRE(encode_stream(w, make_stream_id(Role::A, true, i), 0, false, chunk) > 0);
+        b.on_datagram(i + 1, std::span(frame).first(w.size()), t0());
+    }
+
+    size_t buffered = 0;
+    for (StreamId id : b.active_streams()) buffered += b.readable_bytes(id);
+    CHECK(buffered <= 4096u);
+    CHECK(!collect(b, StreamEventKind::Reset).empty());
+}
+
+TEST(a_lost_connection_window_update_is_resent) {
+    // #4, at the connection level: the same loss of MAX_DATA.
+    StreamConfig cfg = fast_cfg();
+    cfg.conn_recv_window   = 4096;
+    cfg.stream_recv_window = 64 * 1024;
+    CHECK_EQ(transfer_losing_the_first_window_update(cfg, 20000), 20000u);
 }

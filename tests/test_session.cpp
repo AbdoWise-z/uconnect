@@ -911,3 +911,29 @@ TEST(a_forged_far_future_counter_cannot_derail_the_key_schedule) {
     REQUIRE(deliver(p->a, p->b, ep(5, 5000), t0() + 2s) > 0);
     CHECK_EQ(drain_data(p->b).size(), 12u);
 }
+
+TEST(a_rekey_shift_as_wide_as_the_counter_means_never_rekey) {
+    // #27. The generation is `counter >> rekey_shift`, and shifting a 64-bit
+    // value by 64 or more is undefined. On x86 it quietly becomes a shift by
+    // zero -- a new key for every packet -- which is the opposite of what a
+    // huge shift asks for, and turns any reordering by two into loss.
+    SessionConfig cfg;
+    cfg.rekey_shift = 64;
+    auto p = establish_with(cfg);
+    REQUIRE(p.has_value());
+
+    std::vector<std::vector<uint8_t>> dgrams;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(p->a.send(bytes("m" + std::to_string(i)), t0() + 1s).has_value());
+        auto o = p->a.poll_transmit();
+        REQUIRE(o.has_value());
+        dgrams.push_back(o->data);
+    }
+
+    // Two packets of reordering: fine within one generation, fatal if every
+    // packet is a generation of its own.
+    p->b.on_datagram(ep(5, 5000), dgrams[2], t0() + 1s);
+    p->b.on_datagram(ep(5, 5000), dgrams[0], t0() + 1s);
+    p->b.on_datagram(ep(5, 5000), dgrams[1], t0() + 1s);
+    CHECK_EQ(drain_data(p->b).size(), 3u);
+}

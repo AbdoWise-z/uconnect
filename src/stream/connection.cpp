@@ -148,6 +148,69 @@ void StreamConnection::notify_writable() {
     }
 }
 
+void StreamConnection::consume_conn_credit(uint64_t n) {
+    conn_recv_consumed_ += n;
+
+    // Consuming data slides both windows. Announce only when they have moved
+    // enough to be worth the frame.
+    if (conn_recv_consumed_ + cfg_.conn_recv_window >=
+        conn_recv_announced_ + cfg_.conn_recv_window / 2) {
+        send_max_data_ = true;
+    }
+}
+
+void StreamConnection::settle_conn_credit(StreamState& s, uint64_t final_size) {
+    if (s.conn_credit_settled) return;
+    s.conn_credit_settled = true;
+
+    // Everything up to the final size that the application has not read, it
+    // never will. Without returning it, each reset stream shrank the
+    // connection window for good, until no stream could send at all.
+    const uint64_t read = s.recv.consumed();
+    uint64_t       owed = final_size > read ? final_size - read : 0;
+
+    // The final size is the peer's word. Never credit past what we actually
+    // granted, or a reset claiming a huge size would buy it credit it never
+    // had.
+    const uint64_t room = conn_recv_announced_ > conn_recv_consumed_
+                              ? conn_recv_announced_ - conn_recv_consumed_
+                              : 0;
+    owed = std::min(owed, room);
+
+    // The stream now counts against the connection window at its final size,
+    // not at the highest offset that happened to arrive. Crediting bytes as
+    // consumed that were never counted as received would let the peer's
+    // unread backlog grow past the window by that much on every reset.
+    const uint64_t final_end = read + owed;
+    if (final_end > s.recv_high) {
+        conn_recv_total_ += final_end - s.recv_high;
+        s.recv_high = final_end;
+    }
+    consume_conn_credit(owed);
+}
+
+void StreamConnection::abort_on_violation(StreamState& s, StreamId id) {
+    // Tear the stream down rather than grow a buffer the peer controls the
+    // size of. Dropping the chunk quietly is not an option: its packet is
+    // already acked, so it would never be resent.
+    //
+    // Both directions, and once. Aborting only ours left the peer's open: it
+    // kept sending, each frame was a fresh violation and a fresh Reset event,
+    // and the receive side never ended, so the stream never retired.
+    const bool we_send = is_bidi(id) || opener(id) == role_;
+    if (we_send && !s.send_reset) {
+        s.send_reset      = true;
+        s.send_reset_code = 1;
+    }
+    s.send_stop      = true;  // tell the peer to stop
+    s.send_stop_code = 1;
+    s.peer_reset     = true;  // and ignore whatever it sends meanwhile
+    if (!s.reset_notified) {
+        s.reset_notified = true;
+        emit(StreamEventKind::Reset, id, 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Application API
 // ---------------------------------------------------------------------------
@@ -179,14 +242,8 @@ size_t StreamConnection::read(StreamId id, std::span<uint8_t> out) {
     if (!s) return 0;
 
     size_t n = s->recv.read(out);
-    if (n > 0) conn_recv_consumed_ += n;
-
-    // Consuming data slides both windows. Announce only when they have moved
-    // enough to be worth the frame.
-    if (conn_recv_consumed_ + cfg_.conn_recv_window >=
-        conn_recv_announced_ + cfg_.conn_recv_window / 2) {
-        send_max_data_ = true;
-    }
+    // A settled stream's bytes were already credited at its final size.
+    consume_conn_credit(s->conn_credit_settled ? 0 : n);
 
     if (n > 0 && s->recv.finished() && !s->fin_notified) {
         s->fin_notified = true;
@@ -370,18 +427,20 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
             auto& s = *sp;
             if (s.peer_reset) break;
 
+            // What this frame would add to the connection-wide total. Each
+            // stream's own window is checked by insert(); without this check
+            // as well, a peer could fill every stream to its limit at once.
+            const uint64_t end  = f.stream.offset + f.stream.data.size();
+            const uint64_t grow = end > s.recv_high ? end - s.recv_high : 0;
+
             const size_t before = s.recv.readable();
-            if (!s.recv.insert(f.stream.offset, f.stream.data, f.stream.fin)) {
-                // Flow-control violation, or fragmenting past the cap. Tear
-                // the stream down rather than grow a buffer the peer controls
-                // the size of. Dropping the chunk quietly is not an option:
-                // its packet is already acked, so it would never be resent.
-                s.send_reset      = true;
-                s.send_reset_code = 1;
-                s.reset_notified  = true;
-                emit(StreamEventKind::Reset, f.stream.id, 1);
+            if (conn_recv_total_ + grow > conn_recv_announced_ ||
+                !s.recv.insert(f.stream.offset, f.stream.data, f.stream.fin)) {
+                abort_on_violation(s, f.stream.id);
                 break;
             }
+            conn_recv_total_ += grow;
+            s.recv_high += grow;
             if (s.recv.readable() > before) emit(StreamEventKind::Readable, f.stream.id);
             if (s.recv.readable() == 0 && s.recv.finished() && !s.fin_notified) {
                 s.fin_notified = true;
@@ -394,6 +453,7 @@ void StreamConnection::handle_frame(const Frame& f, Instant now) {
             auto* sp = ensure_peer_stream(f.reset.id, now);
             if (!sp) break;
             sp->peer_reset = true;
+            settle_conn_credit(*sp, f.reset.final_size);
             if (!sp->reset_notified) {
                 sp->reset_notified = true;
                 emit(StreamEventKind::Reset, f.reset.id, f.reset.error_code);
@@ -437,13 +497,22 @@ void StreamConnection::on_packet_acked(const SentPacket& p) {
     for (const auto& c : p.chunks) {
         // A retired stream is gone from the map; a late ack for it is fine to
         // drop, the data it covers was already accounted for.
-        if (auto* s = find(c.stream_id)) s->send.on_acked(c.offset, c.length);
+        if (auto* s = find(c.stream_id)) s->send.on_acked(c.offset, c.length, c.fin);
     }
 }
 
 void StreamConnection::on_packet_lost(const SentPacket& p) {
     for (const auto& c : p.chunks) {
         if (auto* s = find(c.stream_id)) s->send.on_lost(c.offset, c.length);
+    }
+
+    // A lost window update has to go out again. It was recorded as announced
+    // when written, so nothing else would notice: the sender waits at the old
+    // limit, and our "moved far enough to announce" test is measured against
+    // a value the sender never received.
+    if (p.max_data) send_max_data_ = true;
+    for (StreamId id : p.max_stream_data) {
+        if (auto* s = find(id); s && !s->peer_reset) s->recv.force_window_update();
     }
 }
 
@@ -492,6 +561,7 @@ size_t StreamConnection::poll_datagram(uint64_t pn, std::span<uint8_t> out, Inst
             send_max_data_       = false;
             any                  = true;
             rec.ack_eliciting    = true;
+            rec.max_data         = true;
         }
     }
 
@@ -527,6 +597,7 @@ size_t StreamConnection::poll_datagram(uint64_t pn, std::span<uint8_t> out, Inst
                 s.recv.window_announced();
                 any               = true;
                 rec.ack_eliciting = true;
+                rec.max_stream_data.push_back(id);
             }
         }
     }

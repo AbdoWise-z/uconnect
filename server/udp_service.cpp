@@ -28,10 +28,17 @@ Reply UdpService::encode(const Endpoint& to, wire::MsgType type, uint32_t txn_id
     return Reply{to, finish(w, buf)};
 }
 
-Reply UdpService::make_retry(const Endpoint& to, uint32_t txn_id, Instant now) {
+std::optional<Reply> UdpService::make_retry(const Endpoint& to, uint32_t txn_id, Instant now,
+                                            size_t request_size) {
     wire::Retry r;
-    r.cookie = store_.make_cookie(to, now);
-    return encode(to, wire::MsgType::Retry, txn_id, r);
+    r.cookie   = store_.make_cookie(to, now);
+    auto reply = encode(to, wire::MsgType::Retry, txn_id, r);
+    // The address is unvalidated -- that is why it gets a Retry -- so the
+    // Retry must be no larger than what provoked it, or it is the very
+    // amplifier it exists to prevent. Clients pad their requests to
+    // wire::kMinUnvalidatedRequest; anything shorter is dropped.
+    if (reply.data.size() > request_size) return std::nullopt;
+    return reply;
 }
 
 Reply UdpService::make_error(const Endpoint& to, uint32_t txn_id, ErrorCode code) {
@@ -87,7 +94,17 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
     // Cheap fixed cost for every request, so a flood of tiny messages still
     // draws down the budget.
     if (!consume_budget(from, 64, now)) {
-        out.push_back(make_error(from, h->txn_id, ErrorCode::RateLimited));
+        // Say so at most once a second per source, never per datagram. This
+        // reply goes to an address nothing has validated, and it is larger
+        // than the smallest request that provokes it -- answering each one
+        // turned an exhausted budget into a ~3x reflector aimed at whoever the
+        // source was spoofed to be. A real client learns it is limited either
+        // way.
+        auto& b = buckets_[from.ip.bytes];
+        if (b.last_refusal == Instant{} || now - b.last_refusal >= std::chrono::seconds(1)) {
+            b.last_refusal = now;
+            out.push_back(make_error(from, h->txn_id, ErrorCode::RateLimited));
+        }
         return out;
     }
 
@@ -96,10 +113,10 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             auto m = wire::Register::decode(r, *h);
             if (!m) return out;
             if (!store_.validate_cookie(m->cookie, from, now)) {
-                out.push_back(make_retry(from, h->txn_id, now));
+                if (auto rt = make_retry(from, h->txn_id, now, dgram.size())) out.push_back(std::move(*rt));
                 return out;
             }
-            auto res = store_.register_entry(*m, from, now);
+            auto res = store_.register_entry(*m, from, now, h->txn_id);
             if (res.code != ErrorCode::None) {
                 out.push_back(make_error(from, h->txn_id, res.code));
                 return out;
@@ -167,7 +184,7 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             auto m = wire::Lookup::decode(r, *h);
             if (!m) return out;
             if (!store_.validate_cookie(m->cookie, from, now)) {
-                out.push_back(make_retry(from, h->txn_id, now));
+                if (auto rt = make_retry(from, h->txn_id, now, dgram.size())) out.push_back(std::move(*rt));
                 return out;
             }
             auto res = store_.lookup(m->id, m->max, m->want_meta, now);
@@ -212,7 +229,7 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             auto m = wire::Resolve::decode(r);
             if (!m) return out;
             if (!store_.validate_cookie(m->cookie, from, now)) {
-                out.push_back(make_retry(from, h->txn_id, now));
+                if (auto rt = make_retry(from, h->txn_id, now, dgram.size())) out.push_back(std::move(*rt));
                 return out;
             }
             auto got = store_.resolve(m->dev_id, now);
@@ -230,7 +247,7 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             auto m = wire::Topics::decode(r);
             if (!m) return out;
             if (!store_.validate_cookie(m->cookie, from, now)) {
-                out.push_back(make_retry(from, h->txn_id, now));
+                if (auto rt = make_retry(from, h->txn_id, now, dgram.size())) out.push_back(std::move(*rt));
                 return out;
             }
             auto res = store_.list_topics(m->cursor, m->limit, now);
@@ -320,7 +337,7 @@ std::vector<Reply> UdpService::handle(const Endpoint& from, std::span<const uint
             auto m = wire::Stats::decode(r);
             if (!m) return out;
             if (!store_.validate_cookie(m->cookie, from, now)) {
-                out.push_back(make_retry(from, h->txn_id, now));
+                if (auto rt = make_retry(from, h->txn_id, now, dgram.size())) out.push_back(std::move(*rt));
                 return out;
             }
             auto st = store_.stats(now);
@@ -360,6 +377,11 @@ void UdpService::tick(Instant now) {
     // Prune idle rate-limit state so a long-running server does not accumulate
     // a bucket per address it has ever seen.
     for (auto it = buckets_.begin(); it != buckets_.end();) {
+        if (now - it->second.last > std::chrono::minutes(5)) it = buckets_.erase(it);
+        else ++it;
+    }
+
+    for (auto it = relay_buckets_.begin(); it != relay_buckets_.end();) {
         if (now - it->second.last > std::chrono::minutes(5)) it = buckets_.erase(it);
         else ++it;
     }

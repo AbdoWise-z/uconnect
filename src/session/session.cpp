@@ -187,9 +187,16 @@ std::optional<Session> Session::accept(SessionConfig cfg, const TopicId& topic,
     if (!n) return std::nullopt;
     msg.resize(*n);
 
-    s.out_.push_back({from, encode_handshake_resp(hi->conn_id, msg, h->txn_id)});
+    s.handshake_msg_ = encode_handshake_resp(hi->conn_id, msg, h->txn_id);
+    s.out_.push_back({from, s.handshake_msg_});
     s.finish_handshake(s.handshake_->split(), now);
     return s;
+}
+
+bool Session::resend_handshake_response() {
+    if (initiator_ || state_ == SessionState::Closed || handshake_msg_.empty()) return false;
+    out_.push_back({path_, handshake_msg_});
+    return true;
 }
 
 void Session::finish_handshake(crypto::Split split, Instant now) {
@@ -288,7 +295,7 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
 // Sending
 // ---------------------------------------------------------------------------
 void Session::advance_send_keys(uint64_t counter) {
-    const uint64_t g = counter >> cfg_.rekey_shift;
+    const uint64_t g = generation(counter);
     while (send_gen_ < g) {
         send_cs_.rekey();   // Noise s11.3; one-way, so the old key is gone
         ++send_gen_;
@@ -298,7 +305,7 @@ void Session::advance_send_keys(uint64_t counter) {
 std::optional<size_t> Session::open_packet(uint64_t counter, std::span<const uint8_t> ad,
                                            std::span<const uint8_t> ciphertext,
                                            std::span<uint8_t> out) {
-    const uint64_t g = counter >> cfg_.rekey_shift;
+    const uint64_t g = generation(counter);
 
     // --- select, without touching any state ------------------------------
     const crypto::CipherState* use = nullptr;

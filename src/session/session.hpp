@@ -187,6 +187,14 @@ public:
     // seconds of the peer holding a NAT binding and possibly a relay slot.
     void close_with_notice(uint16_t reason, Instant now);
 
+    // Responder only: queue the HandshakeResp this session answered with,
+    // again. For a HandshakeInit that arrives with this session's conn_id --
+    // the initiator retransmitting because our response was lost. It goes to
+    // the session's own path, not to wherever the init came from, so a
+    // replayed init cannot aim it anywhere. Returns false if there is nothing
+    // to resend (an initiator, or a closed session).
+    bool resend_handshake_response();
+
     std::optional<Outgoing>     poll_transmit();
     std::optional<SessionEvent> poll_event();
     std::optional<Instant>      next_timeout() const;
@@ -214,6 +222,11 @@ public:
     uint64_t messages_sent() const { return send_counter_; }
     uint64_t messages_received() const { return received_; }
 
+    // When the peer last proved itself -- a packet that passed the AEAD, or
+    // the handshake completing. A peer that is alive refreshes this at least
+    // every keepalive interval.
+    Instant last_received() const { return last_recv_; }
+
 private:
     Session(SessionConfig cfg, const DevId& peer, Endpoint path, bool keyed,
             wire::ConnId conn_id);
@@ -225,6 +238,14 @@ private:
     void  queue_keepalive(Instant now);
     void  queue_close(uint16_t reason);
     void  close_with_cause(Instant now, CloseCause, uint16_t peer_reason);
+
+    // The key generation `counter` belongs to. A shift of 64 or more would be
+    // undefined behaviour -- on x86 it wraps to a shift by zero, a new key per
+    // packet -- so it is taken at its word instead: generations wider than the
+    // counter, i.e. never rekey.
+    uint64_t generation(uint64_t counter) const {
+        return cfg_.rekey_shift >= 64 ? 0 : counter >> cfg_.rekey_shift;
+    }
 
     // Ratchet the send key forward to whatever generation `counter` belongs to.
     // The counter advances by one per packet, so this steps at most once and
@@ -253,7 +274,9 @@ private:
     bool          initiator_ = false;
 
     std::optional<crypto::HandshakeState> handshake_;
-    std::vector<uint8_t>                  handshake_msg_;  // retransmit buffer
+    // Retransmit buffer: the initiator's HandshakeInit, or the responder's
+    // HandshakeResp.
+    std::vector<uint8_t>                  handshake_msg_;
     int                                   handshake_attempts_ = 0;
     Instant                               handshake_next_{};
 

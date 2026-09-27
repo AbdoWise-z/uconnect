@@ -362,9 +362,11 @@ public:
         // compromise. Driven by the packet counter, which travels in every
         // header, so both ends agree without negotiating anything.
         //
-        // Must stay above 64 (the replay window width): that is what bounds a
-        // reordered packet to at most one generation old. Lower it only to
-        // exercise the boundary in a test.
+        // A generation must stay above 64 packets (the replay window width):
+        // that is what bounds a reordered packet to at most one generation
+        // old. So the shift must be in 7..63; the Node constructor throws
+        // std::invalid_argument otherwise. 7 is the floor for exercising the
+        // boundary in a test.
         uint8_t rekey_shift = 16;
     };
 
@@ -399,6 +401,16 @@ public:
 
     // Our reflexive address as the server last reported it, once registered.
     std::optional<Endpoint> reflexive() const;
+
+    // Requests to the rendezvous server still awaiting a reply or cleanup.
+    // Diagnostic: on a healthy node this stays small no matter how long it
+    // runs, and growth means requests are being forgotten rather than retired.
+    size_t pending_requests() const;
+
+    // Probe transactions remembered so a handshake bound to one can be
+    // admitted. Diagnostic: bounded however many probes arrive, because
+    // anyone may probe an open topic.
+    size_t answered_probes() const;
 
 private:
     // Topic::Impl holds a Node::Impl* -- a nested class inherits its enclosing

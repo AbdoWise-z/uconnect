@@ -125,15 +125,19 @@ public:
     std::optional<Chunk> next_chunk(size_t max_len);
 
     void on_sent(uint64_t offset, uint64_t length);
-    void on_acked(uint64_t offset, uint64_t length);
+    // `fin` says whether the acked frame carried the FIN; nothing else can
+    // tell, because the last data and the FIN may travel separately.
+    void on_acked(uint64_t offset, uint64_t length, bool fin = false);
     void on_lost(uint64_t offset, uint64_t length);
 
     void set_peer_max(uint64_t m) { if (m > peer_max_) peer_max_ = m; }
     uint64_t peer_max() const { return peer_max_; }
 
-    // True when there is nothing more to send and everything is acknowledged.
+    // True when there is nothing more to send and everything is acknowledged
+    // -- the FIN included. Without that last part a stream whose data was all
+    // acked retired the moment finish() was called, and its FIN never went out.
     bool complete() const {
-        return fin_written_ && sent_ >= written_ && unacked_.empty() && retransmit_.empty();
+        return fin_acked_ && sent_ >= written_ && unacked_.empty() && retransmit_.empty();
     }
     bool has_pending() const { return !retransmit_.empty() || sent_ < written_ || fin_pending(); }
     bool blocked() const { return sent_ >= peer_max_ && sent_ < written_; }

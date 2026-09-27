@@ -147,7 +147,7 @@ bool Store::is_fresh(const Record& r, Instant now) const {
 // register
 // ---------------------------------------------------------------------------
 RegisterResult Store::register_entry(const wire::Register& msg, const Endpoint& src,
-                                     Instant now) {
+                                     Instant now, uint32_t txn_id) {
     RegisterResult out;
     out.srflx = src;
 
@@ -162,6 +162,28 @@ RegisterResult Store::register_entry(const wire::Register& msg, const Endpoint& 
 
     auto existing = by_dev_.find(dev);
     const bool is_new = existing == by_dev_.end();
+
+    // A retransmission of the REGISTER that minted the current lease: same
+    // address, same txn_id, moments later. Answer it with that same lease and
+    // leave the sequence alone. Minting a new one here is what broke slow
+    // links -- the client keeps whichever reply arrives first, the server kept
+    // the last, and every MAC after that failed.
+    //
+    // Only a retransmission. Any other REGISTER still gets a fresh lease and a
+    // reset sequence, so a restarted client never inherits a lease it lost,
+    // and old captured messages never become replayable again.
+    if (!is_new && txn_id != 0) {
+        Record& r = existing->second;
+        if (r.reg_txn == txn_id && r.bound_addr == src &&
+            now - r.reg_at < cfg_.register_retransmit_window) {
+            r.last_seen     = now;
+            out.lease_token = r.lease_token;
+            auto tit        = topics_.find(msg.id);
+            const size_t n  = tit == topics_.end() ? 0 : tit->second.members.size();
+            out.peers_in_topic = static_cast<uint16_t>(n > 0xFFFF ? 0xFFFF : n);
+            return out;
+        }
+    }
 
     if (is_new) {
         // Quotas count only against new records. A device refreshing its own
@@ -212,6 +234,8 @@ RegisterResult Store::register_entry(const wire::Register& msg, const Endpoint& 
     // legitimately owns the record.
     crypto::random_bytes(r.lease_token);
     out.lease_token = r.lease_token;
+    r.reg_txn       = txn_id;
+    r.reg_at        = now;
 
     auto& topic = topics_[msg.id];
     if (topic.members.empty() && std::find(topic_order_.begin(), topic_order_.end(), msg.id) ==
@@ -526,6 +550,15 @@ Store::RelayResult Store::relay_alloc(const DevId& from, const DevId& peer,
     // ones: a retried allocation after a lost reply must not leak a binding.
     for (auto& [id, b] : relays_) {
         if (b.a_dev == from && b.b_dev == peer) {
+            // A binding that has spent its quota is refused, not reused.
+            // Handing it back told the client "all good" and then dropped
+            // every datagram it carried, with no error anywhere. It stops
+            // being in the way once it expires idle, like any other binding.
+            if (b.exhausted) {
+                ++stats_.rej_relay_quota;
+                out.code = ErrorCode::QuotaExceeded;
+                return out;
+            }
             b.last_seen = now;
             b.a_addr    = src;
             out.relay_id = id;
@@ -569,6 +602,7 @@ std::optional<Endpoint> Store::relay_forward(wire::RelayId id, const Endpoint& s
 
     if (b.bytes + bytes > cfg_.relay_max_bytes) {
         ++stats_.rej_relay_quota;
+        b.exhausted = true;
         return std::nullopt;
     }
 

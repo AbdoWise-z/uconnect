@@ -104,8 +104,16 @@ public:
 
     void begin(Instant now);
 
-    // Feed every datagram whose first byte classifies as MsgClass::Probe.
+    // Feed every datagram whose first byte classifies as MsgClass::Probe. An
+    // incoming Probe is answered as well as noted -- right for a session
+    // standing alone, as in the punch tests.
     void on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, Instant now);
+
+    // An incoming Probe from `from`, already answered by the caller: only
+    // bring our next probe to that address forward. A node running several
+    // sessions answers each probe once itself; letting every session answer
+    // too multiplied the replies to a single, possibly spoofed, probe.
+    void on_peer_probe(const Endpoint& from, Instant now);
 
     void on_timeout(Instant now);
 

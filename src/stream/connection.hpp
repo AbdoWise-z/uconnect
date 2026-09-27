@@ -182,6 +182,12 @@ private:
         bool     stop_sent       = false;
 
         bool peer_reset     = false;
+        // The stream's share of connection credit has been returned in full,
+        // at its final size, so later reads must not count it again.
+        bool conn_credit_settled = false;
+        // Highest offset received on this stream, which is what it charges
+        // against the connection-wide receive window.
+        uint64_t recv_high = 0;
         bool was_blocked    = false;
         bool fin_notified   = false;
         bool open_notified  = false;
@@ -212,6 +218,19 @@ private:
     // used to produce an event.
     void notify_writable();
 
+    // Connection-level receive credit. The sender counts a byte against the
+    // connection window when it writes it, so every byte it wrote must come
+    // back here exactly once: as the application reads it, or -- for bytes
+    // that will never be read because the stream was reset -- all at once,
+    // at the final size the reset carries.
+    void consume_conn_credit(uint64_t n);
+    void settle_conn_credit(StreamState&, uint64_t final_size);
+
+    // The peer overran a window we advertised -- a stream's or the
+    // connection's -- or fragmented past the cap. Ends the stream in both
+    // directions, once.
+    void abort_on_violation(StreamState&, StreamId);
+
     void handle_frame(const Frame&, Instant now);
     void on_packet_acked(const SentPacket&);
     void on_packet_lost(const SentPacket&);
@@ -240,6 +259,10 @@ private:
     // Connection-level flow control, layered above the per-stream windows.
     uint64_t conn_recv_consumed_  = 0;
     uint64_t conn_recv_announced_ = 0;
+    // Sum of every stream's highest received offset (its final size, once
+    // reset): what the peer has actually used of the connection window, and
+    // so what must never exceed conn_recv_announced_.
+    uint64_t conn_recv_total_     = 0;
     uint64_t conn_send_max_       = 0;
     uint64_t conn_send_used_      = 0;
     bool     send_max_data_       = false;

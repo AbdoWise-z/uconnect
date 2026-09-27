@@ -9,6 +9,7 @@ add_executable(uconnect_tests
     test_node.cpp
     test_stun.cpp
     test_chat.cpp
+    test_io.cpp
     # The server's STUN client is compiled straight in: it lives in the server
     # executable, not a library, and only its pure classification is tested.
     ${CMAKE_SOURCE_DIR}/server/stun.cpp

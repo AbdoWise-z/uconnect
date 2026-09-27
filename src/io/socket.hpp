@@ -1,9 +1,10 @@
 #pragma once
-// UDP socket and interface enumeration. This is the ONLY place in the library
-// that touches a socket -- everything below it takes bytes and a clock reading
-// as parameters. If a lower layer ever needs to include this header, a layering
-// violation has happened.
+// UDP and TCP sockets, readiness polling, and interface enumeration. This is the
+// ONLY place in the library that touches a socket -- everything below it takes
+// bytes and a clock reading as parameters. If a lower layer ever needs to
+// include this header, a layering violation has happened.
 
+#include <chrono>
 #include <optional>
 #include <span>
 #include <string>
@@ -12,6 +13,11 @@
 #include "uconnect/types.hpp"
 
 namespace uconnect::io {
+
+// A socket as the OS knows it: a SOCKET on Windows, an int elsewhere, carried
+// in one type wide enough for both.
+using NativeSocket = long long;
+inline constexpr NativeSocket kInvalidSocket = -1;
 
 // Resolve "host:port" to an endpoint. Returns nullopt on failure.
 std::optional<Endpoint> resolve(const std::string& host_port);
@@ -60,6 +66,8 @@ public:
 
     std::string last_error() const { return err_; }
 
+    NativeSocket native() const { return fd_; }
+
 private:
     static constexpr long long kInvalid = -1;
 
@@ -68,6 +76,80 @@ private:
     bool        v6_ = false;
     std::string err_;
 };
+
+// A TCP socket. Non-blocking throughout: nothing here ever waits, which is what
+// lets one thread drive a listener, a server connection and every peer
+// connection at once. Readiness comes from io::poll().
+class TcpSocket {
+public:
+    TcpSocket();
+    ~TcpSocket();
+    TcpSocket(const TcpSocket&)            = delete;
+    TcpSocket& operator=(const TcpSocket&) = delete;
+    TcpSocket(TcpSocket&&) noexcept;
+    TcpSocket& operator=(TcpSocket&&) noexcept;
+
+    // Create the socket and bind it to `port` (0 = ephemeral) with address
+    // reuse on. A node's listener, its connection to the rendezvous server and
+    // every punch attempt share ONE local port: the NAT mapping that port gets
+    // is the address peers are told to dial, so an attempt from any other
+    // port would present an address nobody knows. Every socket sharing a port
+    // must be opened the same way, so `v6` defaults to the dual-stack IPv6
+    // socket that also reaches IPv4.
+    bool open(uint16_t port, bool v6 = true);
+
+    bool listen(int backlog = 32);
+
+    // A waiting inbound connection, or nullopt if there is none right now.
+    std::optional<TcpSocket> accept();
+
+    // Start a non-blocking connect. False means it failed at once; otherwise
+    // watch state() -- or poll() for writability -- to see how it ends.
+    bool connect(const Endpoint& to);
+
+    enum class State : uint8_t { Idle, Connecting, Connected, Failed };
+    // Advances Connecting to Connected or Failed once the outcome is known.
+    State state();
+
+    // Bytes moved; 0 means the call would block. Nullopt means the connection
+    // is over -- closed by the peer, or failed -- and the socket should go.
+    std::optional<size_t> send(std::span<const uint8_t>);
+    std::optional<size_t> recv(std::span<uint8_t>);
+
+    void close();
+
+    bool                    is_open() const { return fd_ != kInvalidSocket; }
+    uint16_t                local_port() const { return local_port_; }
+    std::optional<Endpoint> remote() const;
+    NativeSocket            native() const { return fd_; }
+    std::string             last_error() const { return err_; }
+
+private:
+    explicit TcpSocket(NativeSocket accepted, bool v6);
+    void set_connected_options();
+
+    NativeSocket fd_         = kInvalidSocket;
+    uint16_t     local_port_ = 0;
+    bool         v6_         = false;
+    State        state_      = State::Idle;
+    std::string  err_;
+};
+
+// One socket's interest and, after poll(), its readiness.
+struct PollItem {
+    NativeSocket fd         = kInvalidSocket;
+    bool         want_read  = false;
+    bool         want_write = false;
+
+    bool readable = false;
+    bool writable = false;
+    bool failed   = false;  // error or hang-up; a recv/send will say which
+};
+
+// Wait until at least one item is ready or `timeout` passes, then report on
+// every item. Built on poll()/WSAPoll rather than select(), which on Windows
+// stops at 64 sockets -- fewer than a busy node can hold. False on error.
+bool poll(std::span<PollItem> items, std::chrono::milliseconds timeout);
 
 // One-time platform init (WSAStartup on Windows). Safe to call repeatedly.
 bool init_networking();

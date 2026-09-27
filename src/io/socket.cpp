@@ -1,6 +1,9 @@
 #include "socket.hpp"
 
+#include <algorithm>
+#include <climits>
 #include <cstring>
+#include <thread>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -27,6 +30,8 @@ using socklen_type = int;
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -389,6 +394,316 @@ bool UdpSocket::wait_readable(std::chrono::milliseconds timeout) {
         ptv        = &tv;
     }
     return ::select(nfds, &rd, nullptr, nullptr, ptv) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// TcpSocket
+// ---------------------------------------------------------------------------
+namespace {
+
+#if defined(_WIN32)
+using RawSocket = SOCKET;
+RawSocket raw(NativeSocket s) { return static_cast<SOCKET>(s); }
+int       last_socket_error() { return WSAGetLastError(); }
+bool      would_block(int e) { return e == WSAEWOULDBLOCK; }
+bool      in_progress(int e) { return e == WSAEWOULDBLOCK || e == WSAEINPROGRESS; }
+#else
+using RawSocket = int;
+RawSocket raw(NativeSocket s) { return static_cast<int>(s); }
+int       last_socket_error() { return errno; }
+bool      would_block(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
+bool      in_progress(int e) { return e == EINPROGRESS; }
+#endif
+
+void set_nonblocking(RawSocket s) {
+#if defined(_WIN32)
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+// Let several sockets bind the one port a node punches from.
+void set_port_sharing(RawSocket s) {
+    int on = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on), sizeof(on));
+#if !defined(_WIN32) && defined(SO_REUSEPORT)
+    // Linux refuses a second bind to a port that has a listener unless every
+    // socket on it sets SO_REUSEPORT as well; SO_REUSEADDR alone is not enough.
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#endif
+}
+
+uint16_t bound_port(RawSocket s) {
+    sockaddr_storage b{};
+    socklen_type     len = sizeof(b);
+    if (::getsockname(s, reinterpret_cast<sockaddr*>(&b), &len) != 0) return 0;
+    auto ep = from_sockaddr(b);
+    return ep ? ep->port : 0;
+}
+
+}  // namespace
+
+TcpSocket::TcpSocket() { init_networking(); }
+TcpSocket::~TcpSocket() { close(); }
+
+TcpSocket::TcpSocket(NativeSocket accepted, bool v6)
+    : fd_(accepted), v6_(v6), state_(State::Connected) {
+    set_nonblocking(raw(fd_));
+    set_connected_options();
+    local_port_ = bound_port(raw(fd_));
+}
+
+TcpSocket::TcpSocket(TcpSocket&& o) noexcept
+    : fd_(o.fd_), local_port_(o.local_port_), v6_(o.v6_), state_(o.state_),
+      err_(std::move(o.err_)) {
+    o.fd_    = kInvalidSocket;
+    o.state_ = State::Idle;
+}
+
+TcpSocket& TcpSocket::operator=(TcpSocket&& o) noexcept {
+    if (this != &o) {
+        close();
+        fd_         = o.fd_;
+        local_port_ = o.local_port_;
+        v6_         = o.v6_;
+        state_      = o.state_;
+        err_        = std::move(o.err_);
+        o.fd_       = kInvalidSocket;
+        o.state_    = State::Idle;
+    }
+    return *this;
+}
+
+bool TcpSocket::open(uint16_t port, bool v6) {
+    close();
+
+    RawSocket s = UC_INVALID;
+    v6_         = false;
+    if (v6) {
+        s   = ::socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+        v6_ = s != UC_INVALID;
+    }
+    if (s == UC_INVALID) {
+        s   = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        v6_ = false;
+    }
+    if (s == UC_INVALID) {
+        err_ = "socket() failed";
+        return false;
+    }
+    if (v6_) {
+        int off = 0;
+        ::setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&off),
+                     sizeof(off));
+    }
+    set_port_sharing(s);
+    set_nonblocking(s);
+
+    sockaddr_storage ss{};
+    socklen_type     len;
+    if (v6_) {
+        auto* a        = reinterpret_cast<sockaddr_in6*>(&ss);
+        a->sin6_family = AF_INET6;
+        a->sin6_addr   = in6addr_any;
+        a->sin6_port   = htons(port);
+        len            = sizeof(sockaddr_in6);
+    } else {
+        auto* a            = reinterpret_cast<sockaddr_in*>(&ss);
+        a->sin_family      = AF_INET;
+        a->sin_addr.s_addr = INADDR_ANY;
+        a->sin_port        = htons(port);
+        len                = sizeof(sockaddr_in);
+    }
+    if (::bind(s, reinterpret_cast<sockaddr*>(&ss), len) != 0) {
+        err_ = "bind() failed: " + std::to_string(last_socket_error());
+        UC_CLOSE(s);
+        return false;
+    }
+
+    fd_         = static_cast<NativeSocket>(s);
+    local_port_ = bound_port(s);
+    state_      = State::Idle;
+    return true;
+}
+
+bool TcpSocket::listen(int backlog) {
+    if (!is_open()) return false;
+    if (::listen(raw(fd_), backlog) != 0) {
+        err_ = "listen() failed: " + std::to_string(last_socket_error());
+        return false;
+    }
+    return true;
+}
+
+std::optional<TcpSocket> TcpSocket::accept() {
+    if (!is_open()) return std::nullopt;
+    sockaddr_storage ss{};
+    socklen_type     len = sizeof(ss);
+    RawSocket        s   = ::accept(raw(fd_), reinterpret_cast<sockaddr*>(&ss), &len);
+    if (s == UC_INVALID) return std::nullopt;
+    return TcpSocket{static_cast<NativeSocket>(s), v6_};
+}
+
+bool TcpSocket::connect(const Endpoint& to) {
+    if (!is_open()) return false;
+    if (!v6_ && to.ip.family == IpAddr::Family::V6) {
+        err_   = "IPv6 target on an IPv4-only socket";
+        state_ = State::Failed;
+        return false;
+    }
+    sockaddr_storage ss{};
+    socklen_type     len = to_sockaddr(to, v6_, ss);
+    if (::connect(raw(fd_), reinterpret_cast<sockaddr*>(&ss), len) == 0) {
+        state_ = State::Connected;
+        set_connected_options();
+        return true;
+    }
+    const int e = last_socket_error();
+    if (in_progress(e)) {
+        state_ = State::Connecting;
+        return true;
+    }
+    err_   = "connect() failed: " + std::to_string(e);
+    state_ = State::Failed;
+    return false;
+}
+
+TcpSocket::State TcpSocket::state() {
+    if (state_ != State::Connecting) return state_;
+
+    PollItem it;
+    it.fd         = fd_;
+    it.want_write = true;
+    if (!poll(std::span(&it, 1), std::chrono::milliseconds(0))) return state_;
+    if (!it.writable && !it.failed) return state_;  // still going
+
+    int          so_error = 0;
+    socklen_type len      = sizeof(so_error);
+    ::getsockopt(raw(fd_), SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &len);
+    if (so_error == 0 && !it.failed) {
+        state_ = State::Connected;
+        set_connected_options();
+    } else {
+        err_   = "connect failed: " + std::to_string(so_error);
+        state_ = State::Failed;
+    }
+    return state_;
+}
+
+std::optional<size_t> TcpSocket::send(std::span<const uint8_t> data) {
+    if (!is_open()) return std::nullopt;
+    if (state_ == State::Connecting) state();
+    if (state_ != State::Connected) return state_ == State::Failed ? std::nullopt
+                                                                   : std::optional<size_t>(0);
+    if (data.empty()) return 0;
+#if defined(_WIN32)
+    const int want = static_cast<int>(std::min<size_t>(data.size(), INT_MAX));
+    const int n    = ::send(raw(fd_), reinterpret_cast<const char*>(data.data()), want, 0);
+#else
+    int flags = 0;
+#if defined(MSG_NOSIGNAL)
+    // A write to a connection the peer has closed would otherwise raise
+    // SIGPIPE and kill the process.
+    flags |= MSG_NOSIGNAL;
+#endif
+    const auto n = ::send(raw(fd_), data.data(), data.size(), flags);
+#endif
+    if (n >= 0) return static_cast<size_t>(n);
+    if (would_block(last_socket_error())) return 0;
+    return std::nullopt;
+}
+
+std::optional<size_t> TcpSocket::recv(std::span<uint8_t> out) {
+    if (!is_open()) return std::nullopt;
+    if (out.empty()) return 0;
+#if defined(_WIN32)
+    const int want = static_cast<int>(std::min<size_t>(out.size(), INT_MAX));
+    const int n    = ::recv(raw(fd_), reinterpret_cast<char*>(out.data()), want, 0);
+#else
+    const auto n = ::recv(raw(fd_), out.data(), out.size(), 0);
+#endif
+    if (n > 0) return static_cast<size_t>(n);
+    if (n == 0) return std::nullopt;  // orderly close by the peer
+    if (would_block(last_socket_error())) return 0;
+    return std::nullopt;
+}
+
+void TcpSocket::close() {
+    if (fd_ == kInvalidSocket) return;
+    UC_CLOSE(raw(fd_));
+    fd_    = kInvalidSocket;
+    state_ = State::Idle;
+}
+
+std::optional<Endpoint> TcpSocket::remote() const {
+    if (!is_open()) return std::nullopt;
+    sockaddr_storage ss{};
+    socklen_type     len = sizeof(ss);
+    if (::getpeername(raw(fd_), reinterpret_cast<sockaddr*>(&ss), &len) != 0) return std::nullopt;
+    return from_sockaddr(ss);
+}
+
+void TcpSocket::set_connected_options() {
+    // Messages are small and latency matters more than packing them; Nagle
+    // would hold a short reply back waiting for an ack.
+    int on = 1;
+    ::setsockopt(raw(fd_), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on),
+                 sizeof(on));
+}
+
+// ---------------------------------------------------------------------------
+// poll
+// ---------------------------------------------------------------------------
+bool poll(std::span<PollItem> items, std::chrono::milliseconds timeout) {
+#if defined(_WIN32)
+    using PollFd = WSAPOLLFD;
+#else
+    using PollFd = pollfd;
+#endif
+    std::vector<PollFd> fds;
+    std::vector<size_t> index;
+    fds.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto& it    = items[i];
+        it.readable = it.writable = it.failed = false;
+        if (it.fd == kInvalidSocket) continue;
+        PollFd p{};
+        p.fd     = raw(it.fd);
+        p.events = static_cast<short>((it.want_read ? POLLIN : 0) | (it.want_write ? POLLOUT : 0));
+        fds.push_back(p);
+        index.push_back(i);
+    }
+
+    // Nothing to watch: honour the timeout anyway, since callers use this as
+    // their loop's tick.
+    if (fds.empty()) {
+        if (timeout.count() > 0) std::this_thread::sleep_for(timeout);
+        return true;
+    }
+
+    const int ms = timeout.count() < 0 ? -1
+                                       : static_cast<int>(std::min<long long>(timeout.count(), INT_MAX));
+#if defined(_WIN32)
+    const int n = ::WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), ms);
+#else
+    const int n = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), ms);
+#endif
+    if (n < 0) return false;
+
+    for (size_t k = 0; k < fds.size(); ++k) {
+        auto&      it = items[index[k]];
+        const auto re = fds[k].revents;
+        it.readable   = (re & POLLIN) != 0;
+        it.writable   = (re & POLLOUT) != 0;
+        it.failed     = (re & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+        // A hang-up with nothing left to read still has to reach recv(), which
+        // is where the caller learns the connection is over.
+        if (it.failed && it.want_read) it.readable = true;
+    }
+    return true;
 }
 
 }  // namespace uconnect::io

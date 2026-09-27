@@ -1564,18 +1564,18 @@ uint32_t Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, Instant 
     auto build = [this, tid, txn](const std::vector<uint8_t>& ck) {
         auto it = topics.find(tid);
         if (it == topics.end()) return std::vector<uint8_t>{};
-        const auto& ti = *it->second->impl_;
+        const auto& topic = *it->second->impl_;
 
         std::vector<uint8_t> buf(wire::kMaxDatagram);
         wire::Writer         w{buf};
-        uint8_t flags = ti.unlisted ? wire::flags::kUnlisted : 0;
+        uint8_t flags = topic.unlisted ? wire::flags::kUnlisted : 0;
         wire::Header{wire::MsgType::Register, wire::kVersion, flags, txn}.encode(w);
         wire::Register m;
         m.id         = tid;
-        m.mode       = ti.keyed ? TopicMode::Keyed : TopicMode::Open;
-        m.unlisted   = ti.unlisted;
+        m.mode       = topic.keyed ? TopicMode::Keyed : TopicMode::Open;
+        m.unlisted   = topic.unlisted;
         m.host_cands = host_cands;
-        m.meta       = ti.meta;
+        m.meta       = topic.meta;
         m.cookie     = ck;
         m.encode(w);
         if (!w.ok()) return std::vector<uint8_t>{};

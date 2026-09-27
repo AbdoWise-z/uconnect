@@ -71,6 +71,12 @@ enum class MsgType : uint8_t {
     Retry         = 0x13, Error         = 0x14,
     RelayAlloc    = 0x15, RelayAllocOk  = 0x16,
     RelayData     = 0x17,
+    // --- control protocol v2 only (control.hpp) ---
+    RelayOffer    = 0x18,  // server -> peer: a relay was allocated to reach you
+    RelayJoin     = 0x19,  // first frame on a relay connection
+    RelayJoinOk   = 0x1A,  // both sides joined; raw bytes from here on
+    WhoAmI        = 0x1B, WhoAmIOk      = 0x1C,  // UDP: learn our UDP mapping
+    UdpRelayBind  = 0x1D, UdpRelayBindOk = 0x1E, // UDP: claim a UDP relay slot
     // --- peer probe ---
     Probe         = 0x20, ProbeOk       = 0x21,
     // --- noise ---
@@ -118,14 +124,16 @@ struct Header {
         w.u32(txn_id);
     }
 
-    static std::optional<Header> decode(Reader& r) {
+    // `version` is the protocol the caller speaks: v1 for this UDP signaling,
+    // v2 for the TCP control protocol (control.hpp), which shares the header.
+    static std::optional<Header> decode(Reader& r, uint8_t version = kVersion) {
         Header h;
         h.type    = static_cast<MsgType>(r.u8());
         h.version = r.u8();
         h.flags   = r.u8();
         r.u8();  // reserved
         h.txn_id = r.u32();
-        if (!r.ok() || h.version != kVersion) return std::nullopt;
+        if (!r.ok() || h.version != version) return std::nullopt;
         if (classify(static_cast<uint8_t>(h.type)) == MsgClass::Unknown) return std::nullopt;
         return h;
     }

@@ -2,6 +2,7 @@
 # something has leaked downward.
 add_library(uconnect_wire STATIC
     messages.cpp
+    control.cpp
     types.cpp
 )
 target_include_directories(uconnect_wire

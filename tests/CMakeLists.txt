@@ -11,11 +11,13 @@ add_executable(uconnect_tests
     test_chat.cpp
     test_io.cpp
     test_control.cpp
+    test_registry.cpp
+    test_rendezvous.cpp
     # The server's STUN client is compiled straight in: it lives in the server
     # executable, not a library, and only its pure classification is tested.
     ${CMAKE_SOURCE_DIR}/server/stun.cpp
 )
-target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect_stream uconnect)
+target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect_stream uconnect uconnect_rendezvous)
 target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 uconnect_bundle_runtime(uconnect_tests)
 add_test(NAME uconnect_tests COMMAND uconnect_tests)

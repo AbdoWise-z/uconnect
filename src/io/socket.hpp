@@ -98,7 +98,11 @@ public:
     // socket that also reaches IPv4.
     bool open(uint16_t port, bool v6 = true);
 
-    bool listen(int backlog = 32);
+    // Connections the kernel holds for accept(). A burst beyond it is not
+    // refused: Linux drops the handshake's last packet and retransmits on a
+    // backoff, so the overflow arrives seconds late. A node that dials many
+    // peers at once gets such a burst back, hence the room.
+    bool listen(int backlog = 128);
 
     // A waiting inbound connection, or nullopt if there is none right now.
     std::optional<TcpSocket> accept();

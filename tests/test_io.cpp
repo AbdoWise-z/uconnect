@@ -212,9 +212,14 @@ TEST(tcp_two_sides_dialling_each_other_at_once_get_connected) {
 
 TEST(poll_reports_readiness_for_many_sockets) {
     // More sockets than select() manages on Windows (64).
+    //
+    // The backlog must hold the whole burst. With 32, Linux accepted 66 of the
+    // 80 within the deadline: the overflow's handshakes are completed by
+    // retransmission, seconds later -- which on one kernel happened to beat
+    // the deadline and on another did not.
     TcpSocket listener;
     REQUIRE(listener.open(0));
-    REQUIRE(listener.listen());
+    REQUIRE(listener.listen(128));
 
     std::vector<TcpSocket> clients(80);
     for (auto& c : clients) {

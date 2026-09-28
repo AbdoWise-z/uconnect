@@ -333,16 +333,22 @@ std::optional<TcpEvent> TcpSession::poll_event() {
     return e;
 }
 
-TcpSession::DatagramKeys TcpSession::datagram_keys() const {
+TcpSession::DatagramKeys TcpSession::datagram_keys(uint32_t epoch) const {
     // Each from the exported secret under its own label: the UDP channel
     // shares no key with this one, and its two directions share none either.
+    // The epoch is the salt, so every channel opened on this session gets
+    // keys of its own.
+    const std::array<uint8_t, 4> salt{static_cast<uint8_t>(epoch >> 24),
+                                      static_cast<uint8_t>(epoch >> 16),
+                                      static_cast<uint8_t>(epoch >> 8),
+                                      static_cast<uint8_t>(epoch)};
     DatagramKeys k;
     crypto::SymKey i2r{}, r2i{};
-    crypto::hkdf(exported_, {}, "uconnect:v2:udp:i2r", i2r);
-    crypto::hkdf(exported_, {}, "uconnect:v2:udp:r2i", r2i);
-    crypto::hkdf(exported_, {}, "uconnect:v2:udp:probe", k.probe);
+    crypto::hkdf(exported_, salt, "uconnect:v2:udp:i2r", i2r);
+    crypto::hkdf(exported_, salt, "uconnect:v2:udp:r2i", r2i);
+    crypto::hkdf(exported_, salt, "uconnect:v2:udp:probe", k.probe);
     std::array<uint8_t, 4> id{};
-    crypto::hkdf(exported_, {}, "uconnect:v2:udp:conn", id);
+    crypto::hkdf(exported_, salt, "uconnect:v2:udp:conn", id);
     k.conn_id = static_cast<uint32_t>(id[0]) << 24 | static_cast<uint32_t>(id[1]) << 16 |
                 static_cast<uint32_t>(id[2]) << 8 | id[3];
     k.send = initiator_ ? i2r : r2i;

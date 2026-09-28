@@ -24,8 +24,8 @@
 //     derived from the PSK alone, before any DH has happened. Send padding
 //     only; put real data in the first transport message.
 //  2. Message 1 is replayable and costs the responder a DH. The caller must
-//     gate handshake acceptance on a completed probe exchange -- see
-//     Session::accept() in the path layer.
+//     gate handshake acceptance on something fresh -- TcpSession binds it to a
+//     single-use attempt nonce issued with the introduction.
 
 #include <optional>
 
@@ -121,10 +121,10 @@ class HandshakeState {
 public:
     // prologue is mixed in before anything else, so both sides must agree on it
     // or the handshake fails cryptographically rather than via a check someone
-    // might forget to write. uConnect sets it to
-    //   "uconnect:v1" || topic_id || key_epoch || probe_txn
-    // which binds the session to the topic, the key epoch, and the specific
-    // validated path.
+    // might forget to write. TcpSession sets it to
+    //   "uconnect:v2:tcp" || topic_id || key_epoch || attempt nonce
+    // which binds the session to the topic, the key epoch, and the one
+    // introduction it answers.
     static HandshakeState initiator(Pattern, std::span<const uint8_t> prologue,
                                     const SymKey* psk);
     static HandshakeState responder(Pattern, std::span<const uint8_t> prologue,

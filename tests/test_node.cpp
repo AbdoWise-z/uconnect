@@ -270,12 +270,15 @@ TEST(node_keeps_a_control_connection_to_the_server) {
     CHECK_EQ(srv.connections(), 1u);
 }
 
+// In the tests below, whatever a callback touches is declared before the Pair,
+// so it outlives the nodes whose loop threads call it.
+
 TEST(two_nodes_punch_a_direct_connection_and_exchange_messages) {
-    LocalServer srv;
-    Pair        p{srv, /*force_relay=*/false};
+    LocalServer      srv;
+    std::atomic<int> got{0};
+    Pair             p{srv, /*force_relay=*/false};
     REQUIRE(p.publish());
 
-    std::atomic<int> got{0};
     p.b->on_data([&](DevId, std::span<const uint8_t> d) {
         if (std::string(d.begin(), d.end()) == "hello") ++got;
     });
@@ -292,11 +295,11 @@ TEST(two_nodes_punch_a_direct_connection_and_exchange_messages) {
 }
 
 TEST(messages_reach_a_peer_over_the_relay) {
-    LocalServer srv;
-    Pair        p{srv, /*force_relay=*/true};
+    LocalServer      srv;
+    std::atomic<int> got{0};
+    Pair             p{srv, /*force_relay=*/true};
     REQUIRE(p.publish());
 
-    std::atomic<int> got{0};
     p.b->on_data([&](DevId, std::span<const uint8_t> d) {
         if (std::string(d.begin(), d.end()) == "hello") ++got;
     });
@@ -313,12 +316,12 @@ TEST(messages_reach_a_peer_over_the_relay) {
 }
 
 TEST(messages_arrive_whole_once_and_in_order) {
-    LocalServer srv;
-    Pair        p{srv, /*force_relay=*/false};
-    REQUIRE(p.publish());
-
+    LocalServer                       srv;
     std::mutex                        mu;
     std::vector<std::vector<uint8_t>> seen;
+    Pair                              p{srv, /*force_relay=*/false};
+    REQUIRE(p.publish());
+
     p.b->on_data([&](DevId, std::span<const uint8_t> d) {
         std::lock_guard<std::mutex> lk(mu);
         seen.emplace_back(d.begin(), d.end());
@@ -348,11 +351,11 @@ TEST(messages_arrive_whole_once_and_in_order) {
 TEST(both_sides_connecting_at_once_end_on_one_session) {
     // Each side CONNECTs with its own attempt nonce; they must settle on one,
     // not two sessions each missing half the traffic.
-    LocalServer srv;
-    Pair        p{srv, /*force_relay=*/false};
+    LocalServer      srv;
+    std::atomic<int> at_a{0}, at_b{0};
+    Pair             p{srv, /*force_relay=*/false};
     REQUIRE(p.publish());
 
-    std::atomic<int> at_a{0}, at_b{0};
     p.a->on_data([&](DevId, std::span<const uint8_t>) { ++at_a; });
     p.b->on_data([&](DevId, std::span<const uint8_t>) { ++at_b; });
     REQUIRE(connect_pair(*p.a, *p.b));
@@ -379,11 +382,11 @@ TEST(an_open_topic_shows_both_ends_the_same_sas) {
 
 TEST(a_disconnect_notice_reaches_the_peer_directly_and_over_the_relay) {
     for (bool relay : {false, true}) {
-        LocalServer srv;
-        Pair        p{srv, relay};
+        LocalServer       srv;
+        std::atomic<bool> told{false};
+        Pair              p{srv, relay};
         REQUIRE(p.publish());
 
-        std::atomic<bool> told{false};
         p.b->on_peer_closed([&](DevId, PeerGone why) {
             if (why == PeerGone::GoingAway) told = true;
         });
@@ -396,11 +399,11 @@ TEST(a_disconnect_notice_reaches_the_peer_directly_and_over_the_relay) {
 }
 
 TEST(a_shutdown_tells_peers_the_node_is_exiting) {
-    LocalServer srv;
-    Pair        p{srv, /*force_relay=*/false};
+    LocalServer       srv;
+    std::atomic<bool> told{false};
+    Pair              p{srv, /*force_relay=*/false};
     REQUIRE(p.publish());
 
-    std::atomic<bool> told{false};
     p.b->on_peer_closed([&](DevId, PeerGone why) {
         if (why == PeerGone::ShuttingDown) told = true;
     });
@@ -412,11 +415,11 @@ TEST(a_shutdown_tells_peers_the_node_is_exiting) {
 TEST(a_relayed_peer_can_be_reconnected_after_its_session_ends) {
     // #11. Once a relayed connection ended, that peer could never be reached
     // again for the life of the node.
-    LocalServer srv;
-    Pair        p{srv, /*force_relay=*/true};
+    LocalServer       srv;
+    std::atomic<bool> closed{false};
+    Pair              p{srv, /*force_relay=*/true};
     REQUIRE(p.publish());
 
-    std::atomic<bool> closed{false};
     p.b->on_peer_closed([&](DevId, PeerGone) { closed = true; });
 
     REQUIRE(connect_pair(*p.a, *p.b));
@@ -592,6 +595,216 @@ TEST(a_silent_inbound_connection_does_not_linger_forever) {
     REQUIRE(idle.connected());
     // Nothing sent. The node gives it ten seconds to identify itself.
     CHECK(idle.closed_within(12s));
+}
+
+// ---------------------------------------------------------------------------
+// Datagrams
+// ---------------------------------------------------------------------------
+namespace {
+
+// A connected pair, with every datagram each side receives collected.
+//
+// What the callbacks write to is declared BEFORE the nodes, so it is destroyed
+// after them: until a node has shut down, its loop thread may still call in.
+struct DgramPair {
+    LocalServer&              srv;
+    std::mutex                mu;
+    std::vector<std::string>  at_a, at_b;
+    std::vector<DatagramPath> paths_b;
+    Node                      na;
+    Node                      nb;
+    Topic*                    a = nullptr;
+    Topic*                    b = nullptr;
+
+    DgramPair(LocalServer& s, Node::Config ca, Node::Config cb)
+        : srv(s), na{std::move(ca)}, nb{std::move(cb)} {
+        na.run_in_background();
+        nb.run_in_background();
+        const auto creds = TopicCreds::generate_keyed();
+        a = &na.join(creds);
+        b = &nb.join(creds);
+        a->on_datagram([this](DevId, std::span<const uint8_t> d) {
+            std::lock_guard<std::mutex> lk(mu);
+            at_a.emplace_back(d.begin(), d.end());
+        });
+        b->on_datagram([this](DevId, std::span<const uint8_t> d) {
+            std::lock_guard<std::mutex> lk(mu);
+            at_b.emplace_back(d.begin(), d.end());
+        });
+        b->on_datagram_path([this](DevId, DatagramPath p) {
+            std::lock_guard<std::mutex> lk(mu);
+            paths_b.push_back(p);
+        });
+    }
+    bool connect() { return a->publish() && b->publish() && connect_pair(*a, *b); }
+    DevId ida() const { return *a->self(); }
+    DevId idb() const { return *b->self(); }
+
+    bool settled(DatagramPath want, std::chrono::milliseconds t = 15s) {
+        return wait_until([&] {
+            return a->datagram_path(idb()) == want && b->datagram_path(ida()) == want;
+        }, t);
+    }
+    size_t count_a() { std::lock_guard<std::mutex> lk(mu); return at_a.size(); }
+    size_t count_b() { std::lock_guard<std::mutex> lk(mu); return at_b.size(); }
+};
+
+Node::Config dgram_config(const LocalServer& srv, bool force_relay, DatagramFallback fb) {
+    Node::Config c       = config_for(srv, force_relay);
+    c.datagram_fallback  = fb;
+    c.verbose            = std::getenv("UCONNECT_TEST_VERBOSE") != nullptr;
+    return c;
+}
+
+}  // namespace
+
+TEST(datagrams_punch_a_direct_udp_path_and_flow_both_ways) {
+    LocalServer srv;
+    DgramPair   p{srv, config_for(srv), config_for(srv)};
+    REQUIRE(p.connect());
+    CHECK(p.a->datagram_path(p.idb()) == DatagramPath::None);
+
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::None));
+    REQUIRE(p.settled(DatagramPath::Direct));
+
+    // Unreliable, so send a few and ask for most.
+    for (int i = 0; i < 20; ++i) {
+        CHECK(p.a->send_datagram(p.idb(), bytes("ping")));
+        CHECK(p.b->send_datagram(p.ida(), bytes("pong")));
+        std::this_thread::sleep_for(5ms);
+    }
+    CHECK(wait_until([&] { return p.count_a() >= 15 && p.count_b() >= 15; }, 3s));
+    CHECK(p.a->link(p.idb())->datagrams_sent == 20u);
+    CHECK(p.b->link(p.ida())->datagrams_received >= 15u);
+
+    // The accepting side reported its path as it went.
+    std::lock_guard<std::mutex> lk(p.mu);
+    REQUIRE(!p.paths_b.empty());
+    CHECK(p.paths_b.front() == DatagramPath::Opening);
+    CHECK(p.paths_b.back() == DatagramPath::Direct);
+}
+
+TEST(datagrams_fall_back_over_tcp_when_udp_cannot_be_punched) {
+    LocalServer srv;
+    DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                  dgram_config(srv, true, DatagramFallback::Tcp)};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
+    REQUIRE(p.settled(DatagramPath::Tcp));
+
+    CHECK(p.a->send_datagram(p.idb(), bytes("over tcp")));
+    CHECK(p.b->send_datagram(p.ida(), bytes("and back")));
+    CHECK(wait_until([&] { return p.count_a() == 1 && p.count_b() == 1; }, 3s));
+    std::lock_guard<std::mutex> lk(p.mu);
+    CHECK(p.at_b.front() == "over tcp");
+}
+
+TEST(datagrams_fall_back_to_the_udp_relay_when_asked_to) {
+    LocalServer srv;
+    DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::Relay),
+                  dgram_config(srv, true, DatagramFallback::Relay)};
+    REQUIRE(p.connect());
+    const auto tcp_relays = srv.stats().relays_allocated;
+
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Relay));
+    REQUIRE(p.settled(DatagramPath::Relayed));
+    CHECK(srv.stats().relays_allocated == tcp_relays + 1);  // one binding, both sides
+
+    for (int i = 0; i < 10; ++i) {
+        CHECK(p.a->send_datagram(p.idb(), bytes("via relay")));
+        CHECK(p.b->send_datagram(p.ida(), bytes("via relay too")));
+    }
+    CHECK(wait_until([&] { return p.count_a() >= 8 && p.count_b() >= 8; }, 3s));
+}
+
+TEST(datagrams_with_no_fallback_report_failure_and_refuse_to_send) {
+    LocalServer srv;
+    DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::None),
+                  dgram_config(srv, true, DatagramFallback::None)};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::None));
+    REQUIRE(p.settled(DatagramPath::Failed));
+    CHECK(!p.a->send_datagram(p.idb(), bytes("nowhere to go")));
+}
+
+TEST(each_side_applies_its_own_fallback) {
+    // A chose TCP for itself; B's configuration says relay. A sends over TCP,
+    // B through the relay, and both arrive -- the receiver takes datagrams by
+    // whatever way they come.
+    LocalServer srv;
+    DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                  dgram_config(srv, true, DatagramFallback::Relay)};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
+    CHECK(wait_until([&] {
+        return p.a->datagram_path(p.idb()) == DatagramPath::Tcp &&
+               p.b->datagram_path(p.ida()) == DatagramPath::Relayed;
+    }, 15s));
+    CHECK(p.a->send_datagram(p.idb(), bytes("a")));
+    CHECK(p.b->send_datagram(p.ida(), bytes("b")));
+    CHECK(wait_until([&] { return p.count_a() == 1 && p.count_b() == 1; }, 3s));
+}
+
+TEST(a_datagram_channel_closes_on_both_ends_and_can_be_opened_again) {
+    // Reopening keys the channel under a new epoch. Under the old keys its
+    // counter would start from zero again, reusing every nonce -- and the
+    // peer's replay window would silently drop what it had already seen.
+    LocalServer srv;
+    DgramPair   p{srv, config_for(srv), config_for(srv)};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::None));
+    REQUIRE(p.settled(DatagramPath::Direct));
+    for (int i = 0; i < 5; ++i) p.a->send_datagram(p.idb(), bytes("first"));
+    REQUIRE(wait_until([&] { return p.count_b() >= 3; }, 3s));
+
+    p.a->close_datagrams(p.idb());
+    REQUIRE(p.settled(DatagramPath::None, 3s));
+    CHECK(!p.a->send_datagram(p.idb(), bytes("closed")));
+
+    const size_t before = p.count_b();
+    REQUIRE(p.b->open_datagrams(p.ida(), DatagramFallback::None));  // from the other side
+    REQUIRE(p.settled(DatagramPath::Direct));
+    for (int i = 0; i < 5; ++i) p.a->send_datagram(p.idb(), bytes("second"));
+    CHECK(wait_until([&] { return p.count_b() >= before + 3; }, 3s));
+}
+
+TEST(datagrams_need_a_connected_peer_and_respect_the_size_limit) {
+    LocalServer srv;
+    DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                  dgram_config(srv, true, DatagramFallback::Tcp)};
+    REQUIRE(p.a->publish());
+    REQUIRE(p.b->publish());
+    CHECK(!p.a->open_datagrams(*p.b->self()));  // not connected yet
+
+    REQUIRE(connect_pair(*p.a, *p.b));
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
+    REQUIRE(p.settled(DatagramPath::Tcp));
+    CHECK(p.a->send_datagram(p.idb(), std::vector<uint8_t>(Topic::max_datagram())));
+    CHECK(!p.a->send_datagram(p.idb(), std::vector<uint8_t>(Topic::max_datagram() + 1)));
+}
+
+TEST(a_stranger_probing_the_udp_port_gets_no_answer) {
+    // Probes are tagged with the channel's probe key, which only the peer
+    // holds: nobody else can make the node reveal it is listening.
+    LocalServer srv;
+    DgramPair   p{srv, config_for(srv), config_for(srv)};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::None));
+    REQUIRE(p.settled(DatagramPath::Direct));
+
+    io::UdpSocket stranger;
+    REQUIRE(stranger.open(0, "127.0.0.1"));
+    std::vector<uint8_t> probe(64);
+    wire::Writer         w{probe};
+    wire::Header{wire::MsgType::Probe, wire::kVersion, 0, 1}.encode(w);
+    wire::Probe pr;
+    pr.txn.fill(0x31);
+    pr.encode(w);  // an all-zero tag, as an open topic once used
+    probe.resize(w.size());
+    // The node binds UDP on its TCP port's number when it can.
+    stranger.send_to(Endpoint{IpAddr::v4(127, 0, 0, 1), p.na.local_port()}, probe);
+
+    CHECK(!stranger.wait_readable(300ms));
 }
 
 TEST(an_introduction_from_a_stranger_does_not_disturb_a_live_session) {

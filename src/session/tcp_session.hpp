@@ -126,13 +126,17 @@ public:
     // Keys for the optional UDP datagram channel, derived from this handshake
     // under their own labels so the two channels share no key. `send` is this
     // side's sending direction; both ends compute the same conn_id.
+    //
+    // Each channel opened on this session uses a new `epoch`. The UDP channel
+    // numbers its packets from zero, so opening a second one under the first
+    // one's keys would reuse every nonce; a new epoch means new keys.
     struct DatagramKeys {
         crypto::SymKey send{};
         crypto::SymKey recv{};
         crypto::SymKey probe{};  // tags UDP probes: only the peer can elicit an answer
         uint32_t       conn_id = 0;
     };
-    DatagramKeys datagram_keys() const;
+    DatagramKeys datagram_keys(uint32_t epoch = 0) const;
 
 private:
     TcpSession(TcpSessionConfig, bool initiator, const DevId& self, const DevId& peer,

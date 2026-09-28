@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <utility>
@@ -38,16 +39,20 @@ inline void fail(const char* file, int line, const std::string& msg) {
     ++failures();
 }
 
-inline int run_all() {
+// Runs every case whose name contains `filter` (all of them when it is null).
+inline int run_all(const char* filter = nullptr) {
     int failed_cases = 0;
+    int ran          = 0;
     for (auto& c : registry()) {
+        if (filter && !std::strstr(c.name, filter)) continue;
+        ++ran;
         int before = failures();
         std::printf("  %s\n", c.name);
         c.fn();
         if (failures() != before) ++failed_cases;
     }
-    std::printf("\n%d case(s), %d failed, %d assertion failure(s)\n",
-                static_cast<int>(registry().size()), failed_cases, failures());
+    std::printf("\n%d case(s), %d failed, %d assertion failure(s)\n", ran, failed_cases,
+                failures());
     return failures() == 0 ? 0 : 1;
 }
 

@@ -25,6 +25,15 @@
 // accepted knows which peer is calling. An initiator's first frame names the
 // attempt too, so a responder can identify inbound connections from that.
 // Relay legs need neither: both ends already know the attempt.
+//
+// Datagrams. One UDP socket, opened the first time a channel needs it, on P's
+// number when that is free. A channel is opened over the TCP session: each
+// side sends an offer -- the channel's epoch and its UDP candidates, including
+// the reflexive address the server's WhoAmI reported -- and both punch with
+// probes tagged by the channel's probe key. The epoch picks the keys
+// (TcpSession::datagram_keys), so a reopened channel never reuses a nonce.
+// Where punching fails, each side applies its own fallback: datagrams over
+// the TCP session, the server's UDP relay, or none.
 
 #include "uconnect/uconnect.hpp"
 
@@ -43,6 +52,8 @@
 #include "control.hpp"
 #include "kdf.hpp"
 #include "primitives.hpp"
+#include "punch.hpp"
+#include "session.hpp"
 #include "socket.hpp"
 #include "tcp_session.hpp"
 
@@ -69,6 +80,15 @@ constexpr size_t kMaxQueued = 16u << 20;
 
 // Record kinds on a TcpSession that belong to this layer.
 constexpr uint8_t kMessageRecord = 0x10;  // an application message
+constexpr uint8_t kDgramOffer    = 0x11;  // epoch(4) | UDP candidates: open or answer a channel
+constexpr uint8_t kDgramOverTcp  = 0x12;  // one datagram, when UDP could not be had
+constexpr uint8_t kDgramClose    = 0x13;  // epoch(4): that channel is closed
+
+// Datagram channels.
+constexpr auto kGatherWait    = 1500ms;  // wait this long for our UDP srflx before offering without it
+constexpr auto kWhoAmIEvery   = 500ms;
+constexpr auto kUdpBindEvery  = 500ms;
+constexpr auto kUdpRelayWait  = 10s;     // to allocate and bind the UDP relay
 
 // The hello a dialing responder opens with.
 constexpr uint8_t kHello0   = 'U';
@@ -149,7 +169,50 @@ std::vector<uint8_t> hello_for(const AttemptNonce& attempt) {
     return h;
 }
 
+std::vector<uint8_t> encode_dgram_offer(uint32_t epoch, const std::vector<Candidate>& cands) {
+    std::vector<uint8_t> buf(512);
+    wire::Writer         w{buf};
+    w.u32(epoch);
+    const size_t n = std::min<size_t>(cands.size(), wire::kMaxCandidates);
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i) w.candidate(cands[i]);
+    buf.resize(w.size());
+    return buf;
+}
+
+bool decode_dgram_offer(std::span<const uint8_t> p, uint32_t& epoch, std::vector<Candidate>& cands) {
+    wire::Reader r{p};
+    epoch          = r.u32();
+    const size_t n = r.u8();
+    if (!r.ok() || n > wire::kMaxCandidates) return false;
+    for (size_t i = 0; i < n; ++i) cands.push_back(r.candidate());
+    return r.ok();
+}
+
+std::vector<uint8_t> encode_u32(uint32_t v) {
+    return {static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16),
+            static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
+}
+
+std::optional<uint32_t> decode_u32(std::span<const uint8_t> p) {
+    if (p.size() < 4) return std::nullopt;
+    return static_cast<uint32_t>(p[0]) << 24 | static_cast<uint32_t>(p[1]) << 16 |
+           static_cast<uint32_t>(p[2]) << 8 | p[3];
+}
+
 }  // namespace
+
+const char* to_string(DatagramPath p) {
+    switch (p) {
+        case DatagramPath::None:    return "none";
+        case DatagramPath::Opening: return "opening";
+        case DatagramPath::Direct:  return "direct";
+        case DatagramPath::Relayed: return "relayed";
+        case DatagramPath::Tcp:     return "tcp";
+        case DatagramPath::Failed:  return "failed";
+    }
+    return "?";
+}
 
 const char* to_string(PeerGone g) {
     switch (g) {
@@ -256,6 +319,34 @@ struct PendingConn {
     bool                   joined = false;
 };
 
+// A peer's UDP datagram channel, beside its TCP session.
+struct Dgram {
+    uint32_t                          epoch    = 0;
+    DatagramFallback                  fallback = DatagramFallback::Tcp;
+    DatagramPath                      path     = DatagramPath::Opening;
+    session::TcpSession::DatagramKeys keys;
+    Instant                           opened{};
+
+    bool                                  offered = false;  // ours, sent
+    std::optional<std::vector<Candidate>> remote;           // theirs, received
+    std::optional<path::PunchSession>     punch;
+    std::optional<Endpoint>               direct;           // the punched path, once there is one
+    // Created with the channel and never replaced: its counter is the nonce,
+    // and a second Session under these keys would start it again from zero.
+    std::optional<session::Session>       sess;
+
+    // The UDP relay: taken when punching fails and the fallback says so, and
+    // bound whenever the peer offers one, so its relayed datagrams reach us.
+    bool                          relaying    = false;  // falling back to it
+    bool                          relay_asked = false;
+    Instant                       relay_backup_at{};
+    Instant                       relay_deadline{};
+    std::optional<wire::RelayId>  relay_id;
+    ctl::RelayToken               relay_token{};
+    bool                          relay_bound = false;
+    Instant                       next_bind{};
+};
+
 struct Peer {
     DevId                  dev_id{};
     std::vector<Candidate> cands;
@@ -277,6 +368,11 @@ struct Peer {
     bool                      relayed = false;
     bool                      closing = false;  // flush `out`, then close
 
+    // The datagram channel, if one is open, and the highest epoch used on
+    // this TCP session -- a new channel must go above it.
+    std::optional<Dgram> dgram;
+    uint32_t             dgram_epoch = 0;
+
     LinkInfo link{};
 };
 
@@ -293,6 +389,8 @@ struct Request {
     std::optional<TopicId>                   register_for;
     std::optional<TopicId>                   discover_for;
     std::optional<std::pair<TopicId, DevId>> relay_for;
+    std::optional<std::pair<TopicId, DevId>> dgram_relay_for;  // a UDP relay
+    uint32_t                                 dgram_epoch = 0;
     bool                                     loop_owned = false;
 };
 
@@ -320,6 +418,8 @@ struct Topic::Impl {
     std::function<void(DevId, PeerState)>                on_peer;
     std::function<void(DevId, std::span<const uint8_t>)> on_data;
     std::function<void(DevId, PeerGone)>                 on_peer_closed;
+    std::function<void(DevId, std::span<const uint8_t>)> on_datagram;
+    std::function<void(DevId, DatagramPath)>             on_datagram_path;
 
     const crypto::SymKey* psk() const { return keyed ? &keys.psk : nullptr; }
 };
@@ -343,6 +443,14 @@ struct Node::Impl {
 
     std::vector<Candidate>  host_cands;
     std::optional<Endpoint> srflx;
+
+    // --- UDP, for datagram channels ----------------------------------------
+    io::UdpSocket           udp;
+    bool                    udp_ready = false;
+    bool                    udp_tried = false;
+    std::optional<Endpoint> udp_srflx;  // as the server's WhoAmI saw us
+    uint64_t                whoami_nonce = 0;
+    Instant                 next_whoami{};
 
     mutable std::mutex      mu;
     std::condition_variable cv;
@@ -443,6 +551,22 @@ struct Node::Impl {
     void flush_peer(Peer&);
     void end_attempt(Peer&);
     void set_peer_state(Topic::Impl&, Peer&, PeerState);
+    bool send_record(Peer&, uint8_t kind, std::span<const uint8_t> body);
+
+    // datagrams
+    bool ensure_udp();
+    std::vector<Candidate> udp_candidates() const;
+    void read_udp(Instant now);
+    void on_udp(const Endpoint& from, std::span<const uint8_t> dgram, Instant now);
+    void on_udp_from_server(std::span<const uint8_t> dgram, Instant now);
+    void dgram_open(Topic::Impl&, Peer&, uint32_t epoch, DatagramFallback, Instant now);
+    void dgram_on_offer(Topic::Impl&, Peer&, std::span<const uint8_t> body, Instant now);
+    void dgram_drop(Topic::Impl&, Peer&);
+    void dgram_fall_back(Topic::Impl&, Peer&, Instant now);
+    void dgram_set_path(Topic::Impl&, Peer&, DatagramPath);
+    void drive_dgram(Topic::Impl&, const TopicId&, Peer&, Instant now);
+    void flush_dgram(Peer&);
+    void dgram_relay_granted(Peer&, wire::RelayId, const ctl::RelayToken&, Instant now);
     Topic::Impl* topic_impl(const TopicId&);
     size_t       live_peer_count(const Topic::Impl&) const;
     size_t       total_peer_count() const;
@@ -477,6 +601,12 @@ void Node::Impl::loop() {
             li.fd        = listener.native();
             li.want_read = true;
             items.push_back(li);
+            if (udp_ready) {
+                io::PollItem ui;
+                ui.fd        = udp.native();
+                ui.want_read = true;
+                items.push_back(ui);
+            }
             if (ctl_state != Ctl::Down) {
                 io::PollItem ci;
                 ci.fd         = control.native();
@@ -534,6 +664,7 @@ void Node::Impl::tick(Instant now) {
     }
 
     drive_control(now);
+    read_udp(now);
 
     // Index-based: driving a connection can add more (a relay leg).
     for (size_t i = 0; i < pending.size(); ++i) {
@@ -581,6 +712,27 @@ void Node::Impl::tick(Instant now) {
         for (auto& [dev, peer] : ti.peers) {
             (void)dev;
             drive_peer(ti, tid, peer, now);
+            if (peer.dgram) drive_dgram(ti, tid, peer, now);
+        }
+    }
+
+    // Our UDP mapping, for as long as a channel is still gathering it.
+    if (udp_ready && !udp_srflx && now >= next_whoami) {
+        bool gathering = false;
+        for (auto& [tid, t] : topics) {
+            (void)tid;
+            for (auto& [dev, peer] : t->impl_->peers) {
+                (void)dev;
+                if (peer.dgram && !peer.dgram->offered) gathering = true;
+            }
+        }
+        if (gathering) {
+            if (whoami_nonce == 0) {
+                auto n = crypto::random_array<8>();
+                for (uint8_t b : n) whoami_nonce = whoami_nonce << 8 | b;
+            }
+            udp.send_to(server, ctl::message(wire::MsgType::WhoAmI, 0, ctl::WhoAmI{whoami_nonce}));
+            next_whoami = now + kWhoAmIEvery;
         }
     }
 }
@@ -748,6 +900,16 @@ void Node::Impl::on_control_message(std::span<const uint8_t> msg, Instant now) {
         if (req.register_for) {
             if (auto* ti = topic_impl(*req.register_for)) ti->reregistering = false;
         }
+        if (req.dgram_relay_for) {
+            if (auto* ti = topic_impl(req.dgram_relay_for->first)) {
+                auto pit = ti->peers.find(req.dgram_relay_for->second);
+                if (pit != ti->peers.end() && pit->second.dgram &&
+                    pit->second.dgram->epoch == req.dgram_epoch && pit->second.dgram->relaying) {
+                    pit->second.dgram->relaying = false;
+                    dgram_set_path(*ti, pit->second, DatagramPath::Failed);
+                }
+            }
+        }
         if (req.relay_for) {
             // A refused relay is a definitive answer: report the peer rather
             // than leave it dialing forever.
@@ -796,6 +958,16 @@ void Node::Impl::on_control_message(std::span<const uint8_t> msg, Instant now) {
                     peer.dev_id = e.dev_id;
                     peer.cands  = e.cands;
                     if (!e.stale) begin_connect(*ti, tid, e.dev_id, now);
+                }
+            }
+        } else if (req.dgram_relay_for) {
+            auto  ok = ctl::RelayAllocOk::decode(r);
+            auto* ti = topic_impl(req.dgram_relay_for->first);
+            if (ok && ti) {
+                auto pit = ti->peers.find(req.dgram_relay_for->second);
+                if (pit != ti->peers.end() && pit->second.dgram &&
+                    pit->second.dgram->epoch == req.dgram_epoch) {
+                    dgram_relay_granted(pit->second, ok->relay_id, ok->token, now);
                 }
             }
         } else if (req.relay_for) {
@@ -920,12 +1092,17 @@ void Node::Impl::request_relay(Topic::Impl& ti, const TopicId& tid, Peer& peer) 
 }
 
 void Node::Impl::on_relay_offer(const ctl::RelayOffer& off, Instant now) {
-    if (off.kind != ctl::RelayKind::Tcp) return;  // the UDP relay belongs to datagrams
     auto* ti = topic_impl(off.topic);
     if (!ti) return;
     auto pit = ti->peers.find(off.from_dev);
     if (pit == ti->peers.end()) return;
     Peer& peer = pit->second;
+    if (off.kind == ctl::RelayKind::Udp) {
+        // The peer is relaying its datagrams: bind our side, or they have
+        // nowhere to go.
+        if (peer.dgram) dgram_relay_granted(peer, off.relay_id, off.token, now);
+        return;
+    }
     if (peer.sess || !peer.attempt || peer.relay_joining) return;
     peer.relay_joining = true;
     join_relay(off.topic, peer.dev_id, *peer.attempt, off.relay_id, off.token, now);
@@ -1098,6 +1275,10 @@ void Node::Impl::start_session(PendingConn& pc, Instant now) {
     peer.out.clear();
     peer.closing = false;
     peer.link    = LinkInfo{};
+    // A datagram channel is keyed from the session it runs beside; a new
+    // session starts the epochs again under keys of its own.
+    if (peer.dgram) dgram_drop(*ti, peer);
+    peer.dgram_epoch = 0;
     pc.dead      = true;
     set_peer_state(*ti, peer, PeerState::Handshaking);
     if (!pc.in.empty()) peer.sess->on_bytes(pc.in, now);
@@ -1168,6 +1349,21 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                         deferred.push_back([cb = ti.on_data, dev = peer.dev_id,
                                             body = std::move(e->body)] { cb(dev, body); });
                     }
+                } else if (e->record_kind == kDgramOffer) {
+                    dgram_on_offer(ti, peer, e->body, now);
+                } else if (e->record_kind == kDgramOverTcp) {
+                    // Accepted whatever our own path is: which way the peer
+                    // sends is its fallback, not ours.
+                    if (e->body.size() <= Topic::max_datagram()) {
+                        ++peer.link.datagrams_received;
+                        if (ti.on_datagram) {
+                            deferred.push_back([cb = ti.on_datagram, dev = peer.dev_id,
+                                                body = std::move(e->body)] { cb(dev, body); });
+                        }
+                    }
+                } else if (e->record_kind == kDgramClose) {
+                    auto epoch = decode_u32(e->body);
+                    if (epoch && peer.dgram && peer.dgram->epoch == *epoch) dgram_drop(ti, peer);
                 }
                 break;
             case session::TcpEvent::Kind::Closed: {
@@ -1178,6 +1374,7 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                                  to_hex(peer.dev_id).substr(0, 8).c_str(), to_string(why));
                 }
                 peer.closing = true;  // flush a Close record, if one was queued
+                if (peer.dgram) dgram_drop(ti, peer);  // its keys went with the session
                 if (was_up && ti.on_peer_closed) {
                     deferred.push_back([cb = ti.on_peer_closed, dev = peer.dev_id, why] { cb(dev, why); });
                 }
@@ -1245,6 +1442,375 @@ size_t Node::Impl::total_peer_count() const {
         n += live_peer_count(*t->impl_);
     }
     return n;
+}
+
+bool Node::Impl::send_record(Peer& peer, uint8_t kind, std::span<const uint8_t> body) {
+    if (!peer.sess || !peer.sess->send(kind, body, now())) return false;
+    auto bytes = peer.sess->take_output();
+    peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
+    flush_peer(peer);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Datagram channels
+// ---------------------------------------------------------------------------
+bool Node::Impl::ensure_udp() {
+    if (udp_ready) return true;
+    if (udp_tried) return false;
+    udp_tried = true;
+    // The TCP port's number when it is free, so both channels share one
+    // number in firewall rules and logs; any port otherwise.
+    udp_ready = udp.open(port) || udp.open(0);
+    if (!udp_ready && cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] no UDP socket: %s\n", udp.last_error().c_str());
+    }
+    return udp_ready;
+}
+
+std::vector<Candidate> Node::Impl::udp_candidates() const {
+    std::vector<Candidate> c;
+    if (udp_srflx) c.push_back(Candidate{Candidate::Kind::Srflx, *udp_srflx});
+    for (const auto& h : host_cands) {
+        if (c.size() >= wire::kMaxCandidates) break;
+        c.push_back(Candidate{Candidate::Kind::Host, Endpoint{h.ep.ip, udp.local_port()}});
+    }
+    return c;
+}
+
+void Node::Impl::read_udp(Instant now) {
+    if (!udp_ready) return;
+    std::vector<uint8_t> buf(2048);
+    for (int i = 0; i < 256; ++i) {
+        auto got = udp.recv_from(buf);
+        if (!got) break;
+        on_udp(got->from, std::span(buf).first(got->len), now);
+    }
+}
+
+void Node::Impl::on_udp(const Endpoint& from, std::span<const uint8_t> dgram, Instant now) {
+    if (dgram.size() < 2) return;
+    // The server speaks the control protocol's version; peers speak v1. Only
+    // the server's own address is heard in v2.
+    if (dgram[1] == ctl::kVersion) {
+        if (from == server) on_udp_from_server(dgram, now);
+        return;
+    }
+
+    auto type = wire::peek_type(dgram);
+    if (!type) return;
+
+    // Each channel below is only ever looked at through its own keys.
+    auto each_channel = [&](auto&& fn) {
+        for (auto& [tid, t] : topics) {
+            (void)tid;
+            for (auto& [dev, peer] : t->impl_->peers) {
+                (void)dev;
+                if (peer.dgram && fn(*t->impl_, peer, *peer.dgram)) return;
+            }
+        }
+    };
+
+    switch (*type) {
+        case wire::MsgType::Probe:
+            // Answered once, by the channel whose probe key made the tag:
+            // nobody else can elicit a reply at all.
+            each_channel([&](Topic::Impl&, Peer&, Dgram& d) {
+                auto reply = path::PunchSession::answer_probe(from, dgram, &d.keys.probe, 0);
+                if (!reply) return false;
+                udp.send_to(reply->to, reply->data);
+                if (d.punch) d.punch->on_peer_probe(from, now);
+                return true;
+            });
+            return;
+        case wire::MsgType::ProbeOk:
+            each_channel([&](Topic::Impl&, Peer&, Dgram& d) {
+                if (d.punch) d.punch->on_datagram(from, dgram, now);
+                return false;  // each checks the txn against its own
+            });
+            return;
+        case wire::MsgType::Transport:
+        case wire::MsgType::Close: {
+            if (dgram.size() < wire::Header::kSize + 4) return;
+            const auto cid = *decode_u32(dgram.subspan(wire::Header::kSize, 4));
+            each_channel([&](Topic::Impl&, Peer&, Dgram& d) {
+                if (!d.sess || d.keys.conn_id != cid) return false;
+                d.sess->on_datagram(from, dgram, now);
+                return true;
+            });
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+void Node::Impl::on_udp_from_server(std::span<const uint8_t> dgram, Instant now) {
+    wire::Reader r{dgram};
+    auto         h = wire::Header::decode(r, ctl::kVersion);
+    if (!h) return;
+
+    auto by_relay = [&](wire::RelayId id, auto&& fn) {
+        for (auto& [tid, t] : topics) {
+            (void)tid;
+            for (auto& [dev, peer] : t->impl_->peers) {
+                (void)dev;
+                if (peer.dgram && peer.dgram->relay_id == id) {
+                    fn(*t->impl_, peer, *peer.dgram);
+                    return;
+                }
+            }
+        }
+    };
+
+    switch (h->type) {
+        case wire::MsgType::WhoAmIOk: {
+            auto ok = ctl::WhoAmIOk::decode(r);
+            if (ok && ok->nonce == whoami_nonce && whoami_nonce != 0) udp_srflx = ok->mapped;
+            return;
+        }
+        case wire::MsgType::UdpRelayBindOk: {
+            auto ok = ctl::UdpRelayBindOk::decode(r);
+            if (!ok) return;
+            by_relay(ok->relay_id, [&](Topic::Impl& ti, Peer& peer, Dgram& d) {
+                d.relay_bound = true;
+                if (d.relaying && d.sess) {
+                    d.relaying = false;
+                    d.sess->set_path(server, now);
+                    dgram_set_path(ti, peer, DatagramPath::Relayed);
+                }
+            });
+            return;
+        }
+        case wire::MsgType::RelayData: {
+            auto rd = wire::RelayData::decode(r);
+            if (!rd) return;
+            // The payload is the peer's sealed packet; its keys decide whether
+            // it is genuine, not the wrapper.
+            by_relay(rd->relay_id, [&](Topic::Impl&, Peer&, Dgram& d) {
+                if (d.sess) d.sess->on_datagram(server, rd->payload, now);
+            });
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+// Record the channel's path and tell the application. With no channel -- it
+// was just dropped -- only the telling is left to do.
+void Node::Impl::dgram_set_path(Topic::Impl& ti, Peer& peer, DatagramPath p) {
+    if (peer.dgram) {
+        if (peer.dgram->path == p) return;
+        peer.dgram->path = p;
+    }
+    if (cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] datagrams %s: %s\n",
+                     to_hex(peer.dev_id).substr(0, 8).c_str(), to_string(p));
+    }
+    if (ti.on_datagram_path) {
+        deferred.push_back([cb = ti.on_datagram_path, dev = peer.dev_id, p] { cb(dev, p); });
+    }
+}
+
+void Node::Impl::dgram_open(Topic::Impl& ti, Peer& peer, uint32_t epoch, DatagramFallback fb,
+                            Instant now) {
+    Dgram d;
+    d.epoch    = epoch;
+    d.fallback = fb;
+    d.keys     = peer.sess->datagram_keys(epoch);
+    d.opened   = now;
+    session::SessionConfig scfg;
+    scfg.rekey_shift = cfg.rekey_shift;
+    d.sess.emplace(scfg, peer.dev_id, Endpoint{}, d.keys.send, d.keys.recv, d.keys.conn_id, now);
+    d.path           = DatagramPath::None;  // so the move to Opening is reported
+    peer.dgram       = std::move(d);
+    peer.dgram_epoch = std::max(peer.dgram_epoch, epoch);
+    ensure_udp();
+    dgram_set_path(ti, peer, DatagramPath::Opening);
+}
+
+void Node::Impl::dgram_on_offer(Topic::Impl& ti, Peer& peer, std::span<const uint8_t> body,
+                                Instant now) {
+    uint32_t               epoch = 0;
+    std::vector<Candidate> cands;
+    if (!decode_dgram_offer(body, epoch, cands)) return;
+
+    if (peer.dgram && epoch < peer.dgram->epoch) return;  // an older channel's, overtaken
+    if (!peer.dgram || epoch > peer.dgram->epoch) {
+        // A channel we have not used yet -- never one at or below an epoch we
+        // already keyed, or our counter would start again under used keys.
+        if (epoch <= peer.dgram_epoch) return;
+        const auto fb = peer.dgram ? peer.dgram->fallback : cfg.datagram_fallback;
+        dgram_open(ti, peer, epoch, fb, now);
+    }
+    peer.dgram->remote = std::move(cands);
+}
+
+void Node::Impl::dgram_drop(Topic::Impl& ti, Peer& peer) {
+    if (!peer.dgram) return;
+    peer.dgram.reset();
+    dgram_set_path(ti, peer, DatagramPath::None);
+}
+
+void Node::Impl::dgram_fall_back(Topic::Impl& ti, Peer& peer, Instant now) {
+    Dgram& d = *peer.dgram;
+    d.punch.reset();
+    switch (d.fallback) {
+        case DatagramFallback::Tcp:
+            dgram_set_path(ti, peer, DatagramPath::Tcp);
+            return;
+        case DatagramFallback::None:
+            dgram_set_path(ti, peer, DatagramPath::Failed);
+            return;
+        case DatagramFallback::Relay:
+            d.relaying = true;
+            d.relay_deadline  = now + kUdpRelayWait;
+            d.relay_backup_at = now + kRelayBackupDelay;
+            // Already bound for the peer's sake: nothing to wait for.
+            if (d.relay_bound && d.sess) {
+                d.relaying = false;
+                d.sess->set_path(server, now);
+                dgram_set_path(ti, peer, DatagramPath::Relayed);
+            }
+            return;
+    }
+}
+
+void Node::Impl::dgram_relay_granted(Peer& peer, wire::RelayId id, const ctl::RelayToken& token,
+                                     Instant now) {
+    Dgram& d = *peer.dgram;
+    if (d.relay_id == id) return;
+    d.relay_id    = id;
+    d.relay_token = token;
+    d.relay_bound = false;
+    d.next_bind   = now;
+}
+
+void Node::Impl::flush_dgram(Peer& peer) {
+    Dgram& d = *peer.dgram;
+    if (!d.sess || !udp_ready) return;
+    while (auto o = d.sess->poll_transmit()) {
+        if (o->to.port == 0) continue;  // no path yet
+        if (o->to == server) {
+            if (!d.relay_id) continue;
+            wire::RelayData rd;
+            rd.relay_id = *d.relay_id;
+            rd.payload  = std::move(o->data);
+            udp.send_to(server, ctl::message(wire::MsgType::RelayData, 0, rd));
+        } else {
+            udp.send_to(o->to, o->data);
+        }
+    }
+}
+
+void Node::Impl::drive_dgram(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
+    if (!peer.sess || peer.sess->state() != TcpSession::State::Established) return;
+    Dgram& d = *peer.dgram;
+
+    // Our offer: once we know our UDP mapping, or have waited long enough.
+    if (!d.offered && (udp_srflx || !udp_ready || now - d.opened >= kGatherWait)) {
+        send_record(peer, kDgramOffer, encode_dgram_offer(d.epoch, udp_ready ? udp_candidates()
+                                                                             : std::vector<Candidate>{}));
+        d.offered = true;
+    }
+
+    // Both offers exchanged: punch, unless there is nothing to punch with.
+    if (d.path == DatagramPath::Opening && !d.relaying && d.offered && d.remote && !d.punch) {
+        if (cfg.force_relay || !udp_ready || d.remote->empty()) {
+            dgram_fall_back(ti, peer, now);
+        } else {
+            path::PunchConfig pc;
+            pc.total_timeout = cfg.punch_timeout;
+            d.punch.emplace(pc, peer.dev_id, *d.remote, path::LocalView{udp_srflx}, &d.keys.probe);
+            d.punch->begin(now);
+        }
+    }
+
+    if (d.punch) {
+        d.punch->on_timeout(now);
+        while (auto o = d.punch->poll_transmit()) udp.send_to(o->to, o->data);
+        while (auto e = d.punch->poll_event()) {
+            if (e->kind == path::PunchEvent::Kind::Nominated && d.path == DatagramPath::Opening) {
+                d.direct = e->path;
+                d.sess->set_path(e->path, now);
+                dgram_set_path(ti, peer, DatagramPath::Direct);
+            } else if (e->kind == path::PunchEvent::Kind::Failed &&
+                       d.path == DatagramPath::Opening) {
+                dgram_fall_back(ti, peer, now);
+                break;  // the punch session is gone
+            }
+        }
+        if (d.punch && d.punch->state() != path::PunchState::Probing && !d.punch->next_timeout()) {
+            d.punch.reset();
+        }
+    }
+
+    // The UDP relay: the smaller dev_id asks first; the other asks too if no
+    // offer has come -- the server hands both the same binding.
+    if (d.relaying) {
+        const bool designated = ti.self && smaller(*ti.self, peer.dev_id);
+        if (!d.relay_asked && !d.relay_id && ctl_state == Ctl::Up && ti.self &&
+            (designated || now >= d.relay_backup_at)) {
+            d.relay_asked = true;
+            Request r;
+            r.dgram_relay_for = std::make_pair(tid, peer.dev_id);
+            r.dgram_epoch     = d.epoch;
+            r.loop_owned      = true;
+            request(wire::MsgType::RelayAlloc, wire::MsgType::RelayAllocOk,
+                    ctl::RelayAlloc{*ti.self, peer.dev_id, ctl::RelayKind::Udp}, r);
+        }
+        if (now >= d.relay_deadline) {
+            d.relaying = false;
+            dgram_set_path(ti, peer, DatagramPath::Failed);
+        }
+    }
+    if (d.relay_id && !d.relay_bound && now >= d.next_bind && udp_ready) {
+        udp.send_to(server, ctl::message(wire::MsgType::UdpRelayBind, 0,
+                                         ctl::UdpRelayBind{*d.relay_id, d.relay_token}));
+        d.next_bind = now + kUdpBindEvery;
+    }
+
+    // The channel itself.
+    if (!d.sess) return;
+    if (d.path == DatagramPath::Direct || d.path == DatagramPath::Relayed) d.sess->on_timeout(now);
+    while (auto e = d.sess->poll_event()) {
+        switch (e->kind) {
+            case session::SessionEvent::Kind::Data:
+                ++peer.link.datagrams_received;
+                if (ti.on_datagram) {
+                    deferred.push_back([cb = ti.on_datagram, dev = peer.dev_id,
+                                        body = std::move(e->data)] { cb(dev, body); });
+                }
+                break;
+            case session::SessionEvent::Kind::PathChanged:
+                // The peer reached us over a path of its own finding. A direct
+                // one -- a punch that came through late -- is an upgrade
+                // whatever we chose. The relay is not: it spends the server's
+                // budget, so we use it only if our own fallback says so, and
+                // otherwise keep sending the way we were.
+                if (!(e->path == server)) {
+                    d.direct = e->path;
+                    d.punch.reset();
+                    d.relaying = false;
+                    dgram_set_path(ti, peer, DatagramPath::Direct);
+                } else if (d.fallback == DatagramFallback::Relay) {
+                    d.punch.reset();
+                    d.relaying = false;
+                    dgram_set_path(ti, peer, DatagramPath::Relayed);
+                } else if (d.direct) {
+                    d.sess->set_path(*d.direct, now);
+                }
+                break;
+            case session::SessionEvent::Kind::Closed:
+                // The path went quiet for the whole idle timeout. The keys are
+                // gone with it; what is left is the fallback over TCP, if any.
+                dgram_set_path(ti, peer, d.fallback == DatagramFallback::Tcp ? DatagramPath::Tcp
+                                                                            : DatagramPath::Failed);
+                break;
+        }
+    }
+    flush_dgram(peer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,6 +2032,64 @@ size_t Topic::broadcast(std::span<const uint8_t> payload) {
     return sent;
 }
 
+bool Topic::open_datagrams(const DevId& dev, DatagramFallback fb) {
+    auto&                       n = *impl_->node;
+    std::lock_guard<std::mutex> lk(n.mu);
+    auto                        it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.sess ||
+        it->second.sess->state() != TcpSession::State::Established) {
+        return false;
+    }
+    Peer& peer = it->second;
+    if (peer.dgram && peer.dgram->path != DatagramPath::Failed) {
+        peer.dgram->fallback = fb;  // already open, or opening: just the policy
+        return true;
+    }
+    n.dgram_open(*impl_, peer, peer.dgram_epoch + 1, fb, n.now());
+    return true;
+}
+
+void Topic::close_datagrams(const DevId& dev) {
+    auto&                       n = *impl_->node;
+    std::lock_guard<std::mutex> lk(n.mu);
+    auto                        it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.dgram) return;
+    Peer& peer = it->second;
+    n.send_record(peer, kDgramClose, encode_u32(peer.dgram->epoch));
+    n.dgram_drop(*impl_, peer);
+}
+
+DatagramPath Topic::datagram_path(const DevId& dev) const {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    auto                        it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.dgram) return DatagramPath::None;
+    return it->second.dgram->path;
+}
+
+bool Topic::send_datagram(const DevId& dev, std::span<const uint8_t> payload) {
+    auto&                       n = *impl_->node;
+    std::lock_guard<std::mutex> lk(n.mu);
+    if (payload.size() > max_datagram()) return false;
+    auto it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.dgram || !it->second.sess) return false;
+    Peer&  peer = it->second;
+    Dgram& d    = *peer.dgram;
+    switch (d.path) {
+        case DatagramPath::Direct:
+        case DatagramPath::Relayed:
+            if (!d.sess || !d.sess->send(payload, n.now())) return false;
+            n.flush_dgram(peer);  // straight out, not on the next loop tick
+            break;
+        case DatagramPath::Tcp:
+            if (!n.send_record(peer, kDgramOverTcp, payload)) return false;
+            break;
+        default:
+            return false;
+    }
+    ++peer.link.datagrams_sent;
+    return true;
+}
+
 void Topic::on_peer(std::function<void(DevId, PeerState)> cb) {
     std::lock_guard<std::mutex> lk(impl_->node->mu);
     impl_->on_peer = std::move(cb);
@@ -1479,6 +2103,16 @@ void Topic::on_data(std::function<void(DevId, std::span<const uint8_t>)> cb) {
 void Topic::on_peer_closed(std::function<void(DevId, PeerGone)> cb) {
     std::lock_guard<std::mutex> lk(impl_->node->mu);
     impl_->on_peer_closed = std::move(cb);
+}
+
+void Topic::on_datagram(std::function<void(DevId, std::span<const uint8_t>)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_datagram = std::move(cb);
+}
+
+void Topic::on_datagram_path(std::function<void(DevId, DatagramPath)> cb) {
+    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    impl_->on_datagram_path = std::move(cb);
 }
 
 void Topic::set_max_peers(size_t n) {
@@ -1706,6 +2340,8 @@ void Node::shutdown() {
     impl_->requests.clear();
     impl_->control.close();
     impl_->listener.close();
+    impl_->udp.close();
+    impl_->udp_ready = false;
 }
 
 bool     Node::is_running() const { return impl_->running; }

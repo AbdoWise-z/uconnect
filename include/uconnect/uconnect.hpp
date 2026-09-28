@@ -20,7 +20,8 @@
 // Transport. Each peer connection is one TCP connection: punched directly when
 // the NATs allow, relayed through the rendezvous server when they do not. The
 // Noise handshake runs over it, so it carries the session's keys, and every
-// message on it is reliable, ordered and encrypted.
+// message on it is reliable, ordered and encrypted. A UDP datagram channel can
+// be opened beside it on demand, keyed from the same handshake.
 
 #include <chrono>
 #include <functional>
@@ -123,7 +124,46 @@ struct LinkInfo {
     uint64_t messages_received = 0;
     uint64_t bytes_sent        = 0;  // message payload bytes
     uint64_t bytes_received    = 0;
+
+    uint64_t datagrams_sent     = 0;  // however they travelled
+    uint64_t datagrams_received = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Datagrams
+// ---------------------------------------------------------------------------
+// Messages ride the peer's TCP connection: reliable and ordered, which also
+// means one lost segment holds up everything behind it. Datagrams are the
+// other option -- unreliable, unordered, never waiting on each other -- for
+// traffic where late is as bad as lost: voice, game state, telemetry.
+//
+// They need a UDP path of their own, opened on demand with open_datagrams().
+// The keys come from the TCP connection's handshake, so a datagram channel
+// authenticates the same peer and needs no handshake of its own; UDP is only
+// punched. Where that fails, the application chooses what happens:
+enum class DatagramFallback : uint8_t {
+    // Send datagrams over the TCP connection instead. Always available and
+    // costs nothing extra, but they arrive reliably and in order -- that is,
+    // late rather than lost when the network drops something.
+    Tcp,
+    // Relay them through the rendezvous server's UDP relay. Stays unreliable
+    // and low-latency, but puts the server in the path (still end-to-end
+    // encrypted) and spends its relay budget, which is finite per pair.
+    Relay,
+    // No datagrams for this peer; send_datagram() returns false.
+    None,
+};
+
+enum class DatagramPath : uint8_t {
+    None,     // no channel open
+    Opening,  // exchanging addresses, punching, or binding the relay
+    Direct,   // punched UDP
+    Relayed,  // the rendezvous server's UDP relay
+    Tcp,      // falling back over the TCP connection
+    Failed,   // no path, and the fallback was None (or the relay refused)
+};
+
+const char* to_string(DatagramPath);
 
 // ---------------------------------------------------------------------------
 // Topic
@@ -180,9 +220,28 @@ public:
 
     static constexpr size_t max_message() { return 1u << 20; }
 
+    // --- datagrams ---------------------------------------------------------
+    // Open a datagram channel to a connected peer. Asynchronous: watch
+    // datagram_path() or on_datagram_path() for it to leave Opening. The peer
+    // accepts automatically, applying its own Node::Config::datagram_fallback
+    // to its sending side. False if the peer is not connected.
+    bool open_datagrams(const DevId&, DatagramFallback = DatagramFallback::Tcp);
+    void close_datagrams(const DevId&);
+    DatagramPath datagram_path(const DevId&) const;
+
+    // Unreliable and unordered, up to max_datagram() bytes -- small enough to
+    // cross any path, relay included, without IP fragmentation. False if there
+    // is no usable path (still Opening, Failed, or no channel) or the datagram
+    // is too large; true means sent, not delivered.
+    bool send_datagram(const DevId&, std::span<const uint8_t>);
+
+    static constexpr size_t max_datagram() { return 1100; }
+
     // --- events (invoked on the node's loop thread; do not block) ----------
     void on_peer(std::function<void(DevId, PeerState)>);
     void on_data(std::function<void(DevId, std::span<const uint8_t>)>);
+    void on_datagram(std::function<void(DevId, std::span<const uint8_t>)>);
+    void on_datagram_path(std::function<void(DevId, DatagramPath)>);
 
     // Fires alongside the PeerState::Closed transition, with the reason. Use
     // this to tell a peer that said goodbye from one that simply vanished --
@@ -246,13 +305,19 @@ public:
         // How long to punch before falling back to the relay.
         std::chrono::seconds punch_timeout{8};
 
-        // Skip punching and go straight to the relay. Normally the relay is a
-        // fallback taken only after punching fails, but forcing it is the only
-        // practical way to exercise that path from a network where punching
-        // happens to work -- and what a peer on a known-symmetric NAT wants
-        // anyway, to avoid seconds of dialing that cannot succeed.
+        // Skip punching -- TCP and UDP alike -- and go straight to the
+        // fallback: the TCP relay for connections, the datagram fallback for
+        // datagrams. Normally those are taken only after punching fails, but
+        // forcing it is the only practical way to exercise them from a network
+        // where punching happens to work -- and what a peer on a
+        // known-symmetric NAT wants anyway, to avoid seconds of dialing that
+        // cannot succeed.
         bool force_relay = false;
         bool verbose     = false;
+
+        // What this node does with datagrams when a peer opens a channel to
+        // it and UDP cannot be punched. open_datagrams() takes its own.
+        DatagramFallback datagram_fallback = DatagramFallback::Tcp;
 
         // Ratchet the UDP datagram channel's keys every 2^rekey_shift packets,
         // so traffic older than the current generation cannot be recovered from

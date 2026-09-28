@@ -2,54 +2,9 @@
 
 #include <cstring>
 #include <span>
-#include <string_view>
 #include <utility>
 
 namespace uconnect::session {
-namespace {
-
-constexpr std::string_view kPrologueTag = "uconnect:v1";
-
-// Message 1's payload is dev_id(16) || random padding(16).
-//
-// Under psk0 this payload is encrypted with a key derived from the PSK alone,
-// before any DH, so it has no forward secrecy -- which is fine for a dev_id,
-// since the rendezvous server hands those out to anyone who can look up the
-// topic. Nothing else goes here; real data waits for the first transport
-// message.
-constexpr size_t kInitPadding = 16;
-constexpr size_t kInitPayload = kDevIdLen + kInitPadding;
-
-std::vector<uint8_t> encode_handshake_init(wire::ConnId conn_id, const wire::ProbeTxn& txn,
-                                           std::span<const uint8_t> noise_msg,
-                                           uint32_t txn_id) {
-    std::vector<uint8_t> buf(wire::kMaxDatagram);
-    wire::Writer         w{buf};
-    wire::Header{wire::MsgType::HandshakeInit, wire::kVersion, 0, txn_id}.encode(w);
-    wire::HandshakeInit hi;
-    hi.conn_id   = conn_id;
-    hi.probe_txn = txn;
-    hi.noise_msg.assign(noise_msg.begin(), noise_msg.end());
-    hi.encode(w);
-    buf.resize(w.size());
-    return buf;
-}
-
-std::vector<uint8_t> encode_handshake_resp(wire::ConnId conn_id,
-                                           std::span<const uint8_t> noise_msg,
-                                           uint32_t txn_id) {
-    std::vector<uint8_t> buf(wire::kMaxDatagram);
-    wire::Writer         w{buf};
-    wire::Header{wire::MsgType::HandshakeResp, wire::kVersion, 0, txn_id}.encode(w);
-    wire::HandshakeResp hr;
-    hr.conn_id = conn_id;
-    hr.noise_msg.assign(noise_msg.begin(), noise_msg.end());
-    hr.encode(w);
-    buf.resize(w.size());
-    return buf;
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // ReplayWindow
@@ -85,131 +40,21 @@ bool ReplayWindow::accept(uint64_t counter) {
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
-Session::Session(SessionConfig cfg, const DevId& peer, Endpoint path, bool keyed,
-                 wire::ConnId conn_id)
-    : cfg_(cfg), peer_(peer), path_(path), keyed_(keyed), conn_id_(conn_id) {}
+Session::Session(SessionConfig cfg, const DevId& peer, Endpoint path, const crypto::SymKey& send,
+                 const crypto::SymKey& recv, wire::ConnId conn_id, Instant now)
+    : cfg_(cfg),
+      peer_(peer),
+      path_(path),
+      conn_id_(conn_id),
+      send_cs_(send),
+      recv_cs_(recv),
+      last_recv_(now),
+      next_keepalive_(now + cfg.keepalive) {}
 
-std::vector<uint8_t> Session::make_prologue(const TopicId& topic, uint8_t key_epoch,
-                                            const wire::ProbeTxn& txn) {
-    std::vector<uint8_t> p;
-    p.reserve(kPrologueTag.size() + kTopicIdLen + 1 + wire::kProbeTxnLen);
-    p.insert(p.end(), kPrologueTag.begin(), kPrologueTag.end());
-    p.insert(p.end(), topic.begin(), topic.end());
-    p.push_back(key_epoch);
-    p.insert(p.end(), txn.begin(), txn.end());
-    return p;
-}
-
-Session Session::initiate(SessionConfig cfg, const TopicId& topic, uint8_t key_epoch,
-                          const crypto::SymKey* psk, const DevId& self, const DevId& peer,
-                          Endpoint path, const wire::ProbeTxn& probe_txn, Instant now) {
-    auto id_bytes = crypto::random_array<4>();
-    wire::ConnId conn_id = static_cast<wire::ConnId>(id_bytes[0]) << 24 |
-                           static_cast<wire::ConnId>(id_bytes[1]) << 16 |
-                           static_cast<wire::ConnId>(id_bytes[2]) << 8 |
-                           static_cast<wire::ConnId>(id_bytes[3]);
-
-    Session s{cfg, peer, path, psk != nullptr, conn_id};
-    s.initiator_ = true;
-
-    auto prologue = make_prologue(topic, key_epoch, probe_txn);
-    s.handshake_  = crypto::HandshakeState::initiator(
-        psk ? crypto::Pattern::NNpsk0 : crypto::Pattern::NN, prologue, psk);
-
-    std::vector<uint8_t> payload(kInitPayload);
-    std::memcpy(payload.data(), self.data(), kDevIdLen);
-    crypto::random_bytes(std::span(payload).subspan(kDevIdLen));
-
-    std::vector<uint8_t> msg(256);
-    auto n = s.handshake_->write_message(payload, msg);
-    if (!n) {
-        s.state_ = SessionState::Closed;
-        return s;
-    }
-    msg.resize(*n);
-    s.handshake_msg_ = encode_handshake_init(conn_id, probe_txn, msg, 1);
-    s.emit_handshake_init(now);
-    return s;
-}
-
-void Session::emit_handshake_init(Instant now) {
-    out_.push_back({path_, handshake_msg_});
-    ++handshake_attempts_;
-    handshake_next_ = now + cfg_.handshake_timeout;
-}
-
-std::optional<Session> Session::accept(SessionConfig cfg, const TopicId& topic,
-                                       uint8_t key_epoch, const crypto::SymKey* psk,
-                                       const DevId& fallback_peer, Endpoint from,
-                                       const wire::ProbeTxn& probe_txn,
-                                       std::span<const uint8_t> dgram, Instant now) {
-    wire::Reader r{dgram};
-    auto         h = wire::Header::decode(r);
-    if (!h || h->type != wire::MsgType::HandshakeInit) return std::nullopt;
-
-    auto hi = wire::HandshakeInit::decode(r);
-    if (!hi) return std::nullopt;
-
-    // The caller has already checked that probe_txn was issued by us on this
-    // path, is unused, and is recent. Re-check the binding here so a session
-    // can never be built on a transaction it does not match.
-    if (!crypto::ct_equal(hi->probe_txn, probe_txn)) return std::nullopt;
-
-    Session s{cfg, fallback_peer, from, psk != nullptr, hi->conn_id};
-    s.initiator_ = false;
-
-    auto prologue = make_prologue(topic, key_epoch, probe_txn);
-    s.handshake_  = crypto::HandshakeState::responder(
-        psk ? crypto::Pattern::NNpsk0 : crypto::Pattern::NN, prologue, psk);
-
-    std::vector<uint8_t> payload(256);
-    auto plen = s.handshake_->read_message(hi->noise_msg, payload);
-    if (!plen) {
-        // Wrong PSK, wrong prologue, or tampering. Drop silently.
-        return std::nullopt;
-    }
-
-    // The initiator's dev_id, now that the AEAD has verified it. Identifying
-    // the peer by source address does not work behind a symmetric NAT, where
-    // the address a handshake arrives from is not the one it advertised.
-    if (*plen >= kDevIdLen) {
-        DevId claimed{};
-        std::memcpy(claimed.data(), payload.data(), kDevIdLen);
-        bool all_zero = true;
-        for (uint8_t b : claimed) {
-            if (b != 0) { all_zero = false; break; }
-        }
-        if (!all_zero) s.peer_ = claimed;
-    }
-
-    std::vector<uint8_t> msg(256);
-    auto n = s.handshake_->write_message({}, msg);
-    if (!n) return std::nullopt;
-    msg.resize(*n);
-
-    s.handshake_msg_ = encode_handshake_resp(hi->conn_id, msg, h->txn_id);
-    s.out_.push_back({from, s.handshake_msg_});
-    s.finish_handshake(s.handshake_->split(), now);
-    return s;
-}
-
-bool Session::resend_handshake_response() {
-    if (initiator_ || state_ == SessionState::Closed || handshake_msg_.empty()) return false;
-    out_.push_back({path_, handshake_msg_});
-    return true;
-}
-
-void Session::finish_handshake(crypto::Split split, Instant now) {
-    send_cs_        = split.send;
-    recv_cs_        = split.recv;
-    handshake_hash_ = split.handshake_hash;
-    handshake_.reset();
-
-    state_          = SessionState::Established;
-    established_at_ = now;
-    last_recv_      = now;
-    next_keepalive_ = now + cfg_.keepalive;
-    events_.push_back({SessionEvent::Kind::Established, {}, path_});
+void Session::set_path(const Endpoint& path, Instant now) {
+    path_ = path;
+    // A new path needs its NAT mapping opened and held from our side too.
+    next_keepalive_ = now;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,22 +67,7 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
     auto         h = wire::Header::decode(r);
     if (!h) return;
 
-    if (h->type == wire::MsgType::HandshakeResp) {
-        if (!initiator_ || state_ != SessionState::Handshaking || !handshake_) return;
-        auto hr = wire::HandshakeResp::decode(r);
-        if (!hr || hr->conn_id != conn_id_) return;
-
-        std::vector<uint8_t> payload(256);
-        if (!handshake_->read_message(hr->noise_msg, payload)) return;  // drop silently
-        if (!handshake_->is_finished()) return;
-        finish_handshake(handshake_->split(), now);
-        return;
-    }
-
     if (h->type == wire::MsgType::Close) {
-        if (state_ != SessionState::Established && state_ != SessionState::NeedsRehandshake) {
-            return;
-        }
         auto m = wire::Close::decode(r);
         if (!m || m->conn_id != conn_id_) return;
 
@@ -262,7 +92,6 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
     }
 
     if (h->type != wire::MsgType::Transport) return;
-    if (state_ != SessionState::Established && state_ != SessionState::NeedsRehandshake) return;
 
     auto t = wire::Transport::decode(r);
     if (!t || t->conn_id != conn_id_) return;
@@ -288,7 +117,7 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
 
     plain.resize(*n);
     if (plain.empty()) return;  // keepalive
-    events_.push_back({SessionEvent::Kind::Data, std::move(plain), {}, t->counter});
+    events_.push_back({SessionEvent::Kind::Data, std::move(plain), {}});
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +184,7 @@ std::optional<uint64_t> Session::send(std::span<const uint8_t> payload, Instant 
     std::vector<uint8_t> ct(payload.size() + crypto::kTagLen);
     send_cs_.encrypt_at(send_counter_, {}, payload, ct);
 
-    std::vector<uint8_t> buf(wire::kMaxDatagram);
+    std::vector<uint8_t> buf(wire::kMaxDatagram + 64);
     wire::Writer         w{buf};
     wire::Header{wire::MsgType::Transport, wire::kVersion, 0, 0}.encode(w);
     wire::Transport t;
@@ -418,13 +247,7 @@ void Session::queue_close(uint16_t reason) {
 
 void Session::close_with_notice(uint16_t reason, Instant now) {
     if (state_ == SessionState::Closed) return;
-
-    // Only a session that reached the point of having keys can say anything. A
-    // handshake that never completed has no way to authenticate a goodbye, and
-    // an unauthenticated one would be a teardown primitive for anybody.
-    if (state_ == SessionState::Established || state_ == SessionState::NeedsRehandshake) {
-        for (int i = 0; i < kCloseCopies; ++i) queue_close(reason);
-    }
+    for (int i = 0; i < kCloseCopies; ++i) queue_close(reason);
     close(now);
 }
 
@@ -451,52 +274,17 @@ void Session::close_with_cause(Instant now, CloseCause cause, uint16_t peer_reas
 void Session::on_timeout(Instant now) {
     if (state_ == SessionState::Closed) return;
 
-    if (state_ == SessionState::Handshaking) {
-        if (now < handshake_next_) return;
-        if (handshake_attempts_ >= cfg_.handshake_retries) {
-            close_with_cause(now, CloseCause::TimedOut, 0);
-            return;
-        }
-        if (initiator_) emit_handshake_init(now);
-        return;
-    }
-
     if (now - last_recv_ >= cfg_.idle_timeout) {
         close_with_cause(now, CloseCause::TimedOut, 0);
         return;
     }
-
-    if (state_ == SessionState::Established && now - established_at_ >= cfg_.max_lifetime) {
-        // No in-place rekey: ask the layer above for a fresh handshake instead.
-        // The path is still good, so this is cheap.
-        state_ = SessionState::NeedsRehandshake;
-        events_.push_back({SessionEvent::Kind::NeedsRehandshake, {}, path_});
-        return;
-    }
-
-    if (state_ == SessionState::Established && now >= next_keepalive_) {
-        queue_keepalive(now);
-    }
+    if (now >= next_keepalive_) queue_keepalive(now);
 }
 
 std::optional<Instant> Session::next_timeout() const {
-    switch (state_) {
-        case SessionState::Handshaking:
-            return handshake_next_;
-        case SessionState::Established: {
-            Instant idle    = last_recv_ + cfg_.idle_timeout;
-            Instant life    = established_at_ + cfg_.max_lifetime;
-            Instant soonest = next_keepalive_;
-            if (idle < soonest) soonest = idle;
-            if (life < soonest) soonest = life;
-            return soonest;
-        }
-        case SessionState::NeedsRehandshake:
-            return last_recv_ + cfg_.idle_timeout;
-        case SessionState::Closed:
-            return std::nullopt;
-    }
-    return std::nullopt;
+    if (state_ == SessionState::Closed) return std::nullopt;
+    const Instant idle = last_recv_ + cfg_.idle_timeout;
+    return next_keepalive_ < idle ? next_keepalive_ : idle;
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +303,5 @@ std::optional<SessionEvent> Session::poll_event() {
     events_.pop_front();
     return e;
 }
-
-std::string Session::sas() const { return crypto::sas_string(handshake_hash_); }
 
 }  // namespace uconnect::session

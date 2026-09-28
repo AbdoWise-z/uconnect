@@ -1,21 +1,21 @@
 #pragma once
-// uConnect wire protocol v1.
+// uConnect wire formats shared by every channel: the 8-byte header, the message
+// type space, and the messages that are not the control protocol's own.
 //
-// One UDP socket carries three traffic classes, demultiplexed on the first
-// byte of the datagram:
+// Two protocols share the header and the type space, told apart by the
+// header's version byte:
 //
-//   0x01-0x1F  server signaling
-//   0x20-0x2F  peer probe / punch
-//   0x30-0x3F  Noise handshake
-//   0x40-0x4F  Noise transport
+//   v2 (control.hpp)  the TCP control connection to the rendezvous server, and
+//                     the few UDP messages the server answers (WhoAmI, the UDP
+//                     relay). Types 0x01-0x1F.
+//   v1 (this file)    the UDP datagram channel between two peers: probes that
+//                     punch a path (0x20-0x2F) and AEAD-sealed transport
+//                     (0x40-0x4F). Keys come from the peers' TCP session.
 //
-// All integers are big-endian. Every datagram opens with an 8-byte Header.
+// A few bodies defined here -- PeerEntry, ResolveOk, TopicSummary, Relayed,
+// RelayData, Error -- are carried by the control protocol too.
 //
-// Authenticated messages (Keepalive/Update/Unregister/Connect) carry
-// seq(8) | mac(16), where mac = BLAKE2s(key = lease_token, all preceding bytes
-// of the datagram). The lease_token itself is transmitted exactly once, in
-// RegisterOk, and never again -- sending a bearer token three times a minute
-// over UDP would hand record ownership to any on-path observer.
+// All integers are big-endian.
 
 #include <optional>
 #include <string>
@@ -38,27 +38,15 @@ inline constexpr size_t kMaxCandidates   = 8;
 inline constexpr uint8_t kLookupDefault = 30;   // hard default
 inline constexpr uint8_t kLookupMax     = 100;  // client may request up to this
 
-// Every request whose reply is larger than itself is sent at least this long,
-// zero-padded at the end (decoders ignore trailing bytes). A server answers an
-// unvalidated address with a Retry -- header, length byte and a 16-byte cookie,
-// 25 bytes -- and never sends one larger than the request that provoked it, so
-// a request shorter than that is dropped rather than amplified.
-inline constexpr size_t kMinUnvalidatedRequest = 32;
+inline constexpr size_t kProbeTxnLen = 16;
+inline constexpr size_t kProbeTagLen = 16;
 
-inline constexpr size_t kMacLen        = 16;
-inline constexpr size_t kLeaseTokenLen = 32;
-inline constexpr size_t kProbeTxnLen   = 16;
-inline constexpr size_t kProbeTagLen   = 16;
-inline constexpr size_t kMaxCookieLen  = 32;
-
-using Mac        = std::array<uint8_t, kMacLen>;
-using LeaseToken = std::array<uint8_t, kLeaseTokenLen>;
-using ProbeTxn   = std::array<uint8_t, kProbeTxnLen>;
-using ProbeTag   = std::array<uint8_t, kProbeTagLen>;
-using ConnId     = uint32_t;
+using ProbeTxn = std::array<uint8_t, kProbeTxnLen>;
+using ProbeTag = std::array<uint8_t, kProbeTagLen>;
+using ConnId   = uint32_t;
 
 enum class MsgType : uint8_t {
-    // --- server signaling ---
+    // --- control protocol (control.hpp) ---
     Register      = 0x01, RegisterOk    = 0x02,
     Keepalive     = 0x03, KeepaliveOk   = 0x04,
     Update        = 0x05, UpdateOk      = 0x06,
@@ -68,10 +56,10 @@ enum class MsgType : uint8_t {
     Topics        = 0x0D, TopicsOk      = 0x0E,
     Stats         = 0x0F, StatsOk       = 0x10,
     Connect       = 0x11, Relayed       = 0x12,
-    Retry         = 0x13, Error         = 0x14,
+    // 0x13 was v1's Retry; retired with UDP signaling.
+    Error         = 0x14,
     RelayAlloc    = 0x15, RelayAllocOk  = 0x16,
     RelayData     = 0x17,
-    // --- control protocol v2 only (control.hpp) ---
     RelayOffer    = 0x18,  // server -> peer: a relay was allocated to reach you
     RelayJoin     = 0x19,  // first frame on a relay connection
     RelayJoinOk   = 0x1A,  // both sides joined; raw bytes from here on
@@ -79,18 +67,17 @@ enum class MsgType : uint8_t {
     UdpRelayBind  = 0x1D, UdpRelayBindOk = 0x1E, // UDP: claim a UDP relay slot
     // --- peer probe ---
     Probe         = 0x20, ProbeOk       = 0x21,
-    // --- noise ---
-    HandshakeInit = 0x30, HandshakeResp = 0x31,
+    // --- datagram transport ---
+    // 0x30-0x3F was v1's UDP Noise handshake; the TCP session runs it now.
     Transport     = 0x40,
     Close         = 0x41,
 };
 
-enum class MsgClass : uint8_t { Signaling, Probe, Handshake, Transport, Unknown };
+enum class MsgClass : uint8_t { Signaling, Probe, Transport, Unknown };
 
 constexpr MsgClass classify(uint8_t type) {
     if (type >= 0x01 && type <= 0x1F) return MsgClass::Signaling;
     if (type >= 0x20 && type <= 0x2F) return MsgClass::Probe;
-    if (type >= 0x30 && type <= 0x3F) return MsgClass::Handshake;
     if (type >= 0x40 && type <= 0x4F) return MsgClass::Transport;
     return MsgClass::Unknown;
 }
@@ -124,8 +111,8 @@ struct Header {
         w.u32(txn_id);
     }
 
-    // `version` is the protocol the caller speaks: v1 for this UDP signaling,
-    // v2 for the TCP control protocol (control.hpp), which shares the header.
+    // `version` is the protocol the caller speaks: v1 for the peer datagram
+    // channel, v2 for the control protocol (control.hpp).
     static std::optional<Header> decode(Reader& r, uint8_t version = kVersion) {
         Header h;
         h.type    = static_cast<MsgType>(r.u8());
@@ -146,87 +133,7 @@ inline std::optional<MsgType> peek_type(std::span<const uint8_t> dgram) {
     return static_cast<MsgType>(dgram[0]);
 }
 
-// ---------------------------------------------------------------------------
-// Authenticated-message support.
-//
-// The wire layer does not compute MACs -- that would make it depend on crypto
-// and break the layering. Instead it writes everything up to the MAC via
-// encode_prefix(), then the caller MACs writer.written() and appends the
-// result. On decode, `authed` holds the span the MAC covers, so the caller can
-// verify it.
-// ---------------------------------------------------------------------------
-struct Authed {
-    uint64_t                 seq = 0;
-    Mac                      mac{};
-    std::span<const uint8_t> authed{};  // valid while the source datagram is
-};
-
-// --- Register --------------------------------------------------------------
-struct Register {
-    TopicId                id{};
-    TopicMode              mode      = TopicMode::Open;
-    uint8_t                key_epoch = 0;
-    bool                   unlisted  = false;
-    std::vector<Candidate> host_cands;  // client supplies host only; srflx is observed
-    std::vector<uint8_t>   meta;
-    std::vector<uint8_t>   cookie;      // from Retry; empty on the first attempt
-
-    void encode(Writer&) const;
-    static std::optional<Register> decode(Reader&, const Header&);
-};
-
-struct RegisterOk {
-    DevId      dev_id{};
-    LeaseToken lease_token{};
-    Endpoint   srflx{};  // the mapping the server observed -- this is the STUN result
-    uint16_t   ttl_secs       = 0;
-    uint16_t   peers_in_topic = 0;
-
-    void encode(Writer&) const;
-    static std::optional<RegisterOk> decode(Reader&);
-};
-
-// --- Keepalive / Unregister (identical shape) ------------------------------
-struct DevAuth {
-    DevId  dev_id{};
-    Authed auth{};
-
-    void encode_prefix(Writer&) const;
-    static std::optional<DevAuth> decode(Reader&);
-};
-using Keepalive  = DevAuth;
-using Unregister = DevAuth;
-
-struct KeepaliveOk {
-    Endpoint srflx{};  // re-reported every time: a NAT rebind shows up here
-    uint16_t expires_in = 0;
-
-    void encode(Writer&) const;
-    static std::optional<KeepaliveOk> decode(Reader&);
-};
-
-// --- Update ----------------------------------------------------------------
-struct Update {
-    DevId                  dev_id{};
-    std::vector<Candidate> host_cands;
-    std::vector<uint8_t>   meta;
-    Authed                 auth{};
-
-    void encode_prefix(Writer&) const;
-    static std::optional<Update> decode(Reader&);
-};
-
-// --- Lookup ----------------------------------------------------------------
-struct Lookup {
-    TopicId              id{};
-    uint8_t              max       = kLookupDefault;
-    bool                 want_meta = false;
-    std::vector<uint8_t> cookie;
-
-    void encode(Writer&) const;
-    static std::optional<Lookup> decode(Reader&, const Header&);
-};
-
+// --- Directory entries (carried by the control protocol) --------------------
 struct PeerEntry {
     DevId                  dev_id{};
     uint16_t               age_secs = 0;
@@ -239,53 +146,6 @@ struct PeerEntry {
     static std::optional<PeerEntry> decode(Reader&);
 };
 
-// Responses are paged: all parts share one txn_id, and the client uses whatever
-// arrives before its reassembly timeout.
-//
-// Measured sizes against a 1200-byte budget (see test_store.cpp, which asserts
-// these so they cannot drift):
-//
-//   30 entries, srflx v4 only      930   fits
-//   30 entries, srflx + host v4   1170   fits, 30 bytes of headroom
-//   30 entries, + one host v6     1770   needs 2 pages
-//   30 entries, + 64B meta        3090   needs 3 pages
-//   100 entries, srflx + host v4  3830   needs 4 pages
-//
-// So the common v4-only case fits in a single datagram, and paging exists for
-// IPv6 candidates, metadata, and the larger caps. The headroom on the v4 case
-// is thin enough that the server must size pages from encoded_size() rather
-// than assume.
-struct LookupOk {
-    TopicId                id{};
-    TopicMode              mode  = TopicMode::Open;
-    uint16_t               total = 0;  // matching records on the server, pre-sampling
-    uint8_t                part  = 0;
-    uint8_t                parts = 1;
-    std::vector<PeerEntry> entries;
-
-    void encode(Writer&) const;
-    static std::optional<LookupOk> decode(Reader&);
-};
-
-// --- Resolve ---------------------------------------------------------------
-struct Resolve {
-    DevId                dev_id{};
-    std::vector<uint8_t> cookie;  // required: the reply is ~12x the request
-
-    void encode(Writer&) const;
-    static std::optional<Resolve> decode(Reader&);
-};
-
-// --- Stats -----------------------------------------------------------------
-// Carries only a cookie. The reply is ~14x the request, so it needs address
-// validation like every other amplifying path.
-struct Stats {
-    std::vector<uint8_t> cookie;
-
-    void encode(Writer&) const;
-    static std::optional<Stats> decode(Reader&);
-};
-
 struct ResolveOk {
     bool      found = false;
     TopicId   topic{};
@@ -293,16 +153,6 @@ struct ResolveOk {
 
     void encode(Writer&) const;
     static std::optional<ResolveOk> decode(Reader&);
-};
-
-// --- Topics ----------------------------------------------------------------
-struct Topics {
-    uint32_t             cursor = 0;
-    uint8_t              limit  = 100;
-    std::vector<uint8_t> cookie;
-
-    void encode(Writer&) const;
-    static std::optional<Topics> decode(Reader&);
 };
 
 struct TopicSummary {
@@ -315,30 +165,9 @@ struct TopicSummary {
     static std::optional<TopicSummary> decode(Reader&);
 };
 
-struct TopicsOk {
-    uint32_t                  next_cursor = 0;
-    uint8_t                   part        = 0;
-    uint8_t                   parts       = 1;
-    std::vector<TopicSummary> topics;
-
-    void encode(Writer&) const;
-    static std::optional<TopicsOk> decode(Reader&);
-};
-
-// --- Connect / Relayed -----------------------------------------------------
-// Punching requires both ends to fire at once. Without a way to tell B that A
-// is about to punch, A hammers a NAT with no reason to let it through and B
-// never reciprocates. The server relays two or three opaque blobs, then stops.
-struct Connect {
-    DevId                from_dev{};
-    DevId                to_dev{};
-    std::vector<uint8_t> payload;
-    Authed               auth{};
-
-    void encode_prefix(Writer&) const;
-    static std::optional<Connect> decode(Reader&);
-};
-
+// --- Relayed ---------------------------------------------------------------
+// A CONNECT as the target receives it: who is calling, and their opaque
+// introduction. The server stamps from_dev itself; the payload it only carries.
 struct Relayed {
     DevId                from_dev{};
     std::vector<uint8_t> payload;
@@ -348,44 +177,16 @@ struct Relayed {
 };
 
 // --- Relay -----------------------------------------------------------------
-// The fallback for pairs that cannot hole punch, which in practice means
-// symmetric NAT on both ends: such a NAT allocates a fresh external port per
-// destination, so the address the rendezvous server observed is not the
-// address a peer must hit, and no amount of probing finds one that works.
-//
-// The relay forwards OPAQUE BYTES. It sits below the crypto layer, so what it
-// carries is a Noise handshake message or an AEAD-sealed transport frame. The
+// The fallback for pairs that cannot hole punch. The relay forwards OPAQUE
+// BYTES: it sits below the crypto layer, so what it carries is AEAD-sealed. The
 // server learns metadata -- who talks to whom, when, how much -- and nothing
-// else. It cannot read a keyed topic's traffic or inject into it, exactly as
-// it cannot on a directly punched path.
-//
-// This is the one place the server stays in the path after introducing two
-// peers, so it is deliberately separate from the punching flow: bandwidth is
-// metered per binding, and a relay is only requested once punching has failed.
+// else. Bandwidth is metered per binding.
 using RelayId = uint64_t;
 
-struct RelayAlloc {
-    DevId  from_dev{};
-    DevId  peer_dev{};
-    Authed auth{};
-
-    void encode_prefix(Writer&) const;
-    static std::optional<RelayAlloc> decode(Reader&);
-};
-
-struct RelayAllocOk {
-    RelayId  relay_id   = 0;
-    uint16_t expires_in = 0;
-    uint32_t max_kib    = 0;  // bandwidth ceiling for this binding
-
-    void encode(Writer&) const;
-    static std::optional<RelayAllocOk> decode(Reader&);
-};
-
-// Carries one wrapped datagram in either direction. Unauthenticated at this
-// layer on purpose: adding a MAC here would buy nothing, because the payload
-// is already authenticated end to end and a forged wrapper can only waste the
-// relay's bandwidth -- which the per-binding quota already bounds.
+// One datagram through the server's UDP relay, in either direction.
+// Unauthenticated at this layer on purpose: the payload is already
+// authenticated end to end, and a forged wrapper can only waste the relay's
+// bandwidth -- which the per-binding quota already bounds.
 struct RelayData {
     RelayId              relay_id = 0;
     std::vector<uint8_t> payload;
@@ -394,16 +195,7 @@ struct RelayData {
     static std::optional<RelayData> decode(Reader&);
 };
 
-// --- Retry / Error ---------------------------------------------------------
-// Address validation, QUIC-Retry style. Any response larger than its request
-// requires a valid cookie first, or the server is a UDP amplifier.
-struct Retry {
-    std::vector<uint8_t> cookie;
-
-    void encode(Writer&) const;
-    static std::optional<Retry> decode(Reader&);
-};
-
+// --- Error -----------------------------------------------------------------
 struct Error {
     ErrorCode   code = ErrorCode::None;
     std::string reason;
@@ -415,14 +207,14 @@ struct Error {
 // --- Probe -----------------------------------------------------------------
 // probe_txn is CSPRNG, unique per candidate pair, single-use. Echoing it in
 // ProbeOk is the challenge-response: it proves the peer can receive at that
-// address, and it anchors handshake freshness.
+// address.
 //
-// tag = BLAKE2s(key = HKDF(K, "uconnect:v1:probe"), txn || src || dst), zeroed
-// on open topics. On a keyed topic a non-member cannot elicit a response at
-// all, so you never confirm your existence to a scanner.
+// tag = BLAKE2s(key = the channel's probe key, domain || txn). The probe key
+// comes from the peers' TCP session, so nobody outside it can elicit an
+// answer -- a scanner never learns that anything is listening.
 //
-// Note there is no topic_id on the wire: probe_txn is matched against the local
-// pending attempt, so an observer learns nothing about topic membership.
+// There is no topic_id or dev_id on the wire: probe_txn is matched against the
+// local pending attempt, so an observer learns nothing about membership.
 struct Probe {
     ProbeTxn txn{};
     ProbeTag tag{};
@@ -440,28 +232,10 @@ struct ProbeOk {
     static std::optional<ProbeOk> decode(Reader&);
 };
 
-// --- Noise -----------------------------------------------------------------
-// conn_id is chosen by the initiator. Matching on it rather than on the 4-tuple
-// is what lets a session survive a NAT rebind: packets from a new source
-// address still find their session, the new path is revalidated with a fresh
-// probe, and no rehandshake is needed.
-struct HandshakeInit {
-    ConnId               conn_id = 0;
-    ProbeTxn             probe_txn{};  // binds this handshake to a validated path
-    std::vector<uint8_t> noise_msg;    // [e, psk] + padding
-
-    void encode(Writer&) const;
-    static std::optional<HandshakeInit> decode(Reader&);
-};
-
-struct HandshakeResp {
-    ConnId               conn_id = 0;
-    std::vector<uint8_t> noise_msg;  // [e, ee]
-
-    void encode(Writer&) const;
-    static std::optional<HandshakeResp> decode(Reader&);
-};
-
+// --- Transport -------------------------------------------------------------
+// conn_id is derived from the TCP session, identically on both ends. Matching
+// on it rather than on the 4-tuple is what lets the channel survive a NAT
+// rebind, and move between a punched path and the relay.
 struct Transport {
     ConnId                   conn_id = 0;
     uint64_t                 counter = 0;
@@ -471,8 +245,11 @@ struct Transport {
     static std::optional<Transport> decode(Reader&);
 };
 
+// Header, conn_id, counter and tag around every datagram payload.
+inline constexpr size_t kTransportOverhead = Header::kSize + 4 + 8 + 16;
+
 // A peer telling us it is going away, so we learn in one round trip instead of
-// waiting out the 90-second idle timeout holding a NAT binding open.
+// waiting out the idle timeout holding a NAT binding open.
 //
 // Same envelope as Transport -- conn_id, counter, ciphertext -- because it IS a
 // transport packet: same keys, same counter space, same replay window. What

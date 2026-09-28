@@ -1,7 +1,7 @@
 #pragma once
 // NAT hole punching: candidate ranking, probe fan-out, path validation and
-// nomination. Sans-IO -- it consumes datagrams and a clock reading, and
-// produces datagrams and events. No sockets.
+// nomination for the UDP datagram channel. Sans-IO -- it consumes datagrams
+// and a clock reading, and produces datagrams and events. No sockets.
 //
 // This is the layer that cannot be debugged against the real internet, which is
 // precisely why it takes `now` as a parameter: tests/test_punch.cpp drives it
@@ -19,8 +19,7 @@
 //      EXPECTED to be dropped -- until both sides have sent, neither NAT has a
 //      reason to let the other in.
 //   4. A pair is validated when a ProbeOk echoes our transaction id. That round
-//      trip is the challenge-response, and it is what a handshake is later
-//      gated on.
+//      trip is the challenge-response: it proves the peer receives there.
 //   5. Nominate the best validated pair after a short grace window, so a host
 //      path that validates 5ms later than a relayed one still wins.
 
@@ -90,10 +89,10 @@ struct LocalView {
 
 class PunchSession {
 public:
-    // probe_key is HKDF(K, "uconnect:v1:probe") for a keyed topic, or nullptr
-    // for an open one. When present, a non-member cannot produce a valid probe
-    // and therefore cannot even elicit a response -- you never confirm your
-    // existence to a scanner.
+    // probe_key tags every probe; the Node passes the datagram channel's probe
+    // key from TcpSession::datagram_keys(), so only the peer at the other end
+    // of that session can produce a valid probe or even elicit a response --
+    // you never confirm your existence to a scanner. nullptr answers anyone.
     // jitter_seed makes retransmit timing reproducible. Default 0 means "seed
     // from the CSPRNG"; tests pass a fixed value so a punch attempt replays
     // identically. Without this the punch layer reads real entropy and its

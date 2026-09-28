@@ -427,9 +427,8 @@ TEST(the_top_ranked_pair_is_nominated_immediately_without_waiting_out_the_grace)
 }
 
 TEST(nominated_path_and_txn_are_exposed_for_handshake_binding) {
-    // The handshake prologue includes the nominated probe_txn, which is what
-    // makes a replayed HandshakeInit useless: it arrives bound to a transaction
-    // the responder never issued.
+    // The layer above sends on the nominated path, and the txn is what
+    // validated it.
     Network net{{5ms, 0ms, 0.0, 29}};
     net.add_host("A", ep4(198, 51, 100, 8, 51820), nullptr);
     net.add_host("B", ep4(198, 51, 100, 9, 51820), nullptr);

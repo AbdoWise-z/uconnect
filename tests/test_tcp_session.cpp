@@ -256,3 +256,17 @@ TEST(tcp_session_datagram_keys_pair_up_and_share_nothing_with_each_other) {
     pump(q);
     CHECK(!(q.a.datagram_keys().send == ka.send));
 }
+
+TEST(tcp_session_each_datagram_epoch_has_keys_of_its_own) {
+    // A reopened channel counts its packets from zero again; under the same
+    // keys that would reuse every nonce. Both ends must still agree per epoch.
+    auto p = session_pair();
+    pump(p);
+    auto a1 = p.a.datagram_keys(1), a2 = p.a.datagram_keys(2);
+    auto b2 = p.b.datagram_keys(2);
+    CHECK(!(a1.send == a2.send));
+    CHECK(!(a1.probe == a2.probe));
+    CHECK(a1.conn_id != a2.conn_id);
+    CHECK(a2.send == b2.recv);
+    CHECK(a2.conn_id == b2.conn_id);
+}

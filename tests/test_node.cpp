@@ -102,6 +102,7 @@ Node::Config config_for(const LocalServer& srv, bool force_relay = false) {
     Node::Config c;
     c.server      = srv.address();
     c.force_relay = force_relay;
+    c.verbose     = std::getenv("UCONNECT_TEST_VERBOSE") != nullptr;
     return c;
 }
 
@@ -652,7 +653,6 @@ struct DgramPair {
 Node::Config dgram_config(const LocalServer& srv, bool force_relay, DatagramFallback fb) {
     Node::Config c       = config_for(srv, force_relay);
     c.datagram_fallback  = fb;
-    c.verbose            = std::getenv("UCONNECT_TEST_VERBOSE") != nullptr;
     return c;
 }
 

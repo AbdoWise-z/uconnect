@@ -2,13 +2,15 @@
 
 Peer-to-peer networking where a server only introduces peers, then gets out of
 the way. Two devices sharing a topic and a secret find each other through a
-rendezvous server, punch through NAT, and talk over an authenticated,
-forward-secret channel the server cannot read or impersonate.
+rendezvous server, punch a TCP connection through NAT, and talk over an
+authenticated, forward-secret channel the server cannot read or impersonate.
+When they need it, a UDP datagram channel opens beside it, keyed from the same
+handshake.
 
-When both ends sit behind symmetric NAT, punching cannot work and the server
-stays in the path as a relay — but only as a pipe. It forwards ciphertext it
-cannot decrypt, on a session negotiated end to end, so the trust model does not
-change when the route does.
+When the NATs will not let a connection through, the server stays in the path
+as a relay — but only as a pipe. It forwards ciphertext it cannot decrypt, on a
+session negotiated end to end, so the trust model does not change when the
+route does.
 
 ```cpp
 uconnect::Node node{"rv.example.com:4433"};
@@ -19,13 +21,12 @@ auto& topic = node.join(uconnect::TopicCreds::parse(
 
 topic.on_data([](auto dev, auto bytes) { /* ... */ });
 topic.publish(meta);       // become findable
-topic.connect_all(8);      // LOOKUP -> punch -> Noise handshake
-topic.broadcast(payload);  // unreliable datagram
+topic.connect_all(8);      // LOOKUP -> punch TCP -> Noise handshake
+topic.broadcast(payload);  // a reliable, ordered message to every peer
 
-// ...or a reliable ordered stream, when delivery matters
-auto s = topic.open_stream(dev);
-s.write(bytes);
-s.finish();
+// ...or unreliable datagrams, when late is as bad as lost
+topic.open_datagrams(dev, uconnect::DatagramFallback::Relay);
+topic.send_datagram(dev, frame);
 ```
 
 **Contents** — [Using the library](#using-the-library) ·
@@ -79,29 +80,33 @@ entropy of the passphrase, not of 256 bits.
 
 ## Starting a node
 
-A `Node` owns one UDP socket, one background thread, and every topic joined
-through it.
+A `Node` owns one TCP port, one background thread, and every topic joined
+through it — plus a UDP socket, opened the first time a datagram channel needs
+one.
 
 ```cpp
 Node::Config cfg;
-cfg.server      = "rv.example.com:4433";   // the only required field
-cfg.bind_port   = 0;                       // 0 = ephemeral
-cfg.keepalive   = 20s;                     // also holds the NAT binding open
-cfg.force_relay = false;                   // skip punching, go straight to relay
-cfg.verbose     = false;                   // protocol tracing to stderr
+cfg.server        = "rv.example.com:4433";  // the only required field
+cfg.bind_port     = 0;                      // 0 = ephemeral
+cfg.keepalive     = 20s;                    // refreshes records with the server
+cfg.punch_timeout = 8s;                     // then fall back to the relay
+cfg.force_relay   = false;                  // skip punching, go straight to the fallback
+cfg.verbose       = false;                  // protocol tracing to stderr
 
-cfg.stream_recv_window   = 256 * 1024;     // per stream
-cfg.conn_recv_window     = 1024 * 1024;    // across all streams on one peer
-cfg.max_streams_per_peer = 64;
-cfg.rekey_shift          = 16;             // ratchet keys every 2^16 packets
+cfg.datagram_fallback = DatagramFallback::Tcp;  // for channels peers open to us
+cfg.rekey_shift       = 16;                     // ratchet datagram keys every 2^16 packets
 
 Node node{cfg};
 node.run_in_background();      // or node.run() to block on this thread
 ```
 
-The constructor throws `std::runtime_error` if it cannot bind the socket or
-resolve the server. Those are the only two failures that happen before anything
-is running.
+The constructor throws `std::runtime_error` if it cannot listen on its port or
+resolve the server, and `std::invalid_argument` for a `rekey_shift` outside
+7..63. Those are the only failures that happen before anything is running.
+
+The node connects to the server on its own, keeps that connection up, and
+reconnects — registering every published topic again — if it drops.
+`node.server_connected()` says whether it is up right now.
 
 ## Joining a topic
 
@@ -138,9 +143,9 @@ topic.set_auto_connect(true);     // keep doing it, on the library's interval
 topic.set_max_peers(16);
 ```
 
-Prefer `set_auto_connect(true)` to a polling loop. Calling `peers()` on a 20 ms
-tick produces thousands of lookups a minute and will trip the server's rate
-limiter.
+`connect()` needs a published topic: the server introduces peers only to a
+registered member. Prefer `set_auto_connect(true)` to a polling loop — calling
+`peers()` on a 20 ms tick produces thousands of lookups a minute.
 
 `connect()` returns immediately; connecting is asynchronous and takes a few
 round trips. Watch `on_peer` for progress:
@@ -150,113 +155,79 @@ Unknown -> Probing -> Handshaking -> Connected
                    \-> Failed          \-> Closed
 ```
 
-## Datagrams
+`Probing` covers both punching and, if that fails, the relay. `Failed` means
+neither worked.
 
-Unreliable, unordered and cheap — the session's native shape.
+## Messages
+
+Each peer connection is one TCP connection, so messages are what TCP is:
+reliable and ordered. Each arrives whole, once, in the order sent, as one
+`on_data` call.
 
 ```cpp
-topic.send(dev, bytes);        // one peer
+topic.send(dev, bytes);        // one peer; up to Topic::max_message() = 1 MiB
 topic.broadcast(bytes);        // every connected peer; returns how many
 topic.on_data([](DevId dev, std::span<const uint8_t> bytes) { /* ... */ });
 ```
 
-Good for presence, telemetry, a game tick — anything where the next update makes
-a lost one irrelevant. Use a stream when delivery matters.
+`send()` returns false if the peer is not connected, the message is too large,
+or the peer is reading so slowly that 16 MiB is already queued for it — that
+last one is backpressure; try again later.
 
-## Streams
+## Datagrams
 
-The session layer gives you authenticated datagrams: confidential, replay-proof,
-and free to lose or reorder. `Stream` adds the rest — reliability, ordering, flow
-control and congestion control — in a layer shaped like QUIC (RFC 9000/9002).
-
-| | session datagram | `Stream` |
-|---|---|---|
-| confidentiality, authentication, dedup | yes | inherited |
-| reliability, ordering | no | **yes** |
-| flow control, congestion control | no | **yes** |
-| `Topic::send` / `broadcast` | yes | |
-| `Topic::open_stream` | | yes |
-
-Streams are **multiplexed**, so head-of-line blocking is per stream, not per
-connection: a lost packet stalls its own stream while the others keep flowing.
-That is the reason to build on datagrams rather than one ordered pipe, and it is
-the thing TCP cannot offer.
+TCP's reliability has a price: one lost segment holds up everything behind it.
+For traffic where late is as bad as lost — voice, game state, telemetry — open a
+datagram channel:
 
 ```cpp
-Stream s = topic.open_stream(dev);          // invalid handle if not connected
-                                            // or at the stream limit
-Stream u = topic.open_stream(dev, false);   // unidirectional
+topic.open_datagrams(dev, DatagramFallback::Relay);   // asynchronous
+topic.on_datagram_path([](DevId, DatagramPath p) { /* Opening -> Direct ... */ });
 
-s.write(bytes);                             // short count = backpressure
-s.read(buf);                                // contiguous prefix only
-s.readable();  s.readable_bytes();  s.writable();  s.finished();
-s.id();  s.peer();  s.valid();
+topic.send_datagram(dev, bytes);   // up to Topic::max_datagram() = 1100 bytes
+topic.on_datagram([](DevId dev, std::span<const uint8_t> bytes) { /* ... */ });
+topic.close_datagrams(dev);
 ```
 
-Always check the handle: `open_stream` returns an invalid `Stream` if the peer
-is not connected, or if this peer is already at `max_streams_per_peer`.
+Unreliable, unordered, never waiting on each other. The channel is keyed from
+the TCP connection's handshake, so it authenticates the same peer and needs no
+handshake of its own; opening it only punches a UDP path. The peer accepts
+automatically.
 
-A short `write()` is backpressure, not an error — wait for `on_stream_writable`
-rather than polling `writable()` on a timer.
+When UDP cannot be punched, **you choose what happens**, and each side applies
+its own choice to what it sends:
 
-A write can fall short for three reasons, and `on_stream_writable` covers all
-of them: the connection-wide window, this stream's share of it, and
-`stream_send_cap` — the bound on how much unacknowledged data one stream may
-hold locally. The last is relieved by your own data being acknowledged rather
-than by anything the peer says, which is worth knowing if you are reasoning
-about why a transfer paused.
-
-Both directions of a bidirectional stream have their own independent
-backpressure. `writable()` and `on_stream_writable` always concern *our*
-sending direction; whether the peer can write to us is its own business and
-its own signal at its end.
-
-### Ending a stream
-
-Four verbs, and the difference is worth reading once:
-
-| | ends | releases the stream |
+| `DatagramFallback` | datagrams travel | trade-off |
 |---|---|---|
-| `finish()` | our sending direction, gracefully | only once **both** ends finish |
-| `reset(code)` | our sending direction, abruptly | no — the peer may still send to us |
-| `close(code)` | **both** directions | yes, from one side |
-| `stop_sending(code)` | the **peer's** direction | no — ours stays open |
+| `Tcp` | over the TCP connection | always works, costs nothing, but arrives reliably and in order — late rather than lost |
+| `Relay` | through the server's UDP relay | stays unreliable and low-latency, but the server is in the path and the pair's relay budget is finite |
+| `None` | nowhere | `send_datagram()` returns false |
 
-`finish()` is a half-close. On a bidirectional stream the reverse direction stays
-open, which is the point — but it means a one-way transfer where only the sender
-finishes leaves the stream live on both ends. For one-way transfers open the
-stream **unidirectional**; it then retires as soon as the receiver drains it.
+```
+None -> Opening -> Direct                       punched UDP
+                \-> Relayed | Tcp | Failed      the fallback, or none
+```
 
-`close()` is the one-sided teardown: it aborts our direction and asks the peer to
-abort its own, and the peer's answer is what releases our side. It closes a
-*stream*, not the connection — the session and every other stream on that peer
-keep running.
-
-`stop_sending()` is the reader's verb: "I have what I need, stop" — without
-giving up our own direction the way `close()` does.
-
-Finished streams are retired and their buffers released. Late frames for a
-retired stream are rejected by a high-water mark rather than per-id tombstones,
-which would be unbounded again.
+A punch that comes through late is always taken, whatever the fallback was.
+`send_datagram()` returns true when a datagram was sent, not delivered.
 
 ## Events
 
 All callbacks run on the node's loop thread. **Do not block in them** — no
 sleeping, no synchronous I/O, no waiting on a lock the loop might hold. Copy
-what you need and hand it to your own thread.
+what you need and hand it to your own thread. Calling back into the library
+from a callback is fine.
 
 ```cpp
-topic.on_peer        ([](DevId, PeerState)                 { });
-topic.on_peer_closed ([](DevId, PeerGone)                  { });
-topic.on_data        ([](DevId, std::span<const uint8_t>)  { });
-
-topic.on_stream          ([](Stream)           { });  // peer opened one
-topic.on_stream_readable ([](Stream)           { });  // bytes ready
-topic.on_stream_writable ([](Stream)           { });  // backpressure lifted
-topic.on_stream_finished ([](Stream)           { });  // peer sent FIN, all read
-topic.on_stream_reset    ([](Stream, uint64_t) { });  // aborted
-topic.on_stream_closed   ([](Stream)           { });  // done, state released
+topic.on_peer          ([](DevId, PeerState)                 { });
+topic.on_peer_closed   ([](DevId, PeerGone)                  { });
+topic.on_data          ([](DevId, std::span<const uint8_t>)  { });
+topic.on_datagram      ([](DevId, std::span<const uint8_t>)  { });
+topic.on_datagram_path ([](DevId, DatagramPath)              { });
 ```
+
+Whatever a callback captures must outlive the node: the loop can call it right
+up until `shutdown()` returns.
 
 `PeerGone` separates a peer that said goodbye from one that simply vanished:
 
@@ -264,8 +235,8 @@ topic.on_stream_closed   ([](Stream)           { });  // done, state released
 Local | TimedOut | GoingAway | ShuttingDown | Unspecified
 ```
 
-`TimedOut` is what a crash, a cable pull or a NAT rebind looks like — worth
-retrying. Anything else means the peer was alive enough to say so — worth
+`TimedOut` is what a crash, a cable pull or a dropped connection looks like —
+worth retrying. Anything else means the peer was alive enough to say so — worth
 reporting calmly. The *cause* is always our own account of events; a peer
 supplies only a reason code, so a hostile one cannot dress its own
 disappearance up as our idle timer.
@@ -274,26 +245,20 @@ disappearance up as our idle timer.
 
 ```cpp
 if (auto li = topic.link(dev)) {
-    li->relayed;              // through the server, or direct
-    li->rtt;                  // smoothed
-    li->congestion_window;    li->bytes_in_flight;    li->slow_start;
-    li->packets_sent;         li->packets_lost;
-    li->datagrams_sent;       li->datagrams_received;
-    li->open_streams;
+    li->relayed;                                   // through the server, or direct
+    li->messages_sent;    li->messages_received;
+    li->bytes_sent;       li->bytes_received;      // message payload
+    li->datagrams_sent;   li->datagrams_received;  // however they travelled
 }
 
-topic.state(dev);     topic.connected();    topic.streams(dev);
-node.reflexive();     node.local_port();
+topic.state(dev);     topic.connected();    topic.datagram_path(dev);
+node.reflexive();     node.local_port();    node.server_connected();
 node.stats();         node.explore();       // server counters; listed topics
 ```
 
 All diagnostic — nothing in the protocol depends on it — except `relayed`, which
 is worth showing users. A relayed connection is still end to end encrypted, but
 the rendezvous server is back in the path and can see traffic patterns.
-
-`uconn-stream` prints this after a transfer, which is how the difference shows
-up concretely: the same megabyte over a relay loses packets where the direct
-path loses none.
 
 ## Shutting down
 
@@ -302,13 +267,12 @@ topic.disconnect(dev);        // one peer, and tell it
 topic.disconnect_all();
 topic.unpublish();            // stop being findable, stay connected
 node.leave(topic_id);         // invalidates the Topic&
-node.shutdown();              // UNREGISTER everything, close every session, stop
+node.shutdown();              // unregister everything, close every session, stop
 ```
 
-`disconnect()` and `shutdown()` tell the peer, so it learns in one round trip
-instead of waiting out the 90-second idle timeout while holding a NAT binding
-and possibly a relay slot. A deliberate shutdown should not look identical to a
-cable being pulled.
+`disconnect()` and `shutdown()` tell the peer, so it learns at once instead of
+waiting out the 90-second idle timeout. A deliberate shutdown should not look
+identical to a cable being pulled.
 
 ## Adding identity
 
@@ -339,27 +303,31 @@ strings.
 ```
                     your application
    +---------------------------------------------------+
-   | src/api/      Node, Topic                          |  threads, clock, socket
+   | src/api/      Node, Topic                          |  threads, clock, sockets
    +---------------------------------------------------+
-   | src/stream/   reliability, ordering, flow and      |  sans-IO
-   |               congestion control (QUIC-shaped)     |
+   | src/session/  TcpSession: Noise handshake and      |  sans-IO
+   |               sealed records over a TCP stream     |
+   |               Session: the UDP datagram channel,   |
+   |               replay window, key ratchet, paths    |
    +---------------------------------------------------+
-   | src/session/  Noise handshake, AEAD transport,     |  sans-IO
-   |               replay window, path migration        |
-   +---------------------------------------------------+
-   | src/path/     candidate ranking, hole punching     |  sans-IO
+   | src/path/     candidate ranking, UDP hole punching |  sans-IO
    +---------------------------------------------------+
    | src/crypto/   BLAKE2s, ChaCha20-Poly1305, X25519,  |  pure
    |               Noise, HKDF                          |
-   | src/wire/     encode/decode, varints               |  pure
+   | src/wire/     encode/decode, the control protocol  |  pure
    +---------------------------------------------------+
                           |
                   src/io/ |  the ONLY target that owns a socket
 ```
 
 Layering is enforced by CMake, not by convention: if `uconnect_path` ever needs
-to link `uconnect_io`, the build fails. Note that `uconnect_stream` does **not**
-link `uconnect_crypto` — it sits above the session and never sees a key.
+to link `uconnect_io`, the build fails.
+
+Reliability is TCP's. An earlier version of this library carried its own
+QUIC-shaped stream layer over UDP — loss recovery, flow and congestion control
+— and it was replaced by a TCP connection, because the operating system's TCP is
+better tested, better tuned and cheaper than anything a library can carry. UDP
+stays for what TCP cannot do: datagrams that do not wait for each other.
 
 ## Sans-IO
 
@@ -372,148 +340,201 @@ transport are exactly the two things you cannot debug against the real internet.
 `tests/netsim.hpp` gives four NAT behaviours, hairpinning on or off, packet
 loss, latency, jitter and reordering as parameters — so a symmetric-NAT failure,
 a router that refuses to hairpin, and a punch under 30% loss all run
-deterministically in microseconds.
-
-The practical payoff: a ten-second transfer with 20% loss runs in milliseconds
-and gives the same answer every time. A bug that would be a one-in-fifty flake
-against a real network reproduces on the first try.
+deterministically in microseconds. The TCP session is tested the same way,
+fed its bytes one at a time or in any chunking TCP is free to deliver.
 
 ## Threading
 
-One background thread per `Node`, owning the socket and every timer. Callbacks
+One background thread per `Node`, owning the sockets and every timer. Callbacks
 fire on it. The public API is safe to call from any thread — `Topic` methods take
 the node's lock — but a callback that blocks stalls every peer on that node, not
 just the one that triggered it.
 
 ## The server
 
-A separate binary that depends only on `wire` and `crypto`, never on the client
-library. Its store is sans-IO too, so the whole 90-second record lifecycle is
-tested by advancing a fake clock rather than by sleeping.
+A separate binary on the `wire`, `crypto` and `io` targets, never the client
+library. Its registry and control service are sans-IO too, so record, ownership
+and relay logic is tested without a socket; `tests/test_rendezvous.cpp` then
+runs the real runtime over loopback.
 
-Everything is in memory. With a 90-second hard expiry there is no database, no
-persistence and no migrations — a restart just means every live device
-re-registers within one keepalive. Roughly 200 bytes per record; 10k live
-devices is about 3.4 MB.
+Everything is in memory, and every record **belongs to the connection that
+registered it**: when a node's connection closes, its records go with it. There
+is no database, no persistence and no expiry sweep to tune — a restart just
+means every live node reconnects and registers again.
 
 ---
 
 # How a connection is made
 
-## 1. Register
+## 1. One port, one connection to the server
 
-Registration and keepalive go over **UDP from the same socket used for data**.
-This is not a style preference: the client cannot know its own public mapping,
-and the TCP source port an HTTP server would observe is a different NAT mapping
-than the UDP socket's — registering it would punch a hole to nowhere. The server
-reports the source address it observed, which is the STUN result.
+A node owns one TCP port, P, and does everything from it: it listens on P,
+keeps its connection to the server from P, and punches to peers from P. That is
+not tidiness. The address the server observes for the control connection is
+P's NAT mapping, and that is the address peers are told to dial — punching from
+any other port would open a hole to nowhere. Sockets share P with
+`SO_REUSEADDR` (and `SO_REUSEPORT` on Linux).
+
+The control protocol is length-prefixed frames on that one connection:
+registration, keepalive, lookup, introductions, relay allocation. It is also how
+the server reaches the node — an introduction or a relay offer arrives on it
+unprompted.
+
+## 2. Register
 
 The server derives an identity rather than letting the client choose one:
 
 ```
-dev_id = HMAC(server_secret, topic_id || src_ip || src_port)
+dev_id = MAC(server_secret, topic_id || TCP source address)
 ```
 
 `topic_id` is mixed in deliberately: without it the same device registering in
 two topics would get the same `dev_id` in both, letting anyone who reads two
 topic listings link them.
 
-The reply carries a **lease token**, sent once. Every later keepalive or update
-carries only a MAC over it plus a monotonic sequence number, so the token itself
-never goes back on the wire.
+**Ownership is the connection.** Only the connection that registered a record
+can refresh, update or remove it, or introduce and relay on its behalf. There
+are no lease tokens, MACs or sequence numbers, because there is nothing to
+authenticate that the TCP connection does not already prove — and no expiry
+timer, because the record ends when the connection does.
 
-### Two clocks that are easy to conflate
+### The timers that remain
 
 | Timer | Value | Meaning |
 |---|---|---|
-| Keepalive | 20 s | also what holds the NAT binding open |
-| Stale | 45 s | entry still returned, but flagged |
-| Hard expiry | 90 s | deleted, memory reclaimed |
+| Keepalive | 20 s | the node refreshes each record; also holds P's NAT mapping open |
+| Stale | 45 s | a record not refreshed this long is still returned, but flagged |
+| Idle | 90 s | a connection that says nothing this long is closed, and its records with it |
+| First frame | 10 s | a new connection must say what it is |
 
-NAT UDP mappings commonly die in 30 s–5 min, with the short end normal on mobile
-carriers. A record can be nominally alive while its reflexive candidate has been
-dead for most of that time, which is why the expiry sits close to the keepalive
-rather than minutes away.
+A node with nothing published still sends a bare keepalive, which keeps the
+connection and tells it its reflexive address.
 
-Peer sessions need their **own** keepalive: on many NATs the mapping toward the
-server and the mapping toward a peer are separate bindings with separate timers,
-so an idle peer session dies while the server record stays perfectly healthy.
-
-## 2. Look up
+## 3. Look up
 
 `LOOKUP` returns a **random sample**, capped at 30 by default and 100 at most,
-never the whole swarm. That is both an amplification defence and a load
-balancer: no peer becomes everyone's first choice.
+never the whole swarm. No peer becomes everyone's first choice.
 
 Each entry carries the peer's candidates — its reflexive address as the server
 observed it, plus any host addresses it supplied.
 
-## 3. Punch
+## 4. Introduce and punch
 
-Candidates are ranked host > srflx > relay, with two adjustments:
+The side that connects sends `CONNECT` with a fresh 16-byte **attempt nonce**
+and its candidates. The server delivers it to the peer's connection, stamped
+with the caller's real `dev_id`. Now both sides know the attempt, and both do
+the same thing at once: dial every candidate of the other from P, while
+accepting on P. The two SYNs cross the NATs and open them — a TCP simultaneous
+open, where neither side "connected" to the other.
 
-- **Same-NAT detection.** If a peer's reflexive address shares our public IP we
-  are almost certainly behind the same NAT, where the srflx pair needs the
-  router to hairpin a packet addressed to its own external IP back inside —
-  which many consumer routers simply drop. There the host candidate is not an
-  optimisation, it is the only thing that works, so the srflx pair is demoted.
-- **IPv6 preferred**, since it is frequently unfiltered end to end when IPv4 is
-  double-NATed.
+The first connection to come up carries the handshake, and the others are
+dropped. A connection must name its attempt before anything else happens: the
+initiator's first frame carries the nonce, and a responder that dialed opens
+with a short hello naming it. A connection that names no attempt of ours, or
+says nothing for ten seconds, is closed.
 
-Probes are staggered, retransmitted with jittered exponential backoff, and the
-first packets are *expected* to be lost — until both sides have sent, neither
-NAT has a reason to let the other in. A `ProbeOk` echoing our transaction id
-validates a path; that round trip is also the challenge-response the handshake
-is later gated on.
+When both sides introduce themselves at once, each with its own nonce, the
+smaller `dev_id`'s wins. A live session is never given up for a new
+introduction — claiming to be the same peer proves nothing, and a working
+connection is worth more than a new one.
 
-**Symmetric NAT on both ends defeats punching**, and the test suite asserts this
-rather than papering over it: a symmetric NAT allocates a fresh external port
-per destination, so the port the rendezvous server observed is not the port the
-peer must hit.
+**Symmetric NAT defeats punching.** A symmetric NAT allocates a fresh external
+port per destination, so the port the server observed is not the port a peer
+must hit. The punch simulator's tests assert this rather than papering over it.
 
-## 4. Handshake
+## 5. Handshake
 
 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` for a keyed topic, `Noise_NN_...` for an
-open one. Before anything else, a prologue is mixed in:
+open one, whichever way the TCP connection went: the numerically smaller
+`dev_id` is always the initiator. Before anything else, a prologue is mixed in:
 
 ```
-prologue = "uconnect:v1" || topic_id || key_epoch || probe_txn
+prologue = "uconnect:v2:tcp" || topic_id || key_epoch || attempt_nonce
 ```
 
-Both sides must agree on the topic, the key epoch and the exact validated path,
+Both sides must agree on the topic, the key epoch and the exact introduction,
 or the handshake fails cryptographically rather than through a check someone
-remembered to write. The `probe_txn` term is what makes a replayed
-`HandshakeInit` useless: it arrives bound to a transaction the responder never
-issued.
+remembered to write. The node accepts each nonce once, for the one peer it was
+issued for, so a replayed first message goes nowhere.
 
-The initiator's `dev_id` travels in message 1's authenticated payload rather
-than being inferred from the source address. Behind a symmetric NAT the address
-a handshake *arrives* from is not the address it *advertised*, so address
-matching silently files the session under a synthetic identity.
+Failures are **silent**. A bad PSK, a stale attempt, a malformed message — the
+connection is closed with nothing said. Any error reply would turn a peer into
+an oracle for topic membership.
 
-Failures are **silent**. A bad PSK, a stale transaction, a malformed message —
-all dropped with no response. Any error reply would turn a peer into an oracle
-for topic membership.
+## 6. Records
 
-When both ends open at once, the numerically smaller `dev_id` is the designated
-initiator. Without that tie-break both sides replace their own session with the
-accepted one, both report "connected", and no data flows.
+After the handshake, everything on the connection is an AEAD record:
 
-## 5. Transport
+```
+u32 length | AEAD(kind || body)
+```
 
-Authenticated datagrams with a 64-packet replay window, IPsec style: a
+TCP delivers in order and loses nothing, so nonces are sequential and never
+travel; each direction's key is ratcheted every 2²⁰ records. The session owns a
+few kinds — keepalive, close — and the node the rest: messages, and the
+datagram channel's signaling. A length above the 1 MiB ceiling ends the
+connection before anything is buffered.
+
+## When punching fails: the TCP relay
+
+After `punch_timeout` the smaller `dev_id` asks the server for a relay (the
+other asks too, a little later, in case the first request went nowhere; the
+server hands both the same binding). Each side gets its own token, and opens a
+**second** connection to the server whose first frame joins the relay. Once both
+legs are in, the server splices raw bytes between them — and the two nodes run
+exactly the same handshake over the splice, bound to the same attempt nonce.
+
+The relay forwards **opaque ciphertext**. It sits below the crypto layer, so the
+session is still end-to-end authenticated and forward-secret, and the server
+learns only that two `dev_id`s are exchanging bytes and how many. Each binding
+has a byte budget, and a splice stops reading from a sender whose receiver has
+fallen behind rather than buffer without bound.
+
+`Node::Config::force_relay` skips punching entirely — the only practical way
+to exercise the relay from a network where punching happens to work.
+
+## The datagram channel
+
+Opened on demand, over the TCP session:
+
+1. The node opens a UDP socket (on P's number when free) and asks the server
+   `WhoAmI` to learn its UDP mapping. The request is padded so the answer is
+   never larger than what provoked it.
+2. Each side sends an **offer** record: the channel's epoch and its UDP
+   candidates.
+3. Both punch, with probes tagged under the channel's **probe key**. Only the
+   peer holds it, so nobody else can make a node answer — a scanner never
+   learns anything is listening.
+4. Datagrams are sealed with keys exported from the TCP handshake, under their
+   own labels:
+
+```
+send, recv, probe, conn_id = HKDF(exported, salt = epoch, "uconnect:v2:udp:...")
+```
+
+The **epoch** matters more than it looks. The UDP channel numbers its packets
+from zero, and the packet number is the nonce; a channel reopened under the
+previous one's keys would reuse every nonce. Every channel on a session gets a
+new epoch, so every channel gets new keys.
+
+If punching fails, the fallback applies. For `Relay`, a UDP relay binding is
+allocated like the TCP one, each side binds its UDP address to it with its
+token, and datagrams travel wrapped in `RelayData` — still sealed end to end.
+A late punch always wins over the relay or TCP.
+
+### Replay window and key generations
+
+Datagrams are authenticated with a 64-packet replay window, IPsec style: a
 high-water mark plus a bitmap of the counters below it. UDP reorders, so a
 strictly-increasing check would drop legitimate packets and accepting anything
 would permit replay.
 
-### Key generations, driven by the counter
-
-Transport keys ratchet every 2¹⁶ packets, so traffic older than the current
-generation cannot be recovered from a later compromise:
+Keys ratchet every 2¹⁶ packets, so traffic older than the current generation
+cannot be recovered from a later compromise:
 
 ```
 gen  = counter >> rekey_shift
-k(0) = the key from the Noise split
+k(0) = the channel's key
 k(n) = rekey(k(n-1))              // Noise s11.3, one-way
 ```
 
@@ -528,82 +549,38 @@ That matters because of how the failure would present. If two ends disagree
 about the current key, the receiver decrypts with the wrong one, the AEAD tag
 fails, and a failed tag is dropped silently — so a desynchronised rekey is
 indistinguishable from total packet loss, with no counter or log line anywhere
-to say otherwise. The symptom points at the network; the cause is in the crypto
-state machine.
+to say otherwise.
 
 Two details carry the safety:
 
 - **Nothing mutates before the AEAD verifies.** Key selection has to happen on
   an unauthenticated counter, so a forged packet must cost a dropped packet and
   nothing more — never an advanced generation, and never a discarded key that
-  real traffic still needed. Same rule the replay window already follows.
+  real traffic still needed.
 - **The forward jump is bounded.** An unauthenticated counter decides how much
   derivation to do, so a packet claiming counter 2⁶⁰ would otherwise walk the
-  ratchet 2⁴⁴ times. Removing that bound does not fail the test suite, it hangs
-  it — which is the denial of service, demonstrated.
+  ratchet 2⁴⁴ times.
 
 Only the previous generation is kept, and that is provable rather than guessed:
 the replay window refuses anything more than 64 counters behind the high-water
 mark, so once a generation exceeds 64 packets a straggler can be at most one
 generation old.
 
-### And still a re-handshake
-
-Sessions also have a 15-minute lifetime, after which they ask the layer above
-for a fresh handshake. The two are complementary, not alternatives: a symmetric
-ratchet protects *past* traffic, but `k(n)` derives every future key, so it
-offers no healing after a compromise. Only a fresh DH does that. Streams survive
-the re-handshake, so it is invisible to an application.
-
-**Streams survive it.** The stream layer holds no keys — `uconnect_stream` does
-not even link `uconnect_crypto` — so offsets, buffers and flow-control credit
-carry straight across. Only the part keyed on the session's packet numbers is
-rebuilt, because those restart at zero and an ack naming an old number would
-acknowledge a packet the peer has not sent yet. Anything that was in flight is
-declared lost so its bytes are re-queued: without that they sit in neither the
-retransmit queue nor the unsent range, which is to say they are gone.
-
-The session survives an address change: matching on `conn_id` rather than the
-4-tuple means a NAT rebind or a Wi-Fi/LTE handoff keeps it alive, once the AEAD
-verifies that the peer arriving from the new address really is the peer.
-
-## When punching fails: the relay
-
-The relay runs on the rendezvous server. A peer asks for an allocation, both
-ends address their traffic to the server, and it forwards between them.
-
-It forwards **opaque ciphertext**. The relay sits below the crypto layer, so the
-session is still end-to-end authenticated and forward-secret, and the server
-learns only that two `dev_id`s are exchanging bytes and how many.
-
-Relayed traffic gets its own rate budget rather than sharing the signaling one,
-which is small and bursty. Charging a whole session against a limit sized for
-lookups throttles every relayed transfer with no error and no counter to point
-at. `Node::Config::force_relay` skips punching entirely — the only practical way
-to exercise that path from a network where punching happens to work.
+The channel survives an address change: matching on `conn_id` rather than the
+4-tuple means a NAT rebind keeps it alive, once the AEAD verifies that the peer
+arriving from the new address really is the peer.
 
 ## Saying goodbye
 
-`Topic::disconnect()` and `Node::shutdown()` send a `Close`: the same envelope
-as a transport packet — `conn_id`, counter, ciphertext — sealed with the same
-session keys and drawn from the same counter space, so the peer's existing
-replay window covers it and a captured close is inert against any other session.
+`Topic::disconnect()` and `Node::shutdown()` send a sealed `Close` record with a
+reason, then close the connection. The peer learns at once, and knows why.
 
-It is sealed against **its own type byte as associated data**, and that detail
-is load-bearing. The header is not covered by the AEAD tag, so if a close and a
-data packet were sealed the same way, anyone on path could flip one byte —
-`0x40` to `0x41` — and tear down a session they cannot read. Binding each kind
-to its type makes that forgery fail the tag check. There are tests for the
-forgery in both directions, and they fail if the binding is removed.
-
-Best effort by construction. Nothing acknowledges a close, so it goes out a few
-times and the idle timeout stays as the backstop. This makes a *deliberate*
-disconnect fast; crashes, cable pulls and NAT rebinds still take the full
-timeout, because there is nobody left to send anything.
-
-A close before the handshake completes puts nothing on the wire: there are no
-keys to authenticate it with, and an unauthenticated one would be a teardown
-primitive for anybody.
+On the datagram channel, a `Close` is the same envelope as a data packet —
+`conn_id`, counter, ciphertext — sealed against **its own type byte as
+associated data**. The header is not covered by the AEAD tag, so if a close and
+a data packet were sealed the same way, anyone on path could flip one byte —
+`0x40` to `0x41` — and tear down a channel they cannot read. There are tests for
+the forgery in both directions.
 
 ---
 
@@ -621,6 +598,9 @@ primitive for anybody.
 | Rendezvous server can MITM | **yes, undetectably** | no |
 | Harvest-now-decrypt-later resistant | no | yes |
 
+The datagram channel inherits all of this: its keys come from the same
+handshake.
+
 An open topic is encrypted and nothing more. Anyone who can modify or inject
 traffic — the rendezvous server, an ISP, a hostile Wi-Fi AP — can sit between
 two peers and read everything, and neither side can detect it. That is inherent
@@ -636,22 +616,27 @@ protocols get broken.
 
 A `dev_id` it derived itself, an IP:port, a `topic_id`, and an opaque blob. It
 does not hold `K`, cannot read a keyed topic's traffic, and cannot impersonate a
-member.
+member. It stamps every introduction with the caller's real `dev_id`, so one
+member cannot claim to be another either.
 
 It *does* see metadata, in both senses: the literal `meta` blob you publish, and
-the traffic patterns of who looks up what and when. For a relayed pair it also
-sees byte counts. If that matters for your threat model, run your own — it is a
-single static binary with no configuration and no database.
+the traffic patterns of who looks up what, who connects to whom and when. For a
+relayed pair it also sees byte counts. If that matters for your threat model,
+run your own — it is a single static binary with no configuration and no
+database.
 
 ## Key handling
 
-`K` is never used directly. Purpose-specific subkeys are derived with
-domain-separated HKDF, so a leak in one use cannot cross into another:
+`K` is never used directly. The Noise PSK is derived with domain-separated HKDF,
+so a leak in one use cannot cross into another:
 
 ```
-psk    = HKDF(K, "uconnect:v1:psk",   32)   -> mixed into the Noise handshake
-probe  = HKDF(K, "uconnect:v1:probe", 32)   -> keys probe tags
+psk = HKDF(K, "uconnect:v1:psk", 32)   -> mixed into the Noise handshake
 ```
+
+Everything else is keyed from the handshake: the TCP records by the Noise split,
+and each datagram channel by an exported secret under its own labels and epoch,
+so the two channels share no key.
 
 **32 bytes, not 64.** Every construction downstream is 256-bit — the Noise PSK
 slot, the ChaCha20 key, the BLAKE2s output — so a 512-bit input is compressed to
@@ -677,27 +662,29 @@ provided:
 - **Protection from insiders.** On a keyed topic, any member can read everything
   and can MITM two other members unless they bind identity to the channel.
 - **Traffic analysis resistance.** No padding, no cover traffic, no timing
-  defence. Packet sizes and timing are visible to anyone on path.
+  defence. Record sizes and timing are visible to anyone on path.
 - **Denial of service resistance for peers.** The server has quotas and
   rate limits; a peer does not. An authenticated member can flood you.
-- **Anything about the application layer.** Message framing, ordering across
-  streams, and what a peer is allowed to say are yours.
+- **Anything about the application layer.** What a message means and what a
+  peer is allowed to say are yours.
 
 ## Abuse resistance on the server
 
-- **Retry cookies.** Any response larger than its request requires a validated
-  source address first — `HMAC(secret, ip || port || epoch)`, stateless, valid
-  for the current and previous epoch. Without this a 60-byte `LOOKUP` returning
-  4.6 KB is a 77x amplifier aimed at whoever the attacker spoofed.
+- **TCP for everything that answers.** Every reply the server gives on TCP goes
+  to an address that completed a handshake, so it cannot be aimed at a spoofed
+  victim; the old UDP protocol's Retry cookies are gone with it. The UDP
+  replies that remain never exceed the request that provoked them.
 - **Random sampling.** `LOOKUP` returns a random sample, capped at 30 by default
   and 100 at most, never the whole swarm.
-- **Quotas** per source IP, per topic and overall. Generous by default because a
-  corporate NAT legitimately has many devices behind one address; tune against
-  the rejection counters in `/stats` rather than by guessing.
-- **Token-bucket rate limiting** measured in bytes returned, not requests, with
-  a separate budget for relayed payload.
-- **Bounded everything.** Ack ranges, stream counts, send and receive buffers,
-  relay bytes per binding. A peer chooses how much of each it asks for, so each
+- **Quotas** per source IP, per topic and overall, and on connections per IP.
+  Generous by default because a corporate NAT legitimately has many devices
+  behind one address; tune against the rejection counters rather than by
+  guessing.
+- **Byte budgets.** Each control connection has a token bucket, and one that
+  runs through it is closed rather than slowed. UDP has its own per-IP budget,
+  and each relay binding a byte ceiling.
+- **Bounded everything.** Frame sizes, record sizes, relay splice buffers,
+  queued bytes per peer. A peer chooses how much of each it asks for, so each
   one has a ceiling.
 
 ## Verification
@@ -753,9 +740,10 @@ Platform requirements are narrow by design. Randomness comes from `getentropy`,
 which needs **macOS 10.12+** or **glibc 2.25+** — chosen over Linux's
 `getrandom` precisely so there is one POSIX path rather than a second branch
 that only ever compiles on someone else's machine. Sockets are plain BSD sockets
-with `select`, not `epoll` or `kqueue`, so the same code serves both. Apple
-Silicon needs nothing special: the vendored X25519 and Poly1305 are portable C
-with no intrinsics and no endianness assumptions.
+waited on with `poll` (`WSAPoll` on Windows, where `select` stops at 64
+sockets), not `epoll` or `kqueue`, so the same code serves every platform.
+Apple Silicon needs nothing special: the vendored X25519 and Poly1305 are
+portable C with no intrinsics and no endianness assumptions.
 
 ## Running the built binaries
 
@@ -780,7 +768,7 @@ undefined `__ms_vsnprintf` out of `libmsvcrt`. Hence the copy.)
 ```
 
 `scripts/smoke.sh` does exactly this and asserts that both peers punch,
-handshake and exchange messages.
+handshake, exchange messages, and learn why the other left.
 
 An interactive chat over the same library:
 
@@ -788,16 +776,17 @@ An interactive chat over the same library:
 ./build/examples/chat/uconn-chat --server 127.0.0.1:4433 --topic 'uconn://...' --nick alice
 ```
 
-And a stream transfer, which verifies every byte it receives. Add `--relay` to
-force the path through the server instead of punching:
+And a transfer, which verifies every byte of a megabyte of messages and then
+sends a burst of datagrams. Add `--relay` to both to force the path through the
+server, and `--dgram-fallback relay|tcp|none` to pick where datagrams go then:
 
 ```sh
-./build/examples/uconn-stream --server 127.0.0.1:4433 --topic 'uconn://...' --recv
-./build/examples/uconn-stream --server 127.0.0.1:4433 --topic 'uconn://...' --send 1048576
+./build/examples/uconn-transfer --server 127.0.0.1:4433 --topic 'uconn://...' --recv
+./build/examples/uconn-transfer --server 127.0.0.1:4433 --topic 'uconn://...' --send 1048576 --dgrams 500
 ```
 
-`scripts/stream-smoke.sh` runs that pair and fails unless the bytes arrive
-intact.
+`scripts/transfer-smoke.sh` runs that pair over the punched and the relayed
+paths and fails unless the bytes arrive intact and the datagrams mostly do.
 
 ## Watching a server
 
@@ -834,12 +823,16 @@ cmake --build build
 
 That is a working rendezvous server. Everything below is about keeping it up.
 
-**Open the UDP port.** This is the step people miss, and the failure mode is a
-server that starts cleanly, logs nothing wrong, and answers nobody:
+**Open the port, for TCP and UDP.** This is the step people miss, and the
+failure mode is a server that starts cleanly, logs nothing wrong, and answers
+nobody. TCP carries every node's connection and the TCP relay — without it
+nothing connects at all. UDP carries datagram channels' address discovery and
+the UDP relay.
 
 ```sh
-ufw:       sudo ufw allow 4433/udp
-firewalld: sudo firewall-cmd --add-port=4433/udp --permanent && sudo firewall-cmd --reload
+ufw:       sudo ufw allow 4433/tcp && sudo ufw allow 4433/udp
+firewalld: sudo firewall-cmd --add-port=4433/tcp --add-port=4433/udp --permanent \
+             && sudo firewall-cmd --reload
 ```
 
 On a cloud VM the OS firewall is **not the only one in the path** — AWS, GCP,
@@ -863,44 +856,45 @@ One counter-intuitive line in it is deliberate:
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ```
 
-`AF_UNIX` and `AF_NETLINK` look unnecessary for a process that only speaks UDP,
-but glibc's resolver talks to `nscd`/`systemd-resolved` over a unix socket and
-`getifaddrs()` uses netlink. Restricting to the internet families alone makes the
-startup STUN lookup fail with a misleading "no reply".
+`AF_UNIX` and `AF_NETLINK` look unnecessary for a process that only speaks TCP
+and UDP, but glibc's resolver talks to `nscd`/`systemd-resolved` over a unix
+socket and `getifaddrs()` uses netlink. Restricting to the internet families
+alone makes the startup STUN lookup fail with a misleading "no reply".
 
 ## Oracle Cloud
 
 Oracle puts **two** firewalls in front of an instance and its stock images ship
 an iptables chain that rejects everything but SSH. A script handles the instance
-side and prints exactly what to click for the cloud side:
+side, for both protocols, and prints exactly what to click for the cloud side:
 
 ```sh
 git clone https://github.com/AbdoWise-z/uconnect && cd uconnect
 sudo bash deploy/oracle-setup.sh --port 4433
 ```
 
-The ingress rule that catches people out is the direction: **Source `0.0.0.0/0`,
-Destination port 4433** — not source port 4433. A reversed rule looks plausible
-in the console and passes no traffic.
+The cloud side needs **two** ingress rules, TCP and UDP. The one that catches
+people out is the direction: **Source `0.0.0.0/0`, Destination port 4433** — not
+source port 4433. A reversed rule looks plausible in the console and passes no
+traffic.
 
 ## Docker
 
 ```sh
 docker build -t uconnect-rendezvous .
-docker run --rm -p 4433:4433/udp uconnect-rendezvous
+docker run --rm -p 4433:4433/tcp -p 4433:4433/udp uconnect-rendezvous
 ```
 
-Note the **`/udp`** suffix. A plain `-p 4433:4433` publishes TCP, and the
-container will look perfectly healthy while being completely unreachable.
+Publish **both**. With only one, the container looks perfectly healthy while
+half the protocol is unreachable.
 
 The image is `FROM scratch` with a single static binary — no libc, no shell,
 nothing to mount. The build runs the test suite and fails if it does not pass.
 
-`deploy/fly.toml` covers Fly.io, which is one of the few PaaS platforms that
-carries raw UDP at all. Two things there will silently produce a healthy-looking
-server that answers nothing: UDP needs a **dedicated** IPv4 address (the shared
-one is HTTP-only), and the process must bind `fly-global-services` rather than
-`0.0.0.0`.
+`deploy/fly.toml` covers Fly.io, which carries raw TCP and UDP. Two things there
+will silently produce a server that answers nothing over UDP: UDP needs a
+**dedicated** IPv4 address (the shared one is HTTP-only), and the process must
+bind UDP to `fly-global-services` rather than `0.0.0.0` — which is what `--bind`
+does; TCP always listens on every interface.
 
 ---
 
@@ -940,9 +934,9 @@ rewriting it turns a bad edit into an outage instead of a failed deploy) and its
 own service/timer units (generated per host, so the repo copy is not
 authoritative).
 
-Restarting is cheap by design: records live in memory with a 90-second expiry
-and clients re-register within one 20-second keepalive, so a deploy costs a few
-seconds of re-registration and nothing else.
+Restarting is cheap by design: records live in memory, tied to each node's
+connection, and nodes reconnect and register again on their own, so a deploy
+costs a few seconds of re-registration and nothing else.
 
 ```sh
 journalctl -u uconnect-watch -f      # deploys
@@ -955,7 +949,7 @@ sudo systemctl disable --now uconnect-watch.timer   # stop watching
 ## Why polling rather than a webhook
 
 A webhook needs an inbound HTTP listener, a second open port and a public
-endpoint, on a box whose whole point is that only UDP 4433 is exposed. Polling
+endpoint, on a box whose whole point is that only port 4433 is exposed. Polling
 costs one conditional request a minute and needs nothing open.
 
 ---
@@ -968,24 +962,24 @@ costs one conditional request a minute and needs nothing open.
 uconnect-rendezvous --port 4433 \
     --bind 0.0.0.0 \
     --stale 45 \
-    --expiry 90 \
     --max-per-ip 16 \
+    --no-relay \
     --quiet
 uconnect-rendezvous --nat-check     # report what this host's NAT does, then exit
 ```
 
-`--stale` and `--expiry` are the two clocks worth understanding before changing
-either: a record goes stale at 45s (still returned, flagged) and is deleted at
-90s. Both sit close to the 20-second keepalive on purpose, because NAT mappings
-commonly die in 30s–5min and a record outliving its own NAT binding is worse than
-no record.
+`--port` is TCP and UDP alike. `--bind` pins the UDP socket to one address; TCP
+always listens on every interface. `--stale` is how long a record may go
+unrefreshed before `LOOKUP` flags it. `--no-relay` refuses relay allocations, so
+pairs that cannot punch fail instead of costing you bandwidth.
 
-Everything else lives in `StoreConfig` and `ServiceConfig` in `server/store.hpp`
-and `server/udp_service.hpp` — quotas, relay limits, cookie lifetime, token
-buckets. Tune those against real numbers rather than by guessing: unless
-`--quiet` is set the server prints a `[stats]` line every 30 seconds carrying
-the rejection counters, and the same figures are available remotely from
-`uconn-demo --stats`, `uconn-observe`, or the dashboard.
+Everything else lives in `RegistryConfig`, `ControlConfig` and
+`RendezvousConfig` in `server/registry.hpp`, `server/control_service.hpp` and
+`server/rendezvous.hpp` — quotas, relay limits and budgets, byte budgets,
+connection limits, timeouts. Tune those against real numbers rather than by
+guessing: unless `--quiet` is set the server prints a `[stats]` line every 30
+seconds, and the same figures are available remotely from `uconn-demo --stats`,
+`uconn-observe`, or the dashboard.
 
 To change the deployed flags, edit `ExecStart` in
 `deploy/uconnect-rendezvous.service` and re-run the installer. The watcher does
@@ -1000,12 +994,12 @@ Everything is in `Node::Config`:
 | `server` | — | required |
 | `bind_port` | `0` | a fixed port for a manual firewall rule |
 | `keepalive` | `20s` | shorter on a mobile carrier with aggressive NAT timeouts |
+| `max_total_peers` | `64` | across every topic on the node |
+| `punch_timeout` | `8s` | how long to punch before the fallback |
 | `force_relay` | `false` | skip punching when you know it cannot work |
+| `datagram_fallback` | `Tcp` | what to do with datagrams when a peer opens a channel and UDP cannot be punched |
 | `verbose` | `false` | protocol tracing to stderr |
-| `stream_recv_window` | `256 KB` | raise for a long fat path; costs memory per stream |
-| `conn_recv_window` | `1 MB` | the aggregate across one peer's streams |
-| `max_streams_per_peer` | `64` | each stream costs two buffers |
-| `rekey_shift` | `16` | lower only to exercise the ratchet in a test |
+| `rekey_shift` | `16` | datagram key ratchet; lower only to exercise it in a test |
 
 ## Dashboard
 
@@ -1018,17 +1012,16 @@ whatever host happened to run it.
 ## Layout
 
 ```
-src/wire/      protocol codec, varints             no dependencies
+src/wire/      message codecs, the control protocol     no dependencies
 src/crypto/    BLAKE2s, ChaCha20-Poly1305, X25519, Noise, HKDF
-src/path/      candidate ranking, punch state machine
-src/session/   Noise session, replay window, path migration
-src/stream/    frames, loss recovery, congestion control, streams
-src/io/        UDP sockets                         the ONLY target with a socket
+src/path/      candidate ranking, UDP punch state machine
+src/session/   TcpSession; the UDP datagram Session
+src/io/        TCP and UDP sockets, poll            the ONLY target with a socket
 src/api/       Node and Topic
-server/        record store (sans-IO) + UDP service + relay + binary
+server/        registry and control service (sans-IO), runtime, binary
 third_party/   vendored X25519 and Poly1305
 tests/         unit suite + a simulated network
-examples/      uconn-demo, uconn-chat, uconn-stream
+examples/      uconn-demo, uconn-chat, uconn-transfer
 tools/         uconn-observe -- reads a server's public view as JSON
 web/           read-only Flask dashboard over uconn-observe
 deploy/        Oracle Cloud setup, systemd units, git watcher
@@ -1036,9 +1029,12 @@ deploy/        Oracle Cloud setup, systemd units, git watcher
 
 ## Tests
 
-234 unit cases plus two end-to-end smoke tests — one for punch + handshake +
-messaging, one that moves a megabyte over a stream and verifies every byte.
-`python3 web/test_observer.py` covers the dashboard's data layer.
+A unit suite of nearly two hundred cases — `uconnect_tests [name]` runs the
+ones whose name contains the argument — plus two end-to-end tests with real
+processes: `smoke.sh` for punch, handshake, messages and goodbyes, and
+`transfer-smoke.sh`, which moves a megabyte and a burst of datagrams over both
+the punched and the relayed paths. `python3 web/test_observer.py` covers the
+dashboard's data layer (POSIX only: it fakes the observer with a shell script).
 
 ---
 
@@ -1046,7 +1042,7 @@ messaging, one that moves a megabyte over a stream and verifies every byte.
 
 | Rendezvous | Dashboard | Notes |
 |---|---|---|
-| `129.152.22.201:4433` (UDP) | http://129.152.22.201:8080 | Oracle Cloud, Ubuntu. Redeployed from `master` on every commit. |
+| `129.152.22.201:4433` (TCP + UDP) | http://129.152.22.201:8080 | Oracle Cloud, Ubuntu. Redeployed from `master` on every commit. |
 
 Try it without running anything yourself:
 
@@ -1067,36 +1063,27 @@ reaches it.
 
 # Status
 
-Working end to end: registration, keepalive with rebinding, lookup with
-sampling, topic listing, stats, candidate ranking, punching, the relay fallback
-for symmetric NAT, `Noise_NN`/`NNpsk0`, authenticated transport with replay
-protection, path migration, an N-peer mesh, reliable ordered streams with flow
-and congestion control, an authenticated connection close, and a read-only web
-dashboard.
+Working end to end: a persistent control connection with reconnection,
+registration owned by that connection, lookup with sampling, topic listing,
+stats, TCP hole punching by simultaneous open, the TCP relay, `Noise_NN` /
+`NNpsk0` over TCP with sealed records and a close reason, an N-peer mesh, and
+on-demand UDP datagram channels — punched, relayed, or falling back to TCP as
+the application chooses — with replay protection, a counter-driven key ratchet
+and path migration. Plus a read-only web dashboard.
 
-Verified against the live deployment above as well as the simulator:
-byte-verified transfers of 512 KB–1 MB over both punched and relayed paths, and
-234 unit cases gating every deploy.
+Verified over loopback against the in-process server and with real processes:
+byte-verified megabyte transfers and datagram bursts over both punched and
+relayed paths.
 
 Not yet implemented:
 
-- **REST front end.** The store is sans-IO so an HTTP service sits beside the
-  UDP one. It must be read-only: the TCP source port an HTTP server observes is
-  a different NAT mapping than the client's UDP socket, so a record registered
-  that way would punch to nowhere.
-- **Key rotation driven by `key_epoch`.** The epoch is carried on the wire and
-  mixed into the prologue, but nothing rotates it. Transport keys do ratchet
-  within a session; what is missing is rotating `K` itself across sessions.
-- **Path migration for network changes.** A device that switches Wi-Fi to
-  cellular gets a new mapping, and there is no migration for it — both ends time
-  out and reconnect from scratch.
-
-Known sharp edges:
-
-- A **bidirectional** stream is only released when both ends `finish()`. A
-  one-way transfer over one leaves state on both sides until the peer actually
-  disconnects — and since streams now survive a re-handshake, that is no longer
-  bounded by the 15-minute session lifetime. Use a unidirectional stream, or
-  `close()`.
-- `SendBuffer` never returns its capacity to the allocator, so a stream that
-  carried a large transfer holds its peak send buffer until it is retired.
+- **Key rotation driven by `key_epoch`.** The epoch is carried in the prologue,
+  but nothing rotates it. Keys do ratchet within a session; what is missing is
+  rotating `K` itself across sessions.
+- **Connection migration.** A device that switches Wi-Fi to cellular loses its
+  TCP connections — the peer sees them end and they reconnect from scratch.
+  Datagram channels survive an address change on their own, but only for as
+  long as the TCP session they are keyed from.
+- **Verification on real NATs.** The punch logic is exercised by the simulator
+  and loopback; TCP simultaneous open across real consumer NATs, and
+  `SO_REUSEPORT` port sharing on Linux, have not yet been tested in the field.

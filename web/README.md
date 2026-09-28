@@ -14,7 +14,7 @@ UCONNECT_SERVER=127.0.0.1:4433 python web/app.py
 
 ```
 uconnect-rendezvous          the server, unchanged, running in a terminal
-        ▲  UDP, ordinary client protocol
+        ▲  TCP, ordinary client protocol
    uconn-observe             C++, links the library, prints JSON
         ▲  stdout
    observer.py               runs it, caches, degrades gracefully
@@ -74,7 +74,7 @@ and the UI says so — otherwise a large topic looks like it is losing records.
 
 A topic that has just been created does not appear here, because it does not
 exist yet: the server learns of a topic when a peer **registers** under it, and
-forgets it 90 seconds after the last one leaves.
+forgets it when the last one disconnects.
 
 ## Configuration
 
@@ -117,8 +117,8 @@ sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload
 
 You do **not** need to stop the rendezvous server first. The installer only
 adds the new unit; the server is restarted by the next deploy, which it would
-be anyway, and restarts are cheap — records live in memory with a 90s expiry
-and clients re-register within one 20s keepalive.
+be anyway, and restarts are cheap — records live in memory, and clients
+reconnect and register again on their own within seconds.
 
 On each commit the watcher builds `uconn-observe`, refreshes the venv if
 `requirements.txt` changed, swaps the app tree, refreshes the unit file if it

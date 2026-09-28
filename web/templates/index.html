@@ -23,17 +23,17 @@
       <div class="stat"><div class="n">{{ d.relay_mib }}</div><div class="k">relayed MiB</div></div>
     </div>
     <p class="sub" style="margin-top:.75rem">
-      {{ s.registers }} registers · {{ s.lookups }} lookups · {{ s.keepalives }} keepalives ·
-      {{ s.rebinds }} NAT rebinds · {{ s.expired }} expired
+      {{ s.connections }} connections · {{ s.registers }} registers · {{ s.lookups }} lookups ·
+      {{ s.connects }} introductions · {{ s.expired }} expired
       {%- if d.rejects_total %}
-        · rejected: {{ s.rej_bad_auth }} auth, {{ s.rej_quota }} quota, {{ s.rej_rate_limited }} rate
+        · rejected: {{ s.rej_quota }} quota, {{ s.rej_rate_limited }} rate
       {%- endif %}
     </p>
     <p class="sub" style="margin-top:-.5rem">
-      <em>Stale records</em> are past the 45s freshness line: alive on paper, but
-      their NAT binding may already be gone.
-      <em>Needed a relay</em> is the share of registrations that could not punch —
-      symmetric NAT on both ends.
+      <em>Stale records</em> are past the 45s freshness line: their node is still
+      connected, but has not refreshed its addresses.
+      <em>Needed a relay</em> compares relay bindings — TCP connections and UDP
+      datagram channels that could not punch — to registrations.
     </p>
   {% endif %}
 
@@ -83,7 +83,7 @@
       No topics right now.<br>
       <span style="font-size:.85rem">
         Topics are listed by default; they appear once a peer registers and
-        disappear 90 seconds after its last keepalive. A topic is absent only if
+        disappear when its last member disconnects from the server. A topic is absent only if
         a member asked to be hidden with <code>publish(meta, unlisted=true)</code>.
       </span>
     </div>

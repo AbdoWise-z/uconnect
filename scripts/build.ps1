@@ -56,11 +56,11 @@ if ($LASTEXITCODE -ne 0) { Write-Error "configure failed" }
 if ($LASTEXITCODE -ne 0) { Write-Error "build failed" }
 
 if ($All) {
-    # The smoke test is a bash script: it starts a server and two peers and
-    # asserts they punch, handshake and exchange data.
+    # The end-to-end tests are bash scripts: they start a server and two peers
+    # and assert they punch, handshake and exchange messages and datagrams.
     & ctest --test-dir build --output-on-failure
 } else {
-    & ctest --test-dir build --output-on-failure -E uconnect_smoke
+    & ctest --test-dir build --output-on-failure -LE e2e
 }
 if ($LASTEXITCODE -ne 0) { Write-Error "tests failed" }
 

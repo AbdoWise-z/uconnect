@@ -25,7 +25,7 @@ namespace uconnect::server {
 
 struct RendezvousConfig {
     uint16_t    port = 4433;  // 0 = ephemeral; TCP and UDP get the same number
-    std::string bind_host;    // empty = all interfaces
+    std::string bind_host;    // UDP only; empty = all interfaces. TCP listens on all.
 
     RegistryConfig registry;
     ControlConfig  control;

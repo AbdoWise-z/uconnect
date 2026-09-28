@@ -17,9 +17,10 @@
 #   2. iptables or firewalld ON the instance           (OS side)
 #
 # Oracle's stock images ship with an iptables INPUT chain that REJECTs
-# everything except SSH. Even with the security list wide open, your UDP
-# datagrams die at step 2 with no log and no ICMP. This script handles step 2.
-# Step 1 you must do in the console -- see the instructions it prints at the end.
+# everything except SSH. Even with the security list wide open, your traffic
+# dies at step 2 with no log. This script handles step 2, for TCP and UDP both
+# -- the server needs the two on one port. Step 1 you must do in the console --
+# see the instructions it prints at the end.
 
 set -euo pipefail
 
@@ -41,7 +42,7 @@ cd "$REPO_DIR"
 
 echo "==> repo:  $REPO_DIR"
 echo "==> arch:  $(uname -m)"
-echo "==> port:  $PORT/udp"
+echo "==> port:  $PORT/tcp + $PORT/udp"
 echo
 
 # ---------------------------------------------------------------------------
@@ -83,28 +84,30 @@ install -m 0755 build/server/uconnect-rendezvous /usr/local/bin/uconnect-rendezv
 # 3. OS firewall -- the step everyone misses
 # ---------------------------------------------------------------------------
 echo
-echo "==> opening $PORT/udp on the instance firewall"
+echo "==> opening $PORT/tcp and $PORT/udp on the instance firewall"
 
 if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="$PORT/udp" >/dev/null
+    firewall-cmd --permanent --add-port="$PORT/tcp" --add-port="$PORT/udp" >/dev/null
     firewall-cmd --reload >/dev/null
-    echo "    firewalld: added $PORT/udp"
+    echo "    firewalld: added $PORT/tcp and $PORT/udp"
 else
-    # Oracle's images have a REJECT rule at the end of INPUT. A rule appended
-    # after it never matches, so insert BEFORE it rather than using -A.
-    if iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
-        echo "    iptables: rule already present"
-    else
+    for proto in tcp udp; do
+        # Oracle's images have a REJECT rule at the end of INPUT. A rule
+        # appended after it never matches, so insert BEFORE it rather than -A.
+        if iptables -C INPUT -p "$proto" --dport "$PORT" -j ACCEPT 2>/dev/null; then
+            echo "    iptables: $proto rule already present"
+            continue
+        fi
         reject_line="$(iptables -L INPUT --line-numbers -n \
                         | awk '/REJECT|DROP/ {print $1; exit}')"
         if [ -n "$reject_line" ]; then
-            iptables -I INPUT "$reject_line" -p udp --dport "$PORT" -j ACCEPT
-            echo "    iptables: inserted at position $reject_line (before the REJECT)"
+            iptables -I INPUT "$reject_line" -p "$proto" --dport "$PORT" -j ACCEPT
+            echo "    iptables: $proto inserted at position $reject_line (before the REJECT)"
         else
-            iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT
-            echo "    iptables: appended (no REJECT rule found)"
+            iptables -A INPUT -p "$proto" --dport "$PORT" -j ACCEPT
+            echo "    iptables: $proto appended (no REJECT rule found)"
         fi
-    fi
+    done
 
     # Persist, or it vanishes on reboot.
     if [ "$DISTRO" = debian ]; then
@@ -148,16 +151,25 @@ cat <<EOF
    Networking -> Virtual Cloud Networks -> <your VCN> -> Security Lists
      -> Default Security List -> Add Ingress Rules
 
+   TWO rules, identical but for the protocol:
+
      Stateless:    No
      Source Type:  CIDR
      Source CIDR:  0.0.0.0/0
-     IP Protocol:  UDP
+     IP Protocol:  TCP          (and a second rule with UDP)
      Destination Port Range: $PORT
 
- Or with the OCI CLI:
+   TCP carries every node's connection to the server; without it nothing
+   connects at all. UDP carries datagram channels' address discovery and relay.
+
+ Or with the OCI CLI -- note this REPLACES the list's ingress rules, so include
+ any you already have (SSH, at least):
    oci network security-list update --security-list-id <ocid> \\
-     --ingress-security-rules '[{"protocol":"17","source":"0.0.0.0/0",
-       "udpOptions":{"destinationPortRange":{"min":$PORT,"max":$PORT}}}]'
+     --ingress-security-rules '[
+       {"protocol":"6","source":"0.0.0.0/0",
+        "tcpOptions":{"destinationPortRange":{"min":$PORT,"max":$PORT}}},
+       {"protocol":"17","source":"0.0.0.0/0",
+        "udpOptions":{"destinationPortRange":{"min":$PORT,"max":$PORT}}}]'
 
  Then point a client at it:
    uconn-demo --server $PUBLIC_IP:$PORT --create

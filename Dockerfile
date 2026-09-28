@@ -1,11 +1,12 @@
 # Build the rendezvous server as a static Linux binary.
 #
 #   docker build -t uconnect-rendezvous .
-#   docker run --rm -p 4433:4433/udp uconnect-rendezvous
+#   docker run --rm -p 4433:4433/tcp -p 4433:4433/udp uconnect-rendezvous
 #
-# Note the /udp suffix on the port mapping. This server speaks only UDP; a TCP
-# mapping publishes nothing and the container will look alive while being
-# completely unreachable.
+# Publish BOTH. Nodes keep their control connection -- and the TCP relay -- on
+# TCP; datagram channels learn their address and use the UDP relay on UDP. With
+# only one mapped, the container looks alive while half the protocol is
+# unreachable.
 
 FROM alpine:3.20 AS build
 
@@ -38,12 +39,13 @@ RUN cmake -S . -B build -G Ninja \
 
 # ---------------------------------------------------------------------------
 # Runtime: nothing but the binary. The server holds no keys, writes no files,
-# and keeps every record in memory with a 90s expiry, so there is nothing to
-# persist and nothing to mount.
+# and keeps every record only as long as its node's connection is open, so
+# there is nothing to persist and nothing to mount.
 FROM scratch
 
 COPY --from=build /src/build/server/uconnect-rendezvous /uconnect-rendezvous
 
+EXPOSE 4433/tcp
 EXPOSE 4433/udp
 ENTRYPOINT ["/uconnect-rendezvous"]
 CMD ["--port", "4433"]

@@ -8,7 +8,7 @@
 #
 #  * It polls rather than taking a webhook. A webhook would need an inbound HTTP
 #    listener, a second open port and a public endpoint -- on a box whose whole
-#    point is that only UDP 4433 is exposed. Polling costs one conditional GET a
+#    point is that only port 4433 is exposed. Polling costs one conditional GET a
 #    minute and needs nothing open.
 #
 #  * It builds in a SEPARATE tree from the running binary. A broken commit must
@@ -20,10 +20,10 @@
 #  * It keeps the previous binary and ROLLS BACK if the new one will not stay
 #    running. A rendezvous server that crashloops is worse than a stale one.
 #
-#  * Restarting is genuinely cheap here: records live in memory with a 90s
-#    expiry and clients re-register within one 20s keepalive, so a restart costs
-#    a few seconds of new registrations and nothing else. There is no state to
-#    migrate and no database to worry about.
+#  * Restarting is genuinely cheap here: records live in memory, tied to each
+#    node's connection, and nodes reconnect and register again on their own, so
+#    a restart costs a few seconds of new registrations and nothing else. There
+#    is no state to migrate and no database to worry about.
 #
 #  * The web dashboard is deployed too, but STRICTLY AS AN ACCESSORY. It is
 #    updated after the server is confirmed healthy, and nothing that happens to

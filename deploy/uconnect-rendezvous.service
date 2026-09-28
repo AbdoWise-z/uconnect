@@ -4,13 +4,15 @@
 #   sudo cp uconnect-rendezvous.service /etc/systemd/system/
 #   sudo systemctl enable --now uconnect-rendezvous
 #
-# Then open the port. This is the step people forget, and the failure mode is a
-# server that starts cleanly and is unreachable:
+# Then open the port, for TCP AND UDP. This is the step people forget, and the
+# failure mode is a server that starts cleanly and is unreachable -- or, with
+# only UDP open, one that no node can connect to at all:
 #
-#   ufw:       sudo ufw allow 4433/udp
-#   firewalld: sudo firewall-cmd --add-port=4433/udp --permanent && sudo firewall-cmd --reload
-#   AWS/GCP:   add an inbound UDP rule to the security group -- the OS firewall
-#              is not the only one in the path.
+#   ufw:       sudo ufw allow 4433/tcp && sudo ufw allow 4433/udp
+#   firewalld: sudo firewall-cmd --add-port=4433/tcp --add-port=4433/udp --permanent \
+#                && sudo firewall-cmd --reload
+#   AWS/GCP:   add inbound TCP and UDP rules to the security group -- the OS
+#              firewall is not the only one in the path.
 
 [Unit]
 Description=uConnect rendezvous server
@@ -34,7 +36,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 # AF_UNIX and AF_NETLINK are not optional here even though the server only
-# speaks UDP: glibc's resolver talks to nscd/systemd-resolved over a unix
+# speaks TCP and UDP: glibc's resolver talks to nscd/systemd-resolved over a unix
 # socket, and getifaddrs() uses netlink. Restricting to AF_INET/AF_INET6 alone
 # makes the STUN hostname lookup fail with a misleading "no reply".
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

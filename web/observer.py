@@ -206,17 +206,17 @@ def derived_stats(data: dict) -> dict:
 
     total_records = s.get("entries_total", 0)
     fresh_records = s.get("entries_fresh", 0)
-    rejects = (s.get("rej_bad_auth", 0) + s.get("rej_quota", 0)
-               + s.get("rej_rate_limited", 0))
+    rejects = s.get("rej_quota", 0) + s.get("rej_rate_limited", 0)
 
     return {
         "listed_peers": peers,
         "listed_fresh": fresh,
         "keyed_topics": keyed,
         "open_topics": len(topics) - keyed,
-        # Records past the 45s freshness line: alive on paper, but their NAT
-        # binding may already be gone. A climbing number here is the early
-        # symptom of clients that have stopped sending keepalives.
+        # Records past the 45s freshness line: their node's connection is still
+        # open, but it has not refreshed the record, so its addresses may be
+        # out of date. A climbing number here is the early symptom of clients
+        # that have stopped sending keepalives.
         "stale_records": max(0, total_records - fresh_records),
         "largest_topic": max((t.get("peers", 0) for t in topics), default=0),
         "avg_peers_per_topic": round(peers / len(topics), 1) if topics else 0,

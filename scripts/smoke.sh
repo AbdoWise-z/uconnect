@@ -54,8 +54,8 @@ grep -q "<- .*hello from bob"   /tmp/uc-alice.log || { echo "FAIL: alice got no 
 grep -q "<- .*hello from alice" /tmp/uc-bob.log   || { echo "FAIL: bob got no message from alice"; FAIL=1; }
 
 # Bob's shutdown tells alice on the wire. She outlives him by ~8s, and the idle
-# timeout is 90s, so seeing "closed" at all proves the message arrived rather
-# than a timer having expired.
+# timeout is 90s, so seeing "closed" at all proves bob's node ended the
+# connection rather than a timer having expired.
 grep -q "> closed" /tmp/uc-alice.log || {
     echo "FAIL: alice never saw bob close -- the shutdown notice did not arrive"
     FAIL=1
@@ -72,22 +72,13 @@ grep -q "gone: shutting-down" /tmp/uc-alice.log || {
 [ "$RA" -eq 0 ] || { echo "FAIL: alice exit $RA"; FAIL=1; }
 [ "$RB" -eq 0 ] || { echo "FAIL: bob exit $RB"; FAIL=1; }
 
-# Two peers publishing once each should produce exactly two registrations, and
-# no authentication rejections at all.
-#
-# Both checks exist because of one bug that hid behind a passing smoke test: a
-# spurious retransmission registered every client twice, the server rotated the
-# lease token on the second registration, and every authenticated message
-# afterwards failed. Punching does not depend on those MACs, so peers still
-# connected and still exchanged messages -- nothing looked wrong until the
-# relay, which does depend on them, refused to work at all.
+# Each publisher registers once. More than that means requests are being
+# duplicated, or control connections are dropping and re-registering.
 STATS="$("$DEMO" --server "127.0.0.1:$UC_PORT" --stats 2>/dev/null || true)"
 echo "=== server stats ==="; echo "$STATS"
 
 REGS="$(echo "$STATS" | grep -o 'registers=[0-9]*' | cut -d= -f2)"
-AUTH="$(echo "$STATS" | grep -o 'auth=[0-9]*' | cut -d= -f2)"
 
-[ "${AUTH:-0}" = "0" ] || { echo "FAIL: $AUTH authentication rejection(s) -- lease drift"; FAIL=1; }
 # 3 = alice + bob + the helper that created the topic.
 if [ -n "$REGS" ] && [ "$REGS" -gt 3 ]; then
     echo "FAIL: $REGS registrations for 3 publishers -- requests are being duplicated"

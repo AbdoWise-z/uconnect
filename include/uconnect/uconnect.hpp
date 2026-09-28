@@ -9,13 +9,18 @@
 //   auto& topic = node.join(uconnect::TopicCreds::parse("uconn://<32hex>#<64hex>"));
 //   topic.on_data([](auto dev, auto bytes) { ... });
 //   topic.publish(meta);                          // become findable
-//   topic.connect_all(8);                         // LOOKUP -> punch -> Noise
+//   topic.connect_all(8);                         // LOOKUP -> punch TCP -> Noise
 //   topic.broadcast(payload);
 //
 //   node.shutdown();
 //
 // Connections are owned by the Topic and addressed by dev_id; there is no
 // separate connection object to manage.
+//
+// Transport. Each peer connection is one TCP connection: punched directly when
+// the NATs allow, relayed through the rendezvous server when they do not. The
+// Noise handshake runs over it, so it carries the session's keys, and every
+// message on it is reliable, ordered and encrypted.
 
 #include <chrono>
 #include <functional>
@@ -57,10 +62,10 @@ struct TopicCreds {
 // ---------------------------------------------------------------------------
 enum class PeerState : uint8_t {
     Unknown,
-    Probing,       // punching
-    Handshaking,   // path validated, running Noise
+    Probing,       // dialing: punching TCP, or waiting on a relay
+    Handshaking,   // a connection is up, running Noise
     Connected,
-    Failed,        // no candidate answered
+    Failed,        // no path: punching failed and no relay could be had
     Closed,
 };
 
@@ -83,30 +88,14 @@ struct TopicSummary {
 struct ServerStats {
     uint64_t topics_total = 0, topics_listed = 0;
     uint64_t entries_total = 0, entries_fresh = 0;
-    uint64_t registers = 0, keepalives = 0, lookups = 0, connects = 0;
-    uint64_t rebinds = 0, expired = 0;
-    uint64_t rej_bad_auth = 0, rej_quota = 0, rej_rate_limited = 0;
+    uint64_t registers = 0, lookups = 0, connects = 0, expired = 0;
+    uint64_t rej_quota = 0, rej_rate_limited = 0;
     uint64_t relays_open = 0, relays_allocated = 0, relay_bytes = 0;
+    uint64_t connections = 0;  // control connections open on the server
 };
 
 class Node;
 class Topic;
-
-// ---------------------------------------------------------------------------
-// Stream
-// ---------------------------------------------------------------------------
-// A reliable, ordered byte stream to one peer -- the guarantees TCP gives,
-// layered over the datagram session.
-//
-// Streams are multiplexed, so head-of-line blocking is per stream rather than
-// per connection: a lost packet on one stream stalls that stream while the
-// others keep flowing. That is the reason this is built on datagrams instead
-// of a single ordered pipe, and it is not something TCP can offer.
-//
-// This is a lightweight handle, not an owner. The Topic owns the stream state;
-// copying a Stream is free and safe, and a handle to a stream that has since
-// closed simply reports zero/false rather than misbehaving.
-using StreamId = uint64_t;
 
 // Why a peer connection ended, delivered with on_peer_closed.
 //
@@ -116,7 +105,7 @@ using StreamId = uint64_t;
 // peer was still alive enough to say goodbye.
 enum class PeerGone : uint8_t {
     Local,        // we disconnected, or shut down
-    TimedOut,     // silence: crash, cable pull, NAT rebind, or a failed handshake
+    TimedOut,     // silence or a dropped connection: crash, cable pull, NAT timeout
     GoingAway,    // the peer's application closed this connection
     ShuttingDown, // the peer's node is exiting
     Unspecified,  // the peer said goodbye without saying why
@@ -128,74 +117,12 @@ const char* to_string(PeerGone);
 // a relayed connection is still end-to-end encrypted, yet it puts the
 // rendezvous server back in the path where it can see traffic patterns.
 struct LinkInfo {
-    bool relayed = false;   // going through the rendezvous server, not direct
+    bool relayed = false;  // through the rendezvous server, not direct
 
-    std::chrono::milliseconds rtt{0};      // smoothed, from the stream layer
-    size_t   congestion_window = 0;
-    size_t   bytes_in_flight   = 0;
-    bool     slow_start        = false;
-
-    uint64_t datagrams_sent     = 0;       // session level
-    uint64_t datagrams_received = 0;
-    uint64_t packets_sent       = 0;       // stream level
-    uint64_t packets_lost       = 0;
-
-    size_t open_streams = 0;
-};
-
-class Stream {
-public:
-    Stream() = default;
-
-    // Returns bytes accepted. A short count is backpressure -- flow control or
-    // the send buffer cap -- not an error; retry when the peer's window opens.
-    size_t write(std::span<const uint8_t> data);
-
-    // Reads the contiguous prefix only, so bytes always arrive in the order
-    // they were written. Returns bytes copied; 0 means nothing is ready yet.
-    size_t read(std::span<uint8_t> out);
-
-    // Half-close: no more writes from us. On a bidirectional stream the other
-    // direction stays open, so the stream is only released once BOTH ends
-    // finish. For a one-way transfer open the stream unidirectional -- it then
-    // retires as soon as the receiver has drained it.
-    void finish();
-
-    // Abort our sending direction, discarding anything pending. On a
-    // bidirectional stream the peer may still send to us; use close() to end
-    // both directions.
-    void reset(uint64_t error_code = 0);
-
-    // End the stream in both directions without needing the other application
-    // to cooperate. The peer is told to stop sending and answers by aborting
-    // its own direction, which is what releases this side.
-    //
-    // This closes a stream, not the connection: the session and every other
-    // stream on this peer keep running.
-    void close(uint64_t error_code = 0);
-
-    // Tell the peer to stop sending, without touching our own direction. The
-    // peer answers by aborting its side, so this is how a reader says "I have
-    // what I need" while still having something left to write.
-    void stop_sending(uint64_t error_code = 0);
-
-    bool   readable() const;
-    size_t readable_bytes() const;
-    bool   writable() const;
-    bool   finished() const;             // peer sent FIN and we have read it all
-
-    StreamId id() const { return id_; }
-    DevId    peer() const { return peer_; }
-    bool     valid() const { return topic_ != nullptr; }
-    explicit operator bool() const { return valid(); }
-
-private:
-    friend class Topic;
-    Stream(Topic* t, DevId p, StreamId i) : topic_(t), peer_(p), id_(i) {}
-
-    Topic*   topic_ = nullptr;
-    DevId    peer_{};
-    StreamId id_ = 0;
+    uint64_t messages_sent     = 0;
+    uint64_t messages_received = 0;
+    uint64_t bytes_sent        = 0;  // message payload bytes
+    uint64_t bytes_received    = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -208,10 +135,9 @@ public:
     Topic& operator=(const Topic&) = delete;
 
     // --- membership --------------------------------------------------------
-    // REGISTER with the server and start the ~20s keepalive. Until this is
-    // called the node can find others but cannot be found.
-    // Topics appear in the public listing by default. Pass unlisted=true to
-    // keep this one out of it.
+    // REGISTER with the server. Until this is called the node can find others
+    // but cannot be found. Topics appear in the public listing by default;
+    // pass unlisted=true to keep this one out of it.
     //
     // Hiding is sticky and topic-wide: one member asking for it hides the
     // topic from everyone, for as long as the topic exists. Being unlisted is
@@ -224,14 +150,15 @@ public:
 
     // --- discovery ---------------------------------------------------------
     // Returns a random sample, never the whole swarm. Capped at 30 by default
-    // and 100 at most: a 5000-peer topic would otherwise be an amplification
-    // hazard and an invitation to punch 5000 paths.
+    // and 100 at most: a 5000-peer topic would otherwise be an invitation to
+    // dial 5000 peers.
     std::vector<PeerInfo> peers(uint8_t max = 30, bool want_meta = false,
                                 std::chrono::milliseconds timeout = std::chrono::seconds(3));
     std::optional<PeerInfo> resolve(const DevId&,
                                     std::chrono::milliseconds timeout = std::chrono::seconds(3));
 
     // --- connections, owned here, addressed by dev_id ----------------------
+    // Needs publish(): the server introduces a peer only to a registered one.
     void connect(const DevId&);
     void connect_all(size_t max_peers = 8);
     void disconnect(const DevId&);
@@ -243,20 +170,15 @@ public:
     // Diagnostics for one connected peer. Nullopt if there is no live session.
     std::optional<LinkInfo> link(const DevId&) const;
 
-    // --- datagrams ---------------------------------------------------------
-    // Unreliable and unordered, like the session underneath. Fine for things
-    // that are cheap to lose -- presence, telemetry, a game tick. Use a Stream
-    // when delivery matters.
+    // --- messages ----------------------------------------------------------
+    // Reliable and ordered: each message arrives whole, once, in the order
+    // sent, as one on_data call. Up to max_message() bytes. False if the peer
+    // is not connected, the message is too large, or the peer is reading so
+    // slowly that 16 MiB is already waiting for it -- try again later.
     bool   send(const DevId&, std::span<const uint8_t>);
     size_t broadcast(std::span<const uint8_t>);
 
-    // --- streams -----------------------------------------------------------
-    // Reliable and ordered. Available once a peer reaches PeerState::Connected.
-    // Returns an invalid handle if the peer is not connected, or if this peer
-    // already has the configured maximum number of streams open.
-    Stream open_stream(const DevId&, bool bidirectional = true);
-    Stream stream(const DevId&, StreamId);          // handle to an existing one
-    std::vector<StreamId> streams(const DevId&) const;
+    static constexpr size_t max_message() { return 1u << 20; }
 
     // --- events (invoked on the node's loop thread; do not block) ----------
     void on_peer(std::function<void(DevId, PeerState)>);
@@ -266,24 +188,6 @@ public:
     // this to tell a peer that said goodbye from one that simply vanished --
     // the first is worth reporting calmly, the second is worth retrying.
     void on_peer_closed(std::function<void(DevId, PeerGone)>);
-
-    // The peer opened a stream. Nothing is readable yet -- wait for
-    // on_stream_readable, or just try to read.
-    void on_stream(std::function<void(Stream)>);
-    void on_stream_readable(std::function<void(Stream)>);
-    void on_stream_finished(std::function<void(Stream)>);
-
-    // Flow control reopened after a short write. Retry the write from here
-    // rather than polling writable() on a timer.
-    void on_stream_writable(std::function<void(Stream)>);
-
-    // The stream was aborted -- by the peer, or by us because the peer overran
-    // the receive window. No further bytes will arrive on it.
-    void on_stream_reset(std::function<void(Stream, uint64_t error_code)>);
-
-    // Both directions are done and the state behind the handle has been
-    // released. The handle stays safe to call; it just reports empty.
-    void on_stream_closed(std::function<void(Stream)>);
 
     // --- policy ------------------------------------------------------------
     void set_max_peers(size_t);
@@ -308,15 +212,13 @@ public:
 
 private:
     friend class Node;
-    friend class Stream;
     struct Impl;
     explicit Topic(std::unique_ptr<Impl>);
 
-    // Disconnect carrying a specific wire close reason. Private because the
-    // reason codes are a wire-layer detail; Node uses it so that a shutdown
-    // tells peers the node is exiting rather than that one link was dropped.
+    // Disconnect carrying a specific close reason. Private because the reason
+    // codes are a wire-level detail; Node uses it so that a shutdown tells
+    // peers the node is exiting rather than that one link was dropped.
     void disconnect_all_with_reason(uint16_t reason);
-    void drop_peer_locked(const DevId&, uint16_t reason);
 
     std::unique_ptr<Impl> impl_;
 };
@@ -327,46 +229,40 @@ private:
 class Node {
 public:
     struct Config {
-        std::string          server;            // the only required field
-        uint16_t             bind_port = 0;     // 0 = ephemeral
+        std::string server;  // the only required field: host:port
+
+        // The node's one TCP port: it listens here, keeps its connection to
+        // the server from here, and punches to peers from here, because the
+        // NAT mapping of this port is the address peers are told to dial.
+        // 0 = ephemeral.
+        uint16_t bind_port = 0;
+
+        // How often each published topic is refreshed with the server. The
+        // same traffic keeps the NAT mapping of the node's port alive.
         std::chrono::seconds keepalive{20};
-        size_t               max_total_peers = 64;
+
+        size_t max_total_peers = 64;
+
+        // How long to punch before falling back to the relay.
+        std::chrono::seconds punch_timeout{8};
 
         // Skip punching and go straight to the relay. Normally the relay is a
-        // fallback taken only after probing fails, but forcing it is the only
+        // fallback taken only after punching fails, but forcing it is the only
         // practical way to exercise that path from a network where punching
-        // happens to work -- and it is what a peer on a known-symmetric NAT
-        // would want anyway, to avoid wasting seconds on probes that cannot
-        // succeed.
-        bool                 force_relay     = false;
-        bool                 verbose         = false;
+        // happens to work -- and what a peer on a known-symmetric NAT wants
+        // anyway, to avoid seconds of dialing that cannot succeed.
+        bool force_relay = false;
+        bool verbose     = false;
 
-        // --- stream tuning -------------------------------------------------
-        // Receive window for one stream. The main memory-against-throughput
-        // knob: a long fat path needs a window near bandwidth x delay to keep
-        // the pipe full, and the cost is per stream.
-        size_t stream_recv_window = 256 * 1024;
-
-        // Receive window across every stream on one peer, so many half-idle
-        // streams cannot together pin far more than one busy stream would.
-        size_t conn_recv_window = 1024 * 1024;
-
-        // Concurrent streams per peer, counted separately for each end's
-        // streams. open_stream returns an invalid handle once ours are used up,
-        // and inbound frames past the peer's share are dropped -- each stream
-        // costs buffers, and the peer chooses how many ids it puts on the wire.
-        size_t max_streams_per_peer = 64;
-
-        // Ratchet the transport keys every 2^rekey_shift packets, so traffic
-        // older than the current generation cannot be recovered from a later
-        // compromise. Driven by the packet counter, which travels in every
-        // header, so both ends agree without negotiating anything.
+        // Ratchet the UDP datagram channel's keys every 2^rekey_shift packets,
+        // so traffic older than the current generation cannot be recovered from
+        // a later compromise. Driven by the packet counter, which travels in
+        // every header, so both ends agree without negotiating anything.
         //
         // A generation must stay above 64 packets (the replay window width):
         // that is what bounds a reordered packet to at most one generation
         // old. So the shift must be in 7..63; the Node constructor throws
-        // std::invalid_argument otherwise. 7 is the floor for exercising the
-        // boundary in a test.
+        // std::invalid_argument otherwise.
         uint8_t rekey_shift = 16;
     };
 
@@ -399,27 +295,22 @@ public:
     // --- lifecycle ---------------------------------------------------------
     void run();                // blocking
     void run_in_background();
-    void shutdown();           // UNREGISTER everything, close sessions, stop
+    void shutdown();           // tell peers and the server, close everything, stop
 
     bool     is_running() const;
-    uint16_t local_port() const;
+    uint16_t local_port() const;  // the node's TCP port
 
-    // Our reflexive address as the server last reported it, once registered.
+    // Our reflexive TCP address as the server last reported it, once registered.
     std::optional<Endpoint> reflexive() const;
 
-    // Requests to the rendezvous server still awaiting a reply or cleanup.
-    // Diagnostic: on a healthy node this stays small no matter how long it
-    // runs, and growth means requests are being forgotten rather than retired.
+    // True while the control connection to the server is up.
+    bool server_connected() const;
+
+    // Requests to the rendezvous server still awaiting a reply. Diagnostic:
+    // on a healthy node this stays small no matter how long it runs.
     size_t pending_requests() const;
 
-    // Probe transactions remembered so a handshake bound to one can be
-    // admitted. Diagnostic: bounded however many probes arrive, because
-    // anyone may probe an open topic.
-    size_t answered_probes() const;
-
 private:
-    // Topic::Impl holds a Node::Impl* -- a nested class inherits its enclosing
-    // class's access, so befriending Topic is enough.
     friend class Topic;
     struct Impl;
     std::unique_ptr<Impl> impl_;

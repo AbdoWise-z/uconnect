@@ -98,6 +98,13 @@ ControlService::Result ControlService::on_message(ConnKey key, std::span<const u
             return out;
         }
         case MsgType::Keepalive: {
+            // With no body it keeps the connection itself alive: a node with
+            // nothing published still needs its connection, so the server
+            // can introduce peers to it and it can learn its address.
+            if (r.remaining() == 0) {
+                out.out.push_back(reply(key, MsgType::KeepaliveOk, txn, ctl::KeepaliveOk{conn.peer}));
+                return out;
+            }
             auto m = ctl::DevRef::decode(r);
             if (!m) break;
             auto code = reg_.refresh(m->dev_id, key, now);

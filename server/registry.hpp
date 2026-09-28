@@ -3,9 +3,8 @@
 // relay bindings. Sans-IO: no sockets, no clock, no threads -- `now` is always
 // a parameter, and connections are opaque keys the runtime hands in.
 //
-// The difference from v1's Store is ownership. A node reaches the server over
-// one TCP connection, and every record it registers belongs to that
-// connection. Only the owner can refresh, update or unregister a record, or
+// Everything here is owned. A node reaches the server over one TCP
+// connection, and every record it registers belongs to that connection. Only the owner can refresh, update or unregister a record, or
 // CONNECT and relay on its behalf, and when the connection closes everything
 // it owned goes with it. There are no lease tokens, MACs or sequence numbers,
 // because there is nothing to authenticate that the connection does not
@@ -22,10 +21,24 @@
 
 #include "control.hpp"
 #include "primitives.hpp"
-#include "store.hpp"  // ArrayHash
 #include "uconnect/types.hpp"
 
 namespace uconnect::server {
+
+struct ArrayHash {
+    template <size_t N>
+    size_t operator()(const std::array<uint8_t, N>& a) const noexcept {
+        // FNV-1a. These keys are already uniformly random (dev_id is a MAC,
+        // topic_id is client-chosen but high-entropy), so hash quality is not
+        // load-bearing; speed is.
+        uint64_t h = 1469598103934665603ULL;
+        for (uint8_t b : a) {
+            h ^= b;
+            h *= 1099511628211ULL;
+        }
+        return static_cast<size_t>(h);
+    }
+};
 
 // A control connection, as the runtime identifies it. Never reused.
 using ConnKey = uint64_t;

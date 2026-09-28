@@ -186,6 +186,21 @@ TEST(rendezvous_registers_over_tcp_and_reports_the_observed_address) {
     CHECK_EQ(s.records(), 1u);
 }
 
+TEST(rendezvous_an_empty_keepalive_holds_a_connection_with_nothing_registered) {
+    // A node that has published nothing still keeps its control connection:
+    // it is how the server reaches it. An empty Keepalive refreshes the
+    // connection alone and reports the address it came from.
+    Server s;
+    Client a{s};
+    a.send(ctl::empty_message(MsgType::Keepalive, 3));
+    auto ok = decode<ctl::KeepaliveOk>(a.expect(MsgType::KeepaliveOk),
+                                       [](wire::Reader& r) { return ctl::KeepaliveOk::decode(r); });
+    REQUIRE(ok.has_value());
+    CHECK_EQ(ok->srflx.port, a.local_port());
+    CHECK(!a.closed_within(300ms));
+    CHECK_EQ(s.records(), 0u);
+}
+
 TEST(rendezvous_a_record_disappears_when_its_connection_closes) {
     Server s;
     Client a{s}, b{s};

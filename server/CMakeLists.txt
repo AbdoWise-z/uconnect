@@ -1,7 +1,5 @@
-# Sans-IO record store: no sockets, no clock, no threads.
+# Sans-IO registry: no sockets, no clock, no threads.
 add_library(uconnect_store STATIC
-    store.cpp
-    udp_service.cpp
     registry.cpp
 )
 target_include_directories(uconnect_store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -22,5 +20,5 @@ add_executable(uconnect-rendezvous
         stun.hpp
         stun.cpp
 )
-target_link_libraries(uconnect-rendezvous PRIVATE uconnect_store uconnect_io Threads::Threads)
+target_link_libraries(uconnect-rendezvous PRIVATE uconnect_rendezvous Threads::Threads)
 uconnect_bundle_runtime(uconnect-rendezvous)

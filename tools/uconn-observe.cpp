@@ -171,19 +171,20 @@ int main(int argc, char** argv) {
                 ",\n  \"stats\":{"
                 "\"topics_total\":%llu,\"topics_listed\":%llu,"
                 "\"entries_total\":%llu,\"entries_fresh\":%llu,"
-                "\"registers\":%llu,\"keepalives\":%llu,\"lookups\":%llu,"
-                "\"connects\":%llu,\"rebinds\":%llu,\"expired\":%llu,"
-                "\"rej_bad_auth\":%llu,\"rej_quota\":%llu,\"rej_rate_limited\":%llu,"
-                "\"relays_open\":%llu,\"relays_allocated\":%llu,\"relay_bytes\":%llu}",
+                "\"registers\":%llu,\"lookups\":%llu,"
+                "\"connects\":%llu,\"expired\":%llu,"
+                "\"rej_quota\":%llu,\"rej_rate_limited\":%llu,"
+                "\"relays_open\":%llu,\"relays_allocated\":%llu,\"relay_bytes\":%llu,"
+                "\"connections\":%llu}",
                 (unsigned long long)s->topics_total, (unsigned long long)s->topics_listed,
                 (unsigned long long)s->entries_total, (unsigned long long)s->entries_fresh,
-                (unsigned long long)s->registers, (unsigned long long)s->keepalives,
+                (unsigned long long)s->registers,
                 (unsigned long long)s->lookups, (unsigned long long)s->connects,
-                (unsigned long long)s->rebinds, (unsigned long long)s->expired,
-                (unsigned long long)s->rej_bad_auth, (unsigned long long)s->rej_quota,
+                (unsigned long long)s->expired,
+                (unsigned long long)s->rej_quota,
                 (unsigned long long)s->rej_rate_limited,
                 (unsigned long long)s->relays_open, (unsigned long long)s->relays_allocated,
-                (unsigned long long)s->relay_bytes);
+                (unsigned long long)s->relay_bytes, (unsigned long long)s->connections);
         } else {
             std::printf(",\n  \"stats\":null");
         }

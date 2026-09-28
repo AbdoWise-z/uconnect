@@ -6,8 +6,9 @@
 //   uconn-demo --server 127.0.0.1:4433 --topic uconn://<id>#<key> --name bob
 //       joins, publishes, connects to everyone, and exchanges messages
 //
-// Each instance publishes its record, looks up the topic, punches, runs the
-// Noise handshake, and then sends a greeting to every peer it connects to.
+// Each instance publishes its record, looks up the topic, punches a TCP
+// connection (or falls back to the relay), runs the Noise handshake, and then
+// sends a greeting to every peer it connects to.
 
 #include <atomic>
 #include <chrono>
@@ -74,25 +75,26 @@ int main(int argc, char** argv) {
         cfg.server = server;
         Node node{cfg};
         node.run_in_background();
-        std::printf("[%s] local UDP port %u\n", name.c_str(), node.local_port());
+        std::printf("[%s] local TCP port %u\n", name.c_str(), node.local_port());
 
         if (want_stats) {
             auto s = node.stats();
             if (!s) { std::fprintf(stderr, "no reply from server\n"); return 1; }
-            std::printf("topics=%llu listed=%llu records=%llu fresh=%llu\n"
-                        "registers=%llu keepalives=%llu lookups=%llu relays=%llu\n"
-                        "rebinds=%llu expired=%llu rej{auth=%llu quota=%llu rate=%llu}\n",
+            std::printf("connections=%llu topics=%llu listed=%llu records=%llu fresh=%llu\n"
+                        "registers=%llu lookups=%llu connects=%llu expired=%llu\n"
+                        "relays=%llu open=%llu relay_bytes=%llu rej{quota=%llu rate=%llu}\n",
+                        (unsigned long long)s->connections,
                         (unsigned long long)s->topics_total,
                         (unsigned long long)s->topics_listed,
                         (unsigned long long)s->entries_total,
                         (unsigned long long)s->entries_fresh,
                         (unsigned long long)s->registers,
-                        (unsigned long long)s->keepalives,
                         (unsigned long long)s->lookups,
                         (unsigned long long)s->connects,
-                        (unsigned long long)s->rebinds,
                         (unsigned long long)s->expired,
-                        (unsigned long long)s->rej_bad_auth,
+                        (unsigned long long)s->relays_allocated,
+                        (unsigned long long)s->relays_open,
+                        (unsigned long long)s->relay_bytes,
                         (unsigned long long)s->rej_quota,
                         (unsigned long long)s->rej_rate_limited);
             return 0;

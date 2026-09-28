@@ -109,7 +109,8 @@ struct RegisterOk {
     static std::optional<RegisterOk> decode(Reader&);
 };
 
-// Keepalive and Unregister: which of this connection's records.
+// Keepalive and Unregister: which of this connection's records. A Keepalive
+// with no body at all refreshes the connection alone.
 struct DevRef {
     DevId dev_id{};
 

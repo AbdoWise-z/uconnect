@@ -143,7 +143,7 @@ void usage() {
         "  --create-open           create an OPEN topic (no authentication)\n"
         "  --nick <name>           your display name (default: your username)\n"
         "  --unlisted              keep this topic OUT of the public listing\n"
-        "  --port <n>              bind a specific local UDP port\n"
+        "  --port <n>              bind a specific local TCP port\n"
         "\n"
         "Type a message and press Enter to send it to everyone.\n"
         "Commands: /help /who /peers /invite /sas /nick /connect /part /quit\n");
@@ -279,8 +279,8 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case PeerState::Failed:
-                    term.printf("%s* %s unreachable (punch failed -- likely "
-                                "symmetric NAT on both ends)%s",
+                    term.printf("%s* %s unreachable (punching failed and no "
+                                "relay could be had)%s",
                                 C.dim, short_id(dev).c_str(), C.reset);
                     roster.forget_greeting(dev);
                     break;

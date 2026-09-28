@@ -1,5 +1,6 @@
 #include "tcp_session.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <string_view>
 
@@ -235,10 +236,9 @@ void TcpSession::on_eof(Instant now) {
 // Sending
 // ---------------------------------------------------------------------------
 void TcpSession::seal(uint8_t kind, std::span<const uint8_t> body) {
-    std::vector<uint8_t> plain;
-    plain.reserve(body.size() + 1);
-    plain.push_back(kind);
-    plain.insert(plain.end(), body.begin(), body.end());
+    std::vector<uint8_t> plain(body.size() + 1);
+    plain[0] = kind;
+    std::copy(body.begin(), body.end(), plain.begin() + 1);
 
     std::vector<uint8_t> ct(plain.size() + crypto::kTagLen);
     send_cs_.encrypt_with_ad({}, plain, ct);

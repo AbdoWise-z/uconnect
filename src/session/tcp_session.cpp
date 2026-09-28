@@ -15,7 +15,12 @@ constexpr uint8_t kKeepalive = 0x01;
 constexpr uint8_t kClose     = 0x02;
 
 // Handshake frames are small and fixed in shape; anything longer is not one.
+// That is also what keeps a hello unambiguous: a frame's first byte is the
+// high byte of a length under 512, so it is never 'U'.
 constexpr size_t kMaxHandshakeFrame = 512;
+
+constexpr uint8_t kHello0 = 'U';
+constexpr uint8_t kHello1 = 'C';
 
 // Message 1's payload: the initiator's dev_id and padding. Under psk0 it is
 // sealed with a key from the PSK alone, before any DH -- no forward secrecy,
@@ -99,6 +104,21 @@ TcpSession TcpSession::respond(TcpSessionConfig cfg, const TopicId& topic, uint8
     return s;
 }
 
+std::vector<uint8_t> TcpSession::hello(const AttemptNonce& attempt) {
+    std::vector<uint8_t> h{kHello0, kHello1};
+    h.insert(h.end(), attempt.begin(), attempt.end());
+    return h;
+}
+
+std::optional<AttemptNonce> TcpSession::peek_hello(std::span<const uint8_t> received) {
+    if (received.size() < kHelloLen || received[0] != kHello0 || received[1] != kHello1) {
+        return std::nullopt;
+    }
+    AttemptNonce a{};
+    std::memcpy(a.data(), received.data() + 2, kAttemptLen);
+    return a;
+}
+
 std::optional<AttemptNonce> TcpSession::peek_attempt(std::span<const uint8_t> received) {
     if (received.size() < 2 + kAttemptLen) return std::nullopt;
     const size_t len = static_cast<size_t>(received[0]) << 8 | received[1];
@@ -117,6 +137,18 @@ void TcpSession::on_bytes(std::span<const uint8_t> bytes, Instant now) {
 
     while (state_ != State::Closed) {
         if (state_ == State::Handshaking) {
+            // The responder's hello, wherever it lands before message 2. It
+            // must name our attempt; a hello for any other is not our peer.
+            if (initiator_ && !in_.empty() && in_[0] == kHello0) {
+                if (in_.size() < kHelloLen) return;
+                auto named = peek_hello(in_);
+                if (!named || !crypto::ct_equal(*named, attempt_)) {
+                    fail(CloseCause::Local, now);
+                    return;
+                }
+                consume(in_, kHelloLen);
+                continue;
+            }
             if (in_.size() < 2) return;
             const size_t len = get_u16(in_);
             if (len > kMaxHandshakeFrame || (!initiator_ && len < kAttemptLen)) {

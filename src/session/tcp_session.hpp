@@ -97,6 +97,17 @@ public:
     // arrived. A responder needs this before it can build its session.
     static std::optional<AttemptNonce> peek_attempt(std::span<const uint8_t> received);
 
+    // A responder that dialed opens with a hello -- 'U' 'C' and the attempt --
+    // so an initiator holding a connection it ACCEPTED can tell who is calling.
+    // It is not part of the handshake, and an initiator skips it wherever it
+    // lands before message 2: after a TCP simultaneous open both ends think
+    // they dialed, so the hello can arrive after message 1 has gone out.
+    static constexpr size_t kHelloLen = 2 + kAttemptLen;
+    static std::vector<uint8_t>        hello(const AttemptNonce&);
+    // The attempt a hello names, once all of it has arrived; nullopt if
+    // `received` does not start with one (or has not got all of it yet).
+    static std::optional<AttemptNonce> peek_hello(std::span<const uint8_t> received);
+
     // Everything read from the socket, in order.
     void on_bytes(std::span<const uint8_t>, Instant now);
     // The socket ended without a Close record: the peer vanished.

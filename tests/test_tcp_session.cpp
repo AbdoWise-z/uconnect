@@ -137,6 +137,46 @@ TEST(tcp_session_a_different_peer_claiming_the_attempt_is_refused) {
     CHECK(!b.has_output());
 }
 
+TEST(tcp_session_an_initiator_skips_a_hello_that_arrives_after_message_1) {
+    // A TCP simultaneous open gives both ends one connection that each thinks
+    // it dialed. The initiator sends message 1 at once; the responder, having
+    // "dialed", opens with its hello -- which reaches the initiator AFTER its
+    // message 1 left. Read as a frame, 'U' 'C' is a 21827-byte length and the
+    // handshake died on one side while completing on the other.
+    for (size_t chunk : {size_t{1}, size_t{7}, SIZE_MAX}) {
+        auto p     = session_pair();
+        auto hello = TcpSession::hello(nonce_of(9));
+        auto m1    = p.a.take_output();
+        p.b.on_bytes(m1, t0());
+        auto m2 = p.b.take_output();
+
+        std::vector<uint8_t> to_a = hello;
+        to_a.insert(to_a.end(), m2.begin(), m2.end());
+        for (size_t off = 0; off < to_a.size(); off += chunk) {
+            p.a.on_bytes(std::span(to_a).subspan(off, std::min(chunk, to_a.size() - off)), t0());
+        }
+        CHECK(p.a.state() == TcpSession::State::Established);
+        CHECK(p.b.state() == TcpSession::State::Established);
+        CHECK(p.a.handshake_hash() == p.b.handshake_hash());
+    }
+}
+
+TEST(tcp_session_a_hello_for_another_attempt_is_not_our_peer) {
+    auto p = session_pair();
+    (void)p.a.take_output();
+    p.a.on_bytes(TcpSession::hello(nonce_of(8)), t0());  // we are attempt 9
+    CHECK(p.a.state() == TcpSession::State::Closed);
+}
+
+TEST(tcp_session_peek_hello_needs_all_of_it) {
+    auto h = TcpSession::hello(nonce_of(0x21));
+    CHECK(!TcpSession::peek_hello(std::span(h).first(TcpSession::kHelloLen - 1)).has_value());
+    auto n = TcpSession::peek_hello(h);
+    REQUIRE(n.has_value());
+    CHECK(*n == nonce_of(0x21));
+    CHECK(!TcpSession::peek_hello(std::vector<uint8_t>(TcpSession::kHelloLen, 0)).has_value());
+}
+
 TEST(tcp_session_peek_finds_the_attempt_in_the_first_frame) {
     auto p     = session_pair(nullptr, nullptr, nonce_of(0x44), nonce_of(0x44));
     auto first = p.a.take_output();

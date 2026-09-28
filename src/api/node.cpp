@@ -71,6 +71,8 @@ constexpr auto kRelayBackupDelay  = 2s;   // the non-designated side waits this 
 constexpr auto kRelayWindow       = 20s;  // after punching gives up, time allowed for a relay
 constexpr auto kInboundIdentify   = 10s;  // an unidentified connection must speak by then
 constexpr auto kLiveSession       = 30s;  // a session heard from this recently is never replaced
+constexpr auto kHandshakeRetry    = 1s;   // after a failed handshake, a fresh introduction
+constexpr int  kMaxHandshakeRetries = 2;
 constexpr auto kReconnectMin      = 500ms;
 constexpr auto kReconnectMax      = 30s;
 
@@ -89,11 +91,6 @@ constexpr auto kGatherWait    = 1500ms;  // wait this long for our UDP srflx bef
 constexpr auto kWhoAmIEvery   = 500ms;
 constexpr auto kUdpBindEvery  = 500ms;
 constexpr auto kUdpRelayWait  = 10s;     // to allocate and bind the UDP relay
-
-// The hello a dialing responder opens with.
-constexpr uint8_t kHello0   = 'U';
-constexpr uint8_t kHello1   = 'C';
-constexpr size_t  kHelloLen = 2 + session::kAttemptLen;
 
 namespace close_reason {
 constexpr uint16_t kGoingAway = 1;  // application closed this connection
@@ -163,11 +160,6 @@ bool decode_intro(std::span<const uint8_t> p, TopicId& topic, AttemptNonce& atte
     return r.ok();
 }
 
-std::vector<uint8_t> hello_for(const AttemptNonce& attempt) {
-    std::vector<uint8_t> h{kHello0, kHello1};
-    h.insert(h.end(), attempt.begin(), attempt.end());
-    return h;
-}
 
 std::vector<uint8_t> encode_dgram_offer(uint32_t epoch, const std::vector<Candidate>& cands) {
     std::vector<uint8_t> buf(512);
@@ -360,6 +352,11 @@ struct Peer {
     Instant                     relay_backup_at{};
     bool                        relay_asked = false;
     bool                        relay_joining = false;
+
+    // A handshake that failed is retried with a new introduction, not the old
+    // one: the peer may have completed its side and spent that nonce.
+    Instant retry_at{};
+    int     retries = 0;
 
     // The session, and the connection it runs on.
     std::optional<TcpSession> sess;
@@ -1193,14 +1190,8 @@ void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
 
     // Identify an inbound connection from what it says.
     if (!pc.known) {
-        std::optional<AttemptNonce> a;
-        if (pc.in.size() >= kHelloLen && pc.in[0] == kHello0 && pc.in[1] == kHello1) {
-            AttemptNonce n{};
-            std::memcpy(n.data(), pc.in.data() + 2, session::kAttemptLen);
-            a = n;
-        } else {
-            a = TcpSession::peek_attempt(pc.in);
-        }
+        auto a = TcpSession::peek_hello(pc.in);
+        if (!a) a = TcpSession::peek_attempt(pc.in);
         if (!a) {
             // A hello or first frame that does not parse will not start to.
             if (pc.in.size() >= 2 + session::kAttemptLen) pc.dead = true;
@@ -1236,11 +1227,8 @@ void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
 
     const bool initiator = smaller(*ti->self, peer.dev_id);
     if (initiator) {
-        // We speak first, on the first connection to come up. A hello the
-        // responder opened with is not part of the session's stream.
-        if (pc.in.size() >= kHelloLen && pc.in[0] == kHello0 && pc.in[1] == kHello1) {
-            pc.in.erase(pc.in.begin(), pc.in.begin() + static_cast<ptrdiff_t>(kHelloLen));
-        }
+        // We speak first, on the first connection to come up. The session
+        // itself skips the responder's hello, whenever that arrives.
         start_session(pc, now);
         return;
     }
@@ -1248,7 +1236,7 @@ void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
     // Responder: a connection we dialed opens with a hello, so an initiator
     // that accepted it knows who is calling; then wait for message 1.
     if (pc.kind == PendingConn::Kind::Dial && !pc.greeted) {
-        auto h = hello_for(pc.attempt);
+        auto h = TcpSession::hello(pc.attempt);
         pc.out.insert(pc.out.end(), h.begin(), h.end());
         pc.greeted = true;
         drive_pending(pc, now);  // flush it now
@@ -1296,6 +1284,13 @@ void Node::Impl::end_attempt(Peer& peer) {
 }
 
 void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Instant now) {
+    // A failed handshake's fresh introduction, once its delay is up.
+    if (!peer.sess && !peer.attempt && peer.retry_at != Instant{} && now >= peer.retry_at) {
+        peer.retry_at = Instant{};
+        begin_connect(ti, tid, peer.dev_id, now);
+        if (!peer.attempt) set_peer_state(ti, peer, PeerState::Failed);  // could not even ask
+    }
+
     // Dialing: keep punching until the deadline, then fall back to a relay.
     if (peer.attempt && !peer.sess) {
         const bool designated = ti.self && smaller(*ti.self, peer.dev_id);
@@ -1334,6 +1329,8 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
         switch (e->kind) {
             case session::TcpEvent::Kind::Established:
                 end_attempt(peer);
+                peer.retries  = 0;
+                peer.retry_at = Instant{};
                 if (cfg.verbose) {
                     std::fprintf(stderr, "[uconnect] connected %s (%s)\n",
                                  to_hex(peer.dev_id).substr(0, 8).c_str(),
@@ -1380,10 +1377,17 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                 }
                 // A handshake that failed while the attempt still has time left
                 // goes back to dialing; anything else is over.
-                if (!was_up && peer.attempt && now < peer.punch_deadline + kRelayWindow) {
+                // A handshake that failed goes round again with a NEW
+                // introduction. Redialing under the old nonce can never work
+                // if the peer completed its side and spent it -- which is how
+                // a handshake fails on one end only.
+                const bool retry = !was_up && peer.attempt && peer.retries < kMaxHandshakeRetries;
+                end_attempt(peer);
+                if (retry) {
+                    ++peer.retries;
+                    peer.retry_at = now + kHandshakeRetry;
                     set_peer_state(ti, peer, PeerState::Probing);
                 } else {
-                    end_attempt(peer);
                     set_peer_state(ti, peer, was_up ? PeerState::Closed : PeerState::Failed);
                 }
                 break;

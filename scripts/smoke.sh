@@ -16,9 +16,8 @@ trap cleanup EXIT
 rm -f /tmp/uc-*.log
 "$SERVER" --port "$UC_PORT" > /tmp/uc-server.log 2>&1 &
 SRV_PID=$!
-sleep 1
 
-if ! kill -0 "$SRV_PID" 2>/dev/null; then
+if ! wait_listening /tmp/uc-server.log "$SRV_PID"; then
     echo "FAIL: server did not start"; cat /tmp/uc-server.log; exit 1
 fi
 echo "server up on $UC_PORT (pid $SRV_PID)"

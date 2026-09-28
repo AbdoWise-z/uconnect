@@ -27,9 +27,8 @@ leg() {
 
     "$SERVER" --port "$port" --quiet > "/tmp/xs-$label-server.log" 2>&1 &
     local SRV=$!
-    sleep 1
-    if ! kill -0 "$SRV" 2>/dev/null; then
-        echo "FAIL [$label]: server did not start"; FAIL=1; return
+    if ! wait_listening "/tmp/xs-$label-server.log" "$SRV"; then
+        echo "FAIL [$label]: server did not start"; FAIL=1; kill "$SRV" 2>/dev/null; return
     fi
 
     # Build the topic locally so no helper process registers a ghost record.

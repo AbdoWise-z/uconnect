@@ -140,6 +140,12 @@ std::optional<size_t> SymmetricState::decrypt_and_hash(std::span<const uint8_t> 
     return n;
 }
 
+Hash SymmetricState::export_secret(std::string_view label) const {
+    Hash out{};
+    hkdf(ck_, {}, label, out);
+    return out;
+}
+
 void SymmetricState::split(CipherState& c1, CipherState& c2) {
     Hash t1{}, t2{};
     hkdf2(ck_, {}, t1, t2);
@@ -278,6 +284,7 @@ Split HandshakeState::split() {
         s.recv = c1;
     }
     s.handshake_hash = sym_.handshake_hash();
+    s.exported       = sym_.export_secret("uconnect:v2:export");
     secure_zero(psk_);
     return s;
 }

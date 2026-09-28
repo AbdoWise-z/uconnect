@@ -85,6 +85,10 @@ public:
 
     void split(CipherState& c1, CipherState& c2);
 
+    // Derive an extra secret from the chaining key under `label`. Call before
+    // the state is discarded; see Split::exported.
+    Hash export_secret(std::string_view label) const;
+
     const Hash& handshake_hash() const { return h_; }
 
 private:
@@ -105,6 +109,12 @@ struct Split {
     // an insider (anyone holding K) from relaying A's identity proof into a
     // second session and impersonating them to B.
     Hash handshake_hash{};
+
+    // A further secret from the same chaining key, independent of the two
+    // cipher keys: HKDF(ck, "uconnect:v2:export"). Identical on both ends and
+    // known to nobody else, it lets a second channel -- the optional UDP one
+    // -- be keyed by this handshake without sharing a key with the first.
+    Hash exported{};
 };
 
 class HandshakeState {

@@ -55,20 +55,25 @@ struct IpAddr {
         return bytes == kLoop6;
     }
 
+    // 169.254/16 and fe80::/10. Meaningful only on one link, and an IPv6 one
+    // cannot even be dialed without the interface's scope id.
+    bool is_link_local() const {
+        if (family == Family::V4) return bytes[0] == 169 && bytes[1] == 254;
+        return bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80;
+    }
+
     // RFC1918 / CGNAT / link-local. Used to rank candidates and to detect the
     // "both peers report the same srflx" same-NAT case.
     bool is_private() const {
+        if (is_link_local()) return true;
         if (family == Family::V4) {
             if (bytes[0] == 10) return true;
             if (bytes[0] == 192 && bytes[1] == 168) return true;
             if (bytes[0] == 172 && (bytes[1] & 0xF0) == 16) return true;
             if (bytes[0] == 100 && (bytes[1] & 0xC0) == 64) return true;  // CGNAT 100.64/10
-            if (bytes[0] == 169 && bytes[1] == 254) return true;          // link-local
             return false;
         }
-        if ((bytes[0] & 0xFE) == 0xFC) return true;                        // ULA fc00::/7
-        if (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80) return true;    // link-local fe80::/10
-        return false;
+        return (bytes[0] & 0xFE) == 0xFC;                                  // ULA fc00::/7
     }
 
     friend bool operator==(const IpAddr& a, const IpAddr& b) {

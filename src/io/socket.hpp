@@ -25,9 +25,17 @@ std::optional<Endpoint> resolve(const std::string& host_port);
 std::string to_string(const Endpoint&);
 std::string to_string(const IpAddr&);
 
-// Every usable local address, for host candidates. Loopback is excluded; link
-// local and ULA IPv6 are kept, because two devices on the same LAN frequently
-// have working IPv6 when IPv4 is double-NATed.
+// Every usable local address, for host candidates. ULA and global IPv6 are
+// kept, because two devices on the same LAN frequently have working IPv6 when
+// IPv4 is double-NATed.
+//
+// Loopback and link-local are excluded. A link-local IPv6 address cannot be
+// dialed without an interface scope id, which a candidate does not carry --
+// and would be the sender's interface, meaningless to the peer. Advertising
+// one also got every registration reset on at least one real network: a
+// middlebox there resets any TCP flow whose first segment carries an fe80::
+// address, so a node publishing before its control connection was up never
+// connected at all.
 std::vector<IpAddr> local_addresses();
 
 class UdpSocket {

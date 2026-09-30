@@ -210,6 +210,36 @@ TEST(tcp_two_sides_dialling_each_other_at_once_get_connected) {
     CHECK(linked);
 }
 
+TEST(link_local_addresses_are_recognised_in_both_families) {
+    IpAddr v6{};
+    v6.family = IpAddr::Family::V6;
+    v6.bytes  = {0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0xED, 0x6A, 0x74, 0xC7, 0x1D, 0xA3, 0x85, 0x1F};
+    CHECK(v6.is_link_local());
+    CHECK(v6.is_private());
+    v6.bytes[1] = 0xBF;  // still inside fe80::/10
+    CHECK(v6.is_link_local());
+    v6.bytes[1] = 0xC0;  // fec0:: is not
+    CHECK(!v6.is_link_local());
+    v6.bytes = {0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};  // ULA
+    CHECK(!v6.is_link_local());
+    CHECK(v6.is_private());
+
+    CHECK(IpAddr::v4(169, 254, 3, 4).is_link_local());
+    CHECK(!IpAddr::v4(10, 0, 12, 204).is_link_local());
+    CHECK(IpAddr::v4(169, 254, 3, 4).is_private());
+}
+
+TEST(host_candidates_never_include_loopback_or_link_local) {
+    // A link-local address cannot be dialed without a scope id a candidate
+    // does not carry. Advertising one also got every registration reset on a
+    // real network whose middlebox resets any flow whose first segment
+    // carries an fe80:: address.
+    for (const auto& ip : local_addresses()) {
+        CHECK(!ip.is_loopback());
+        CHECK(!ip.is_link_local());
+    }
+}
+
 TEST(poll_reports_readiness_for_many_sockets) {
     // More sockets than select() manages on Windows (64).
     //

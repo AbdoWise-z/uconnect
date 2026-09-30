@@ -197,7 +197,7 @@ std::vector<IpAddr> local_addresses() {
             std::memcpy(&ss, u->Address.lpSockaddr,
                         static_cast<size_t>(u->Address.iSockaddrLength));
             auto ep = from_sockaddr(ss);
-            if (!ep || ep->ip.is_loopback()) continue;
+            if (!ep || ep->ip.is_loopback() || ep->ip.is_link_local()) continue;
             out.push_back(ep->ip);
         }
     }
@@ -214,7 +214,7 @@ std::vector<IpAddr> local_addresses() {
                     p->ifa_addr->sa_family == AF_INET ? sizeof(sockaddr_in)
                                                       : sizeof(sockaddr_in6));
         auto ep = from_sockaddr(ss);
-        if (!ep || ep->ip.is_loopback()) continue;
+        if (!ep || ep->ip.is_loopback() || ep->ip.is_link_local()) continue;
         out.push_back(ep->ip);
     }
     freeifaddrs(ifa);
@@ -612,7 +612,9 @@ std::optional<size_t> TcpSocket::send(std::span<const uint8_t> data) {
     const auto n = ::send(raw(fd_), data.data(), data.size(), flags);
 #endif
     if (n >= 0) return static_cast<size_t>(n);
-    if (would_block(last_socket_error())) return 0;
+    const int e = last_socket_error();
+    if (would_block(e)) return 0;
+    err_ = "send() failed: " + std::to_string(e);
     return std::nullopt;
 }
 
@@ -626,8 +628,13 @@ std::optional<size_t> TcpSocket::recv(std::span<uint8_t> out) {
     const auto n = ::recv(raw(fd_), out.data(), out.size(), 0);
 #endif
     if (n > 0) return static_cast<size_t>(n);
-    if (n == 0) return std::nullopt;  // orderly close by the peer
-    if (would_block(last_socket_error())) return 0;
+    if (n == 0) {  // orderly close by the peer
+        err_ = "closed by the peer";
+        return std::nullopt;
+    }
+    const int e = last_socket_error();
+    if (would_block(e)) return 0;
+    err_ = "recv() failed: " + std::to_string(e);
     return std::nullopt;
 }
 

@@ -71,6 +71,7 @@ constexpr auto kRelayBackupDelay  = 2s;   // the non-designated side waits this 
 constexpr auto kRelayWindow       = 20s;  // after punching gives up, time allowed for a relay
 constexpr auto kInboundIdentify   = 10s;  // an unidentified connection must speak by then
 constexpr auto kLiveSession       = 30s;  // a session heard from this recently is never replaced
+constexpr auto kIntroWait         = 2s;   // an inbound connection may beat its introduction here
 constexpr auto kHandshakeRetry    = 1s;   // after a failed handshake, a fresh introduction
 constexpr int  kMaxHandshakeRetries = 2;
 constexpr auto kReconnectMin      = 500ms;
@@ -528,7 +529,7 @@ struct Node::Impl {
 
     // control
     void drive_control(Instant now);
-    void on_control_down(Instant now);
+    void on_control_down(Instant now, const char* why);
     void on_control_message(std::span<const uint8_t> msg, Instant now);
     void on_relayed(const wire::Relayed&, Instant now);
     void on_relay_offer(const ctl::RelayOffer&, Instant now);
@@ -755,7 +756,7 @@ void Node::Impl::drive_control(Instant now) {
     if (ctl_state == Ctl::Connecting) {
         auto st = control.state();
         if (st == io::TcpSocket::State::Failed) {
-            on_control_down(now);
+            on_control_down(now, "connect");
             return;
         }
         if (st != io::TcpSocket::State::Connected) return;
@@ -782,12 +783,12 @@ void Node::Impl::drive_control(Instant now) {
     for (int round = 0; round < 32; ++round) {
         auto got = control.recv(buf);
         if (!got) {
-            on_control_down(now);
+            on_control_down(now, "recv");
             return;
         }
         if (*got == 0) break;
         if (!ctl_reader.feed(std::span(buf).first(*got))) {
-            on_control_down(now);
+            on_control_down(now, "malformed frame");
             return;
         }
         while (auto msg = ctl_reader.next()) on_control_message(*msg, now);
@@ -795,7 +796,7 @@ void Node::Impl::drive_control(Instant now) {
     while (!ctl_out.empty()) {
         auto n = control.send(ctl_out);
         if (!n) {
-            on_control_down(now);
+            on_control_down(now, "send");
             return;
         }
         if (*n == 0) break;
@@ -803,8 +804,11 @@ void Node::Impl::drive_control(Instant now) {
     }
 }
 
-void Node::Impl::on_control_down(Instant now) {
-    if (cfg.verbose) std::fprintf(stderr, "[uconnect] control connection down\n");
+void Node::Impl::on_control_down(Instant now, const char* why) {
+    if (cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] control connection down (%s: %s)\n", why,
+                     control.last_error().c_str());
+    }
     control.close();
     ctl_state = Ctl::Down;
     ctl_out.clear();
@@ -873,7 +877,16 @@ void Node::Impl::on_control_message(std::span<const uint8_t> msg, Instant now) {
     }
 
     auto it = requests.find(h->txn_id);
-    if (it == requests.end()) return;
+    if (it == requests.end()) {
+        // An error for a message nobody waits on -- a CONNECT, say. Nothing to
+        // resolve, but worth seeing: otherwise a refused introduction is silent.
+        if (cfg.verbose && h->type == wire::MsgType::Error) {
+            auto e = wire::Error::decode(r);
+            std::fprintf(stderr, "[uconnect] server error txn=%u: %s\n", h->txn_id,
+                         to_string(e ? e->code : ErrorCode::BadRequest));
+        }
+        return;
+    }
     Request& req = it->second;
 
     if (h->type == wire::MsgType::Error) {
@@ -999,6 +1012,10 @@ void Node::Impl::on_relayed(const wire::Relayed& rel, Instant now) {
     if (!decode_intro(rel.payload, topic, attempt, cands)) return;
     auto* ti = topic_impl(topic);
     if (!ti || !ti->self) return;
+    if (cfg.verbose) {
+        std::fprintf(stderr, "[uconnect] introduced to %s (%zu candidates)\n",
+                     to_hex(rel.from_dev).substr(0, 8).c_str(), cands.size());
+    }
 
     auto& peer  = ti->peers[rel.from_dev];
     peer.dev_id = rel.from_dev;
@@ -1199,7 +1216,12 @@ void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
         }
         auto at = attempts.find(*a);
         if (at == attempts.end()) {
+            // The introduction may still be on its way: a peer close by can
+            // dial us faster than the server, further off, can tell us it
+            // will. Hold on briefly before deciding it names nothing of ours.
+            if (now - pc.started < kIntroWait) return;
             pc.dead = true;  // no introduction of ours names it
+            if (cfg.verbose) std::fprintf(stderr, "[uconnect] dropped a connection naming no attempt of ours\n");
             return;
         }
         pc.known   = true;
@@ -1377,10 +1399,19 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                 }
                 // A handshake that failed while the attempt still has time left
                 // goes back to dialing; anything else is over.
-                // A handshake that failed goes round again with a NEW
-                // introduction. Redialing under the old nonce can never work
-                // if the peer completed its side and spent it -- which is how
-                // a handshake fails on one end only.
+                // A connection that simply went away mid-handshake -- the
+                // peer dropped it, perhaps before its introduction arrived --
+                // is dialed again under the same attempt.
+                //
+                // A handshake that FAILED goes round again with a NEW
+                // introduction instead. Redialing under the old nonce can never
+                // work if the peer completed its side and spent it -- which is
+                // how a handshake fails on one end only.
+                const bool gone = e->cause == session::CloseCause::TimedOut;
+                if (!was_up && peer.attempt && gone && now < peer.punch_deadline + kRelayWindow) {
+                    set_peer_state(ti, peer, PeerState::Probing);
+                    break;
+                }
                 const bool retry = !was_up && peer.attempt && peer.retries < kMaxHandshakeRetries;
                 end_attempt(peer);
                 if (retry) {

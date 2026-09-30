@@ -20,6 +20,7 @@
 #include "control.hpp"
 #include "rendezvous.hpp"
 #include "socket.hpp"
+#include "tcp_session.hpp"
 #include "testing.hpp"
 #include "uconnect/uconnect.hpp"
 
@@ -147,6 +148,15 @@ public:
             if (!reader_.feed(std::span(buf).first(*got))) return std::nullopt;
         }
         return std::nullopt;
+    }
+
+    // Whatever has arrived (possibly nothing), or nullopt once it is closed.
+    std::optional<std::vector<uint8_t>> read_some() {
+        std::vector<uint8_t> buf(4096);
+        auto                 got = sock_.recv(buf);
+        if (!got) return std::nullopt;
+        buf.resize(*got);
+        return buf;
     }
 
     // True once the other end has closed the connection.
@@ -584,7 +594,62 @@ TEST(an_inbound_connection_naming_no_attempt_of_ours_is_dropped) {
     std::vector<uint8_t> hello{'U', 'C'};
     for (int i = 0; i < 16; ++i) hello.push_back(0xAB);
     attacker.send_raw(hello);
-    CHECK(attacker.closed_within(2s));
+    // Held for up to two seconds -- an introduction may be on its way -- and
+    // then dropped, since none names it.
+    CHECK(attacker.closed_within(4s));
+}
+
+TEST(a_connection_that_arrives_before_its_introduction_is_held_for_it) {
+    // A peer close by can dial faster than the server, further off, can
+    // introduce it. The node used to drop such a connection at once as naming
+    // no attempt of its own -- and on a LAN with a distant server that was
+    // most of them. Here peer A dials B, speaks, and only half a second later
+    // sends the CONNECT that introduces it; the held connection must carry
+    // the handshake.
+    LocalServer srv;
+    Node        nb{config_for(srv)};
+    nb.run_in_background();
+    const auto creds = TopicCreds::generate_open();
+    Topic&     b     = nb.join(creds);
+    REQUIRE(b.publish());
+    const DevId idb = *b.self();
+
+    RawConn ctrl{srv.endpoint()};  // A's control connection
+    auto    ida = ctrl.register_in(creds.id);
+    REQUIRE(ida.has_value());
+
+    session::AttemptNonce attempt{};
+    attempt.fill(0x5C);
+    const bool a_initiates = std::memcmp(ida->data(), idb.data(), kDevIdLen) < 0;
+    const auto t0          = std::chrono::steady_clock::now();
+    auto s = a_initiates ? session::TcpSession::initiate({}, creds.id, 0, nullptr, *ida, idb, attempt, t0)
+                         : session::TcpSession::respond({}, creds.id, 0, nullptr, *ida, idb, attempt, t0);
+
+    // A dials first: no introduction exists yet.
+    RawConn dial{Endpoint{IpAddr::v4(127, 0, 0, 1), nb.local_port()}};
+    REQUIRE(dial.connected());
+    if (a_initiates) dial.send_raw(s.take_output());
+    else dial.send_raw(session::TcpSession::hello(attempt));
+    std::this_thread::sleep_for(500ms);
+
+    // Then the introduction, naming that attempt.
+    std::vector<uint8_t> intro(creds.id.begin(), creds.id.end());
+    intro.insert(intro.end(), attempt.begin(), attempt.end());
+    intro.push_back(0);  // no candidates: the connection is already there
+    ctl::Connect c;
+    c.from_dev = *ida;
+    c.to_dev   = idb;
+    c.payload  = intro;
+    ctrl.send_raw(ctl::frame(ctl::message(wire::MsgType::Connect, 9, c)));
+
+    CHECK(wait_until([&] {
+        auto got = dial.read_some();
+        if (!got) return false;  // dropped
+        s.on_bytes(*got, std::chrono::steady_clock::now());
+        dial.send_raw(s.take_output());
+        return s.state() == session::TcpSession::State::Established;
+    }, 5s));
+    CHECK(wait_until([&] { return b.state(*ida) == PeerState::Connected; }, 3s));
 }
 
 TEST(a_silent_inbound_connection_does_not_linger_forever) {

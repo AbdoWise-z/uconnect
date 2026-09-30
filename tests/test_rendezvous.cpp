@@ -302,6 +302,66 @@ TEST(rendezvous_a_relay_join_with_the_wrong_token_is_refused) {
     CHECK(intruder.closed_within(2s));
 }
 
+TEST(rendezvous_waiting_relay_bounds_early_input) {
+    // #39: exercise both data coalesced with RelayJoin and later socket reads.
+    for (bool coalesced : {false, true}) {
+        RendezvousConfig cfg;
+        cfg.splice_buffer = 4096;
+        Server s{cfg};
+        Client a{s}, b{s};
+        auto ra = register_in(a, topic_of(1));
+        auto rb = register_in(b, topic_of(1));
+        a.send(ctl::message(MsgType::RelayAlloc, 4,
+                            ctl::RelayAlloc{ra.dev_id, rb.dev_id, ctl::RelayKind::Tcp}));
+        auto grant = decode<ctl::RelayAllocOk>(a.expect(MsgType::RelayAllocOk),
+            [](wire::Reader& r) { return ctl::RelayAllocOk::decode(r); });
+        REQUIRE(grant.has_value());
+        Client leg{s};
+        auto join = ctl::frame(ctl::message(MsgType::RelayJoin, 0,
+                                           ctl::RelayJoin{grant->relay_id, grant->token}));
+        std::vector<uint8_t> early(cfg.splice_buffer + 1, 0);
+        if (coalesced) {
+            join.insert(join.end(), early.begin(), early.end());
+            leg.send_raw(join);
+        } else {
+            leg.send_raw(join);
+            CHECK(!leg.closed_within(50ms));
+            leg.send_raw(early);
+        }
+        CHECK(leg.closed_within(500ms));
+        // Rejecting a relay leg must not destroy its owner's control record.
+        CHECK_EQ(lookup_count(a, topic_of(1)), 2u);
+    }
+}
+
+TEST(rendezvous_waiting_relay_preserves_bounded_raw_input) {
+    RendezvousConfig cfg;
+    cfg.splice_buffer = 4096;
+    Server s{cfg};
+    Client a{s}, b{s};
+    auto ra = register_in(a, topic_of(1));
+    auto rb = register_in(b, topic_of(1));
+    a.send(ctl::message(MsgType::RelayAlloc, 4,
+                        ctl::RelayAlloc{ra.dev_id, rb.dev_id, ctl::RelayKind::Tcp}));
+    auto grant = decode<ctl::RelayAllocOk>(a.expect(MsgType::RelayAllocOk),
+        [](wire::Reader& r) { return ctl::RelayAllocOk::decode(r); });
+    auto offer = decode<ctl::RelayOffer>(b.expect(MsgType::RelayOffer),
+        [](wire::Reader& r) { return ctl::RelayOffer::decode(r); });
+    REQUIRE(grant.has_value()); REQUIRE(offer.has_value());
+    Client la{s}, lb{s};
+    auto join = ctl::frame(ctl::message(MsgType::RelayJoin, 0,
+                                       ctl::RelayJoin{grant->relay_id, grant->token}));
+    // Raw relay data is not another control frame, even when it starts ff ff.
+    std::string early(cfg.splice_buffer, static_cast<char>(0xff));
+    join.insert(join.end(), early.begin(), early.end());
+    la.send_raw(join);
+    CHECK(!la.closed_within(50ms));
+    lb.send(ctl::message(MsgType::RelayJoin, 0, ctl::RelayJoin{offer->relay_id, offer->token}));
+    REQUIRE(la.expect(MsgType::RelayJoinOk).has_value());
+    REQUIRE(lb.expect(MsgType::RelayJoinOk).has_value());
+    CHECK(lb.read_raw(early.size()) == early);
+}
+
 TEST(rendezvous_a_tcp_relay_stops_when_its_budget_is_spent) {
     RendezvousConfig cfg;
     cfg.registry.relay_max_bytes = 4096;

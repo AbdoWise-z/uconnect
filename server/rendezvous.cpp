@@ -119,6 +119,20 @@ void Rendezvous::read_from(Conn& c, Instant now) {
         splice_read(c, now);
         return;
     }
+    if (c.mode == Mode::RelayWaiting) {
+        // Read one byte beyond the remaining allowance to detect overflow,
+        // without ever allocating or retaining an unbounded early stream.
+        const size_t room = cfg_.splice_buffer - c.relay_early.size();
+        std::vector<uint8_t> early(std::min(room, kReadChunk - 1) + 1);
+        auto got = c.sock.recv(early);
+        if (!got || *got > room) {
+            kill(c);
+            return;
+        }
+        c.relay_early.insert(c.relay_early.end(), early.begin(),
+                             early.begin() + static_cast<ptrdiff_t>(*got));
+        return;
+    }
     std::vector<uint8_t> buf(kReadChunk);
     for (int round = 0; round < 16 && !c.dead; ++round) {
         auto got = c.sock.recv(buf);
@@ -140,8 +154,8 @@ void Rendezvous::read_from(Conn& c, Instant now) {
             if (drop_filter && drop_filter(*msg)) continue;
             on_frame(c, *msg, now);
         }
-        if (c.reader.broken()) kill(c);
         if (c.mode == Mode::RelayWaiting || c.mode == Mode::Splice) return;
+        if (c.reader.broken()) kill(c);
     }
 }
 
@@ -168,6 +182,15 @@ void Rendezvous::on_relay_join(Conn& c, std::span<const uint8_t> msg, Instant no
     auto         side = j ? registry_.relay_side(j->relay_id, j->token) : std::nullopt;
     if (!side) {
         kill(c);  // wrong id or token: knowing the id alone admits nobody
+        return;
+    }
+
+    // RelayJoin is the final framed message. Coalesced bytes are raw relay
+    // input, and must obey the same cap as bytes received while waiting.
+    c.relay_early = c.reader.take_rest();
+    c.reader = ctl::FrameReader{};
+    if (c.relay_early.size() > cfg_.splice_buffer) {
+        kill(c);
         return;
     }
 
@@ -206,7 +229,7 @@ void Rendezvous::on_relay_join(Conn& c, std::span<const uint8_t> msg, Instant no
     }
     // Anything either leg sent early belongs to the other now.
     for (auto [from, to] : {std::pair{&c, &p}, std::pair{&p, &c}}) {
-        auto rest = from->reader.take_rest();
+        auto rest = std::move(from->relay_early);
         if (rest.empty()) continue;
         if (!registry_.relay_charge(c.relay_id, rest.size(), now)) {
             kill(c);

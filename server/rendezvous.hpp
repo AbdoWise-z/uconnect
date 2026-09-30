@@ -76,6 +76,7 @@ private:
         io::TcpSocket              sock;
         Endpoint                   peer{};
         wire::ctl::FrameReader     reader;
+        std::vector<uint8_t>       relay_early; // bounded raw input before pairing
         std::vector<uint8_t>       out;  // bytes waiting to be written
         Mode                       mode = Mode::New;
         wire::RelayId              relay_id = 0;

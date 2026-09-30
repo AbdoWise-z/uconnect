@@ -58,10 +58,11 @@ enum class MsgType : uint8_t {
 };
 
 std::vector<uint8_t> encode(MsgType t, std::string_view body) {
-    std::vector<uint8_t> out;
-    out.reserve(body.size() + 1);
-    out.push_back(static_cast<uint8_t>(t));
-    out.insert(out.end(), body.begin(), body.end());
+    // Sized up front: GCC 15 misreports reserve() + push_back() here as
+    // freeing a non-heap pointer (-Wfree-nonheap-object).
+    std::vector<uint8_t> out(body.size() + 1);
+    out[0] = static_cast<uint8_t>(t);
+    std::copy(body.begin(), body.end(), out.begin() + 1);
     return out;
 }
 

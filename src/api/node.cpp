@@ -473,6 +473,7 @@ struct Node::Impl {
 
     // --- helpers -----------------------------------------------------------
     Instant now() const { return std::chrono::steady_clock::now(); }
+    bool on_loop_thread() const { return loop_thread_id == std::this_thread::get_id(); }
     uint32_t alloc_txn() { return next_txn++; }
 
     session::TcpSessionConfig session_cfg() const { return {}; }
@@ -655,7 +656,8 @@ void Node::Impl::loop() {
             callbacks.swap(deferred);
         }
         // Invoked with the lock released, so a callback may call straight back
-        // into the library -- send a reply, look up peers, disconnect someone.
+        // into the library -- send a reply or disconnect someone. Synchronous
+        // queries reject loop-thread calls before queuing a request.
         for (auto& fn : callbacks) fn();
     }
     // Callbacks may request shutdown themselves. Finish their queued notices
@@ -1918,6 +1920,7 @@ bool           Topic::is_authenticated() const { return impl_->keyed; }
 bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
     auto&                        n = *impl_->node;
     std::unique_lock<std::mutex> lk(n.mu);
+    if (n.on_loop_thread()) return false;
     impl_->meta.assign(meta.begin(), meta.end());
     impl_->unlisted = unlisted;
 
@@ -1967,6 +1970,7 @@ std::optional<DevId> Topic::self() const {
 std::vector<PeerInfo> Topic::peers(uint8_t max, bool want_meta, std::chrono::milliseconds timeout) {
     auto&                        n = *impl_->node;
     std::unique_lock<std::mutex> lk(n.mu);
+    if (n.on_loop_thread()) return {};
     ctl::Lookup                  l;
     l.id        = impl_->creds.id;
     l.max       = max;
@@ -2000,6 +2004,7 @@ std::vector<PeerInfo> Topic::peers(uint8_t max, bool want_meta, std::chrono::mil
 std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::milliseconds timeout) {
     auto&                        n = *impl_->node;
     std::unique_lock<std::mutex> lk(n.mu);
+    if (n.on_loop_thread()) return std::nullopt;
     const uint32_t txn = n.request(wire::MsgType::Resolve, wire::MsgType::ResolveOk, ctl::Resolve{dev});
     n.wait_for(lk, txn, std::chrono::steady_clock::now() + timeout);
 
@@ -2321,6 +2326,7 @@ const TopicCreds* Node::creds(const TopicId& id) const {
 std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
                                         std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(impl_->mu);
+    if (impl_->on_loop_thread()) return {};
     const auto                   deadline = std::chrono::steady_clock::now() + timeout;
 
     // One TOPICS request carries at most 255. Follow next_cursor until `limit`
@@ -2355,6 +2361,7 @@ std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
 
 std::optional<ServerStats> Node::stats(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(impl_->mu);
+    if (impl_->on_loop_thread()) return std::nullopt;
     const uint32_t txn = impl_->request_empty(wire::MsgType::Stats, wire::MsgType::StatsOk);
     const bool     ok  = impl_->wait_for(lk, txn, std::chrono::steady_clock::now() + timeout);
 

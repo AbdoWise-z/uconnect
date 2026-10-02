@@ -216,7 +216,12 @@ A punch that comes through late is always taken, whatever the fallback was.
 All callbacks run on the node's loop thread. **Do not block in them** — no
 sleeping, no synchronous I/O, no waiting on a lock the loop might hold. Copy
 what you need and hand it to your own thread. Calling back into the library
-from a callback is fine.
+from a callback is fine for nonblocking operations such as `send`, `connect`,
+and `disconnect`. Synchronous `publish`, `peers`, `resolve`, `explore`, and
+`stats` return failure immediately on the loop thread, without sending a
+request; `connect_all` consequently does nothing there. Run these calls on
+an application thread. Their failure values are `false`, an empty vector,
+or `nullopt`, matching the method's return type.
 
 ```cpp
 topic.on_peer          ([](DevId, PeerState)                 { });
@@ -227,7 +232,10 @@ topic.on_datagram_path ([](DevId, DatagramPath)              { });
 ```
 
 Whatever a callback captures must outlive the node: the loop can call it right
-up until `shutdown()` returns.
+up until an external call to `shutdown()` returns. Calling `shutdown()` from
+a callback requests a stop; the loop finishes cleanup after callbacks return.
+Keep the node and callback captures alive until an external thread has waited
+for shutdown. Destroying the node inside a callback is not supported.
 
 `PeerGone` separates a peer that said goodbye from one that simply vanished:
 

@@ -1035,3 +1035,40 @@ TEST(tcp_fallback_datagrams_share_message_backpressure_and_resume_after_draining
     REQUIRE(p.a->send_datagram(p.idb(), datagram));
     CHECK(wait_until([&] { return datagrams == sent_datagrams + 1; }, 3s));
 }
+
+TEST(blocking_queries_from_callbacks_fail_promptly_without_requests_or_side_effects) {
+    LocalServer srv;
+    std::atomic<int> calls{0};
+    std::atomic<bool> rejected{false};
+    std::atomic<int64_t> elapsed_ms{-1};
+    Pair p{srv, true};
+    REQUIRE(p.publish());
+    REQUIRE(connect_pair(*p.a, *p.b));
+    auto before = p.na.stats();
+    REQUIRE(before.has_value());
+    const auto ida = p.ida(), idb = p.idb();
+    p.a->on_data([&](DevId, std::span<const uint8_t>) {
+        if (calls.load() == 0) {
+            const auto start = std::chrono::steady_clock::now();
+            bool failed = p.a->peers(10, false, 250ms).empty();
+            failed &= !p.a->resolve(idb, 250ms).has_value();
+            failed &= !p.na.stats(250ms).has_value();
+            failed &= p.na.explore(0, 10, 250ms).empty();
+            failed &= !p.a->publish();
+            rejected = failed;
+            elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+        ++calls;
+    });
+    REQUIRE(p.b->send(ida, bytes("queries")));
+    REQUIRE(wait_until([&] { return calls.load() == 1; }, 8s));
+    CHECK(rejected.load());
+    CHECK(elapsed_ms.load() < 200);
+    auto after = p.na.stats();
+    REQUIRE(after.has_value());
+    CHECK(after->registers == before->registers);
+    CHECK(after->lookups == before->lookups);
+    REQUIRE(p.b->send(ida, bytes("still live")));
+    CHECK(wait_until([&] { return calls.load() == 2; }, 2s));
+}

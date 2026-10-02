@@ -239,6 +239,10 @@ public:
     static constexpr size_t max_datagram() { return 1100; }
 
     // --- events (invoked on the node's loop thread; do not block) ----------
+    // Synchronous publish(), peers(), resolve(), Node::explore() and
+    // Node::stats() reject calls on this thread immediately (false, empty, or
+    // nullopt) without sending a request. connect_all() is consequently a
+    // no-op here. Run those calls on an application thread instead.
     void on_peer(std::function<void(DevId, PeerState)>);
     void on_data(std::function<void(DevId, std::span<const uint8_t>)>);
     void on_datagram(std::function<void(DevId, std::span<const uint8_t>)>);

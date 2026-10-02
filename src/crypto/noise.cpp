@@ -104,6 +104,7 @@ void SymmetricState::mix_key(std::span<const uint8_t> ikm) {
     Hash new_ck{}, temp_k{};
     hkdf2(ck_, ikm, new_ck, temp_k);
     ck_ = new_ck;
+    secure_zero(new_ck);
     SymKey k{};
     std::memcpy(k.data(), temp_k.data(), kKeyLen);
     cipher_ = CipherState{k};
@@ -115,6 +116,7 @@ void SymmetricState::mix_key_and_hash(std::span<const uint8_t> ikm) {
     Hash new_ck{}, temp_h{}, temp_k{};
     hkdf3(ck_, ikm, new_ck, temp_h, temp_k);
     ck_ = new_ck;
+    secure_zero(new_ck);
     mix_hash(temp_h);
     SymKey k{};
     std::memcpy(k.data(), temp_k.data(), kKeyLen);

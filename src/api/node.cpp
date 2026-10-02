@@ -317,7 +317,8 @@ struct Dgram {
     uint32_t                          epoch    = 0;
     DatagramFallback                  fallback = DatagramFallback::Tcp;
     DatagramPath                      path     = DatagramPath::Opening;
-    session::TcpSession::DatagramKeys keys;
+    crypto::SymKey                    probe_key{};
+    uint32_t                          conn_id = 0;
     Instant                           opened{};
 
     bool                                  offered = false;  // ours, sent
@@ -557,7 +558,7 @@ struct Node::Impl {
     void read_udp(Instant now);
     void on_udp(const Endpoint& from, std::span<const uint8_t> dgram, Instant now);
     void on_udp_from_server(std::span<const uint8_t> dgram, Instant now);
-    void dgram_open(Topic::Impl&, Peer&, uint32_t epoch, DatagramFallback, Instant now);
+    bool dgram_open(Topic::Impl&, Peer&, uint32_t epoch, DatagramFallback, Instant now);
     void dgram_on_offer(Topic::Impl&, Peer&, std::span<const uint8_t> body, Instant now);
     void dgram_drop(Topic::Impl&, Peer&);
     void dgram_fall_back(Topic::Impl&, Peer&, Instant now);
@@ -1551,7 +1552,7 @@ void Node::Impl::on_udp(const Endpoint& from, std::span<const uint8_t> dgram, In
             // Answered once, by the channel whose probe key made the tag:
             // nobody else can elicit a reply at all.
             each_channel([&](Topic::Impl&, Peer&, Dgram& d) {
-                auto reply = path::PunchSession::answer_probe(from, dgram, &d.keys.probe, 0);
+                auto reply = path::PunchSession::answer_probe(from, dgram, &d.probe_key, 0);
                 if (!reply) return false;
                 udp.send_to(reply->to, reply->data);
                 if (d.punch) d.punch->on_peer_probe(from, now);
@@ -1569,7 +1570,7 @@ void Node::Impl::on_udp(const Endpoint& from, std::span<const uint8_t> dgram, In
             if (dgram.size() < wire::Header::kSize + 4) return;
             const auto cid = *decode_u32(dgram.subspan(wire::Header::kSize, 4));
             each_channel([&](Topic::Impl&, Peer&, Dgram& d) {
-                if (!d.sess || d.keys.conn_id != cid) return false;
+                if (!d.sess || d.conn_id != cid) return false;
                 d.sess->on_datagram(from, dgram, now);
                 return true;
             });
@@ -1648,21 +1649,25 @@ void Node::Impl::dgram_set_path(Topic::Impl& ti, Peer& peer, DatagramPath p) {
     }
 }
 
-void Node::Impl::dgram_open(Topic::Impl& ti, Peer& peer, uint32_t epoch, DatagramFallback fb,
+bool Node::Impl::dgram_open(Topic::Impl& ti, Peer& peer, uint32_t epoch, DatagramFallback fb,
                             Instant now) {
+    auto keys = peer.sess->datagram_keys(epoch);
+    if (!keys) return false;
     Dgram d;
     d.epoch    = epoch;
     d.fallback = fb;
-    d.keys     = peer.sess->datagram_keys(epoch);
+    d.probe_key = keys->probe;
+    d.conn_id   = keys->conn_id;
     d.opened   = now;
     session::SessionConfig scfg;
     scfg.rekey_shift = cfg.rekey_shift;
-    d.sess.emplace(scfg, peer.dev_id, Endpoint{}, d.keys.send, d.keys.recv, d.keys.conn_id, now);
+    d.sess.emplace(scfg, peer.dev_id, Endpoint{}, keys->send, keys->recv, keys->conn_id, now);
     d.path           = DatagramPath::None;  // so the move to Opening is reported
     peer.dgram       = std::move(d);
     peer.dgram_epoch = std::max(peer.dgram_epoch, epoch);
     ensure_udp();
     dgram_set_path(ti, peer, DatagramPath::Opening);
+    return true;
 }
 
 void Node::Impl::dgram_on_offer(Topic::Impl& ti, Peer& peer, std::span<const uint8_t> body,
@@ -1677,7 +1682,7 @@ void Node::Impl::dgram_on_offer(Topic::Impl& ti, Peer& peer, std::span<const uin
         // already keyed, or our counter would start again under used keys.
         if (epoch <= peer.dgram_epoch) return;
         const auto fb = peer.dgram ? peer.dgram->fallback : cfg.datagram_fallback;
-        dgram_open(ti, peer, epoch, fb, now);
+        if (!dgram_open(ti, peer, epoch, fb, now)) return;
     }
     peer.dgram->remote = std::move(cands);
 }
@@ -1757,7 +1762,7 @@ void Node::Impl::drive_dgram(Topic::Impl& ti, const TopicId& tid, Peer& peer, In
         } else {
             path::PunchConfig pc;
             pc.total_timeout = cfg.punch_timeout;
-            d.punch.emplace(pc, peer.dev_id, *d.remote, path::LocalView{udp_srflx}, &d.keys.probe);
+            d.punch.emplace(pc, peer.dev_id, *d.remote, path::LocalView{udp_srflx}, &d.probe_key);
             d.punch->begin(now);
         }
     }
@@ -2080,8 +2085,8 @@ bool Topic::open_datagrams(const DevId& dev, DatagramFallback fb) {
         peer.dgram->fallback = fb;  // already open, or opening: just the policy
         return true;
     }
-    n.dgram_open(*impl_, peer, peer.dgram_epoch + 1, fb, n.now());
-    return true;
+    if (peer.dgram_epoch == UINT32_MAX) return false;
+    return n.dgram_open(*impl_, peer, peer.dgram_epoch + 1, fb, n.now());
 }
 
 void Topic::close_datagrams(const DevId& dev) {

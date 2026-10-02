@@ -320,8 +320,8 @@ public:
         DatagramFallback datagram_fallback = DatagramFallback::Tcp;
 
         // Ratchet the UDP datagram channel's keys every 2^rekey_shift packets,
-        // so traffic older than the current generation cannot be recovered from
-        // a later compromise. Driven by the packet counter, which travels in
+        // erasing retired keys (the receiver retains one previous generation
+        // for reordering). Driven by the packet counter, which travels in
         // every header, so both ends agree without negotiating anything.
         //
         // A generation must stay above 64 packets (the replay window width):

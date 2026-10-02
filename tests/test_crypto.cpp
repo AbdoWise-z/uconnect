@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <string>
 
 #include "kdf.hpp"
@@ -19,6 +20,23 @@
 
 using namespace uconnect;
 using namespace uconnect::crypto;
+
+TEST(crypto_discarded_cipher_and_handshake_states_erase_secrets) {
+    SymKey key{};
+    key.fill(0x9b);
+    alignas(CipherState) std::array<uint8_t, sizeof(CipherState)> cipher_storage{};
+    auto* cipher = std::construct_at(reinterpret_cast<CipherState*>(cipher_storage.data()), key);
+    REQUIRE(std::search(cipher_storage.begin(), cipher_storage.end(), key.begin(), key.end()) != cipher_storage.end());
+    std::destroy_at(cipher);
+    CHECK(std::search(cipher_storage.begin(), cipher_storage.end(), key.begin(), key.end()) == cipher_storage.end());
+
+    alignas(HandshakeState) std::array<uint8_t, sizeof(HandshakeState)> handshake_storage{};
+    auto* handshake = std::construct_at(reinterpret_cast<HandshakeState*>(handshake_storage.data()),
+        HandshakeState::initiator(Pattern::NNpsk0, {}, &key));
+    REQUIRE(std::search(handshake_storage.begin(), handshake_storage.end(), key.begin(), key.end()) != handshake_storage.end());
+    std::destroy_at(handshake);
+    CHECK(std::search(handshake_storage.begin(), handshake_storage.end(), key.begin(), key.end()) == handshake_storage.end());
+}
 
 namespace {
 

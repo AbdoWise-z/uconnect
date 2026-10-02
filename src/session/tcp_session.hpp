@@ -78,6 +78,11 @@ struct TcpEvent {
 
 class TcpSession {
 public:
+    ~TcpSession() { crypto::secure_zero(exported_); }
+    TcpSession(TcpSession&&) noexcept = default;
+    TcpSession& operator=(TcpSession&&) noexcept = default;
+    TcpSession(const TcpSession&) = delete;
+    TcpSession& operator=(const TcpSession&) = delete;
     enum class State : uint8_t { Handshaking, Established, Closed };
 
     // Record kinds below this are the session's own; the layer above uses
@@ -146,8 +151,16 @@ public:
         crypto::SymKey recv{};
         crypto::SymKey probe{};  // tags UDP probes: only the peer can elicit an answer
         uint32_t       conn_id = 0;
+        ~DatagramKeys() {
+            crypto::secure_zero(send);
+            crypto::secure_zero(recv);
+            crypto::secure_zero(probe);
+        }
     };
-    DatagramKeys datagram_keys(uint32_t epoch = 0) const;
+    // Consumes the epoch's derivation secret. Old epochs cannot be derived
+    // again; jumps are bounded to prevent a peer forcing unbounded KDF work.
+    std::optional<DatagramKeys> datagram_keys(uint32_t epoch = 0);
+    static constexpr uint64_t max_datagram_epoch_skip = 64;
 
 private:
     TcpSession(TcpSessionConfig, bool initiator, const DevId& self, const DevId& peer,
@@ -173,6 +186,7 @@ private:
     uint64_t                              recv_records_ = 0;
     crypto::Hash                          handshake_hash_{};
     crypto::Hash                          exported_{};
+    uint64_t                              next_datagram_epoch_ = 0;
 
     std::vector<uint8_t> in_;
     std::vector<uint8_t> out_;

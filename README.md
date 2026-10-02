@@ -509,13 +509,22 @@ Opened on demand, over the TCP session:
    own labels:
 
 ```
-send, recv, probe, conn_id = HKDF(exported, salt = epoch, "uconnect:v2:udp:...")
+root(0) = exported
+root(n+1) = HKDF(root(n), "uconnect:v3:udp:next")
+send, recv, probe, conn_id = HKDF(root(epoch), salt = epoch, "uconnect:v2:udp:...")
 ```
 
 The **epoch** matters more than it looks. The UDP channel numbers its packets
 from zero, and the packet number is the nonce; a channel reopened under the
 previous one's keys would reuse every nonce. Every channel on a session gets a
 new epoch, so every channel gets new keys.
+
+Deriving a channel consumes its epoch root: only the next root remains, and
+initial traffic-key copies are erased after constructing the channel. Retired
+epochs cannot be derived again. Epoch skips are limited to 64 to bound work.
+The TCP handshake prologue is now `uconnect:v3:tcp`; upgrade both peers together.
+Older peer libraries fail the handshake rather than silently disagreeing about
+UDP keys. The rendezvous control protocol remains version 2.
 
 If punching fails, the fallback applies. For `Relay`, a UDP relay binding is
 allocated like the TCP one, each side binds its UDP address to it with its
@@ -529,8 +538,9 @@ high-water mark plus a bitmap of the counters below it. UDP reorders, so a
 strictly-increasing check would drop legitimate packets and accepting anything
 would permit replay.
 
-Keys ratchet every 2¹⁶ packets, so traffic older than the current generation
-cannot be recovered from a later compromise:
+Keys ratchet every 2¹⁶ packets. Retired generation keys are erased; the receiver
+retains one previous generation for reordering. Compromise of the remaining
+key state cannot reconstruct generations older than those retained:
 
 ```
 gen  = counter >> rekey_shift

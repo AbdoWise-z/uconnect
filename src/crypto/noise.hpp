@@ -38,6 +38,7 @@ class CipherState {
 public:
     CipherState() = default;
     explicit CipherState(const SymKey& k) : key_(k), has_key_(true) {}
+    ~CipherState() { clear(); }
 
     bool     has_key() const { return has_key_; }
     uint64_t nonce() const { return nonce_; }
@@ -75,6 +76,7 @@ private:
 class SymmetricState {
 public:
     explicit SymmetricState(std::string_view protocol_name);
+    ~SymmetricState() { secure_zero(ck_); }
 
     void mix_hash(std::span<const uint8_t> data);
     void mix_key(std::span<const uint8_t> ikm);
@@ -115,14 +117,16 @@ struct Split {
     // known to nobody else, it lets a second channel -- the optional UDP one
     // -- be keyed by this handshake without sharing a key with the first.
     Hash exported{};
+    ~Split() { secure_zero(exported); }
 };
 
 class HandshakeState {
 public:
+    ~HandshakeState() { secure_zero(psk_); secure_zero(e_.secret); }
     // prologue is mixed in before anything else, so both sides must agree on it
     // or the handshake fails cryptographically rather than via a check someone
     // might forget to write. TcpSession sets it to
-    //   "uconnect:v2:tcp" || topic_id || key_epoch || attempt nonce
+    //   "uconnect:v3:tcp" || topic_id || key_epoch || attempt nonce
     // which binds the session to the topic, the key epoch, and the one
     // introduction it answers.
     static HandshakeState initiator(Pattern, std::span<const uint8_t> prologue,

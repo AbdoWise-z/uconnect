@@ -284,17 +284,18 @@ TEST(tcp_session_datagram_keys_pair_up_and_share_nothing_with_each_other) {
     auto p   = session_pair(&psk, &psk);
     pump(p);
     auto ka = p.a.datagram_keys(), kb = p.b.datagram_keys();
-    CHECK(ka.send == kb.recv);
-    CHECK(ka.recv == kb.send);
-    CHECK(!(ka.send == ka.recv));
-    CHECK(ka.probe == kb.probe);
-    CHECK(!(ka.probe == ka.send));
-    CHECK_EQ(ka.conn_id, kb.conn_id);
+    REQUIRE(ka && kb);
+    CHECK(ka->send == kb->recv);
+    CHECK(ka->recv == kb->send);
+    CHECK(!(ka->send == ka->recv));
+    CHECK(ka->probe == kb->probe);
+    CHECK(!(ka->probe == ka->send));
+    CHECK_EQ(ka->conn_id, kb->conn_id);
 
     // And another session's keys are different.
     auto q = session_pair(&psk, &psk);
     pump(q);
-    CHECK(!(q.a.datagram_keys().send == ka.send));
+    CHECK(!(q.a.datagram_keys()->send == ka->send));
 }
 
 TEST(tcp_session_each_datagram_epoch_has_keys_of_its_own) {
@@ -304,9 +305,59 @@ TEST(tcp_session_each_datagram_epoch_has_keys_of_its_own) {
     pump(p);
     auto a1 = p.a.datagram_keys(1), a2 = p.a.datagram_keys(2);
     auto b2 = p.b.datagram_keys(2);
-    CHECK(!(a1.send == a2.send));
-    CHECK(!(a1.probe == a2.probe));
-    CHECK(a1.conn_id != a2.conn_id);
-    CHECK(a2.send == b2.recv);
-    CHECK(a2.conn_id == b2.conn_id);
+    REQUIRE(a1 && a2 && b2);
+    CHECK(!(a1->send == a2->send));
+    CHECK(!(a1->probe == a2->probe));
+    CHECK(a1->conn_id != a2->conn_id);
+    CHECK(a2->send == b2->recv);
+    CHECK(a2->conn_id == b2->conn_id);
+}
+
+TEST(tcp_session_retired_datagram_traffic_cannot_be_recovered_from_exporter) {
+    auto p = session_pair();
+    pump(p);
+    auto initial = p.a.datagram_keys(1);
+    REQUIRE(initial.has_value());
+    SessionConfig cfg;
+    cfg.rekey_shift = 7;
+    Session udp{cfg, dev_of(2), {}, initial->send, initial->recv, initial->conn_id, t0()};
+    crypto::secure_zero(initial->send);
+    crypto::secure_zero(initial->recv);
+    REQUIRE(udp.send(bytes("retired traffic"), t0()).has_value());
+    auto old = udp.poll_transmit();
+    REQUIRE(old.has_value());
+    for (int i = 0; i < 256; ++i) {
+        udp.send(bytes("new traffic"), t0());
+        udp.poll_transmit();
+    }
+    auto regenerated = p.a.datagram_keys(1);
+    wire::Reader r{old->data};
+    REQUIRE(wire::Header::decode(r).has_value());
+    auto packet = wire::Transport::decode(r);
+    REQUIRE(packet.has_value());
+    std::vector<uint8_t> plaintext(packet->ciphertext.size());
+    CHECK(!regenerated.has_value());
+    if (regenerated) {
+        CHECK(!crypto::aead_decrypt(regenerated->send, packet->counter, {}, packet->ciphertext, plaintext));
+    }
+}
+
+TEST(tcp_session_datagram_epoch_rejection_does_not_advance_keys) {
+    auto p = session_pair();
+    CHECK(!p.a.datagram_keys(0)); // not established
+    pump(p);
+    CHECK(!p.a.datagram_keys(UINT32_MAX)); // bound derivation work
+    auto a = p.a.datagram_keys(1);
+    auto b = p.b.datagram_keys(1);
+    REQUIRE(a && b);
+    CHECK(a->send == b->recv);
+    CHECK(!p.a.datagram_keys(0));
+    CHECK(!p.a.datagram_keys(1));
+    CHECK(!p.a.datagram_keys(1000));
+    auto next = p.a.datagram_keys(2);
+    auto other = p.b.datagram_keys(2);
+    REQUIRE(next && other);
+    CHECK(next->send == other->recv);
+    p.a.close(0, t0());
+    CHECK(!p.a.datagram_keys(3));
 }

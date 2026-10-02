@@ -104,6 +104,7 @@ Hash hmac_blake2s(std::span<const uint8_t> key, std::span<const uint8_t> msg) {
     if (key.size() > kBlockLen) {
         Hash kh = Blake2s::hash(key);
         std::memcpy(k_block.data(), kh.data(), kh.size());
+        secure_zero(kh);
     } else if (!key.empty()) {
         std::memcpy(k_block.data(), key.data(), key.size());
     }
@@ -127,6 +128,7 @@ Hash hmac_blake2s(std::span<const uint8_t> key, std::span<const uint8_t> msg) {
     secure_zero(k_block);
     secure_zero(ipad);
     secure_zero(opad);
+    secure_zero(inner_hash);
     return out;
 }
 
@@ -187,6 +189,8 @@ void hkdf(std::span<const uint8_t> ikm, std::span<const uint8_t> salt,
         off += n;
 
         t.assign(block.begin(), block.end());
+        secure_zero(block);
+        secure_zero(input);
         ++counter;
     }
 

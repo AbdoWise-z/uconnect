@@ -7,7 +7,8 @@
 namespace uconnect::session {
 namespace {
 
-constexpr std::string_view kPrologueTag = "uconnect:v2:tcp";
+// v3 binds peers to the one-way UDP epoch derivation introduced in #40.
+constexpr std::string_view kPrologueTag = "uconnect:v3:tcp";
 
 // The session's own record kinds; everything from kFirstUserKind up belongs
 // to the layer above.
@@ -230,6 +231,7 @@ void TcpSession::handle_record(std::span<const uint8_t> plain, Instant now) {
         const uint16_t reason =
             body.size() >= 2 ? static_cast<uint16_t>(body[0] << 8 | body[1]) : 0;
         state_ = State::Closed;
+        crypto::secure_zero(exported_);
         send_cs_.clear();
         recv_cs_.clear();
         TcpEvent e;
@@ -296,6 +298,8 @@ void TcpSession::close(uint16_t reason, Instant now) {
         seal(kClose, r);
     }
     state_ = State::Closed;
+    hs_.reset();
+    crypto::secure_zero(exported_);
     send_cs_.clear();
     recv_cs_.clear();
     TcpEvent e;
@@ -308,6 +312,7 @@ void TcpSession::fail(CloseCause cause, Instant now) {
     (void)now;
     if (state_ == State::Closed) return;
     state_ = State::Closed;
+    crypto::secure_zero(exported_);
     hs_.reset();
     send_cs_.clear();
     recv_cs_.clear();
@@ -365,7 +370,20 @@ std::optional<TcpEvent> TcpSession::poll_event() {
     return e;
 }
 
-TcpSession::DatagramKeys TcpSession::datagram_keys(uint32_t epoch) const {
+std::optional<TcpSession::DatagramKeys> TcpSession::datagram_keys(uint32_t epoch) {
+    if (state_ != State::Established || epoch < next_datagram_epoch_ ||
+        static_cast<uint64_t>(epoch) - next_datagram_epoch_ > max_datagram_epoch_skip) {
+        return std::nullopt;
+    }
+    auto advance = [&] {
+        crypto::Hash next{};
+        crypto::hkdf(exported_, {}, "uconnect:v3:udp:next", next);
+        crypto::secure_zero(exported_);
+        exported_ = next;
+        crypto::secure_zero(next);
+        ++next_datagram_epoch_;
+    };
+    while (next_datagram_epoch_ < epoch) advance();
     // Each from the exported secret under its own label: the UDP channel
     // shares no key with this one, and its two directions share none either.
     // The epoch is the salt, so every channel opened on this session gets
@@ -387,6 +405,7 @@ TcpSession::DatagramKeys TcpSession::datagram_keys(uint32_t epoch) const {
     k.recv = initiator_ ? r2i : i2r;
     crypto::secure_zero(i2r);
     crypto::secure_zero(r2i);
+    advance(); // erase the root that could reconstruct this channel's keys
     return k;
 }
 

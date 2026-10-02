@@ -61,6 +61,10 @@ class Blake2s {
 public:
     // key may be empty (plain hash) or up to 32 bytes (keyed hash = MAC).
     explicit Blake2s(std::span<const uint8_t> key = {}, size_t out_len = kHashLen);
+    ~Blake2s() {
+        secure_zero(std::span<uint8_t>(reinterpret_cast<uint8_t*>(h_.data()), sizeof(h_)));
+        secure_zero(buf_);
+    }
 
     void update(std::span<const uint8_t> in);
     void update(std::string_view s);
@@ -104,6 +108,7 @@ void hkdf(std::span<const uint8_t> ikm, std::span<const uint8_t> salt,
 struct KeyPair {
     SecretKey secret{};
     PublicKey pub{};
+    ~KeyPair() { secure_zero(secret); }
 
     static KeyPair generate();
     static KeyPair from_secret(const SecretKey&);

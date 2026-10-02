@@ -996,3 +996,42 @@ TEST(shutdown_from_a_callback_stops_both_loop_modes_without_throwing) {
         CHECK(wait_until([&] { return notified.load(); }, 3s));
     }
 }
+
+TEST(tcp_fallback_datagrams_share_message_backpressure_and_resume_after_draining) {
+    LocalServer srv;
+    std::atomic<bool> blocked{false}, release{false};
+    std::atomic<size_t> messages{0}, datagrams{0};
+    DgramPair p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                    dgram_config(srv, true, DatagramFallback::Tcp)};
+    // Unblock before the nodes are destroyed even when a REQUIRE fails.
+    struct Release { std::atomic<bool>& flag; ~Release() { flag = true; } } guard{release};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
+    REQUIRE(p.settled(DatagramPath::Tcp));
+    p.b->on_data([&](DevId, std::span<const uint8_t> data) {
+        if (data.size() == 1) {
+            blocked = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        } else { ++messages; }
+    });
+    p.b->on_datagram([&](DevId, std::span<const uint8_t>) { ++datagrams; });
+    REQUIRE(p.a->send(p.idb(), bytes("x")));
+    REQUIRE(wait_until([&] { return blocked.load(); }, 3s));
+
+    std::vector<uint8_t> message(Topic::max_message(), 0x42);
+    size_t sent_messages = 0;
+    while (sent_messages < 128 && p.a->send(p.idb(), message)) ++sent_messages;
+    REQUIRE(sent_messages > 0 && sent_messages < 128);
+    // A last rejected large message can leave at most one message's space.
+    // Four MiB of small datagrams must hit that same queue limit.
+    std::vector<uint8_t> datagram(Topic::max_datagram(), 0x17);
+    size_t sent_datagrams = 0;
+    while (sent_datagrams < 4096 && p.a->send_datagram(p.idb(), datagram)) ++sent_datagrams;
+    CHECK(sent_datagrams < 4096);
+    REQUIRE(p.a->state(p.idb()) == PeerState::Connected);
+    CHECK(p.a->link(p.idb())->datagrams_sent == sent_datagrams);
+    release = true;
+    REQUIRE(wait_until([&] { return messages == sent_messages && datagrams == sent_datagrams; }, 15s));
+    REQUIRE(p.a->send_datagram(p.idb(), datagram));
+    CHECK(wait_until([&] { return datagrams == sent_datagrams + 1; }, 3s));
+}

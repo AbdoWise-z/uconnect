@@ -232,7 +232,8 @@ public:
     // Unreliable and unordered, up to max_datagram() bytes -- small enough to
     // cross any path, relay included, without IP fragmentation. False if there
     // is no usable path (still Opening, Failed, or no channel) or the datagram
-    // is too large; true means sent, not delivered.
+    // is too large, or the shared TCP output queue is full when using the TCP
+    // fallback (retry after it drains); true means sent, not delivered.
     bool send_datagram(const DevId&, std::span<const uint8_t>);
 
     static constexpr size_t max_datagram() { return 1100; }

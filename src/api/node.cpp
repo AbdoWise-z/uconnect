@@ -1526,6 +1526,14 @@ bool Node::Impl::can_admit(const Topic::Impl& ti, const Peer* peer) const {
 }
 
 bool Node::Impl::send_record(Peer& peer, uint8_t kind, std::span<const uint8_t> body) {
+    if (kind == kMessageRecord || kind == kDgramOverTcp) {
+        // Both application APIs consume the same queue, including the length,
+        // kind and AEAD tag. Check before sealing so rejection spends no nonce.
+        // Small protocol notices (offers and close) can still be sent at capacity.
+        constexpr size_t overhead = 4 + 1 + crypto::kTagLen;
+        if (body.size() > kMaxQueued - overhead ||
+            peer.out.size() > kMaxQueued - overhead - body.size()) return false;
+    }
     if (!peer.sess || !peer.sess->send(kind, body, now())) return false;
     auto bytes = peer.sess->take_output();
     peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
@@ -2095,13 +2103,9 @@ bool Topic::send(const DevId& dev, std::span<const uint8_t> payload) {
     if (it == impl_->peers.end() || !it->second.sess) return false;
     if (payload.size() > max_message()) return false;
     Peer& peer = it->second;
-    if (peer.out.size() + payload.size() > kMaxQueued) return false;
-    if (!peer.sess->send(kMessageRecord, payload, n.now())) return false;
+    if (!n.send_record(peer, kMessageRecord, payload)) return false;
     ++peer.link.messages_sent;
     peer.link.bytes_sent += payload.size();
-    auto bytes = peer.sess->take_output();
-    peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
-    n.flush_peer(peer);  // straight out, not on the next loop tick
     return true;
 }
 

@@ -257,6 +257,9 @@ void PunchSession::on_datagram(const Endpoint& from, std::span<const uint8_t> dg
         if (!crypto::ct_equal(p.txn, ok->txn)) continue;
         if (p.validated) return;  // duplicate ProbeOk, ignore
 
+        // The authenticated response validates its source, which may differ
+        // from the advertised candidate after NAT remapping.
+        p.remote.ep = from;
         p.validated = true;
         p.rtt       = std::chrono::duration_cast<Duration>(now - p.first_sent);
         events_.push_back({PunchEvent::Kind::PathValidated, p.remote.ep, p.txn, p.rtt});

@@ -631,3 +631,34 @@ TEST(an_incoming_probe_accelerates_our_next_probe_to_that_address) {
     s.on_timeout(t0() + 61ms);
     CHECK(s.poll_transmit().has_value());
 }
+
+TEST(authenticated_probe_replies_nominate_the_actual_source_endpoint) {
+    const auto original = ep4(198, 51, 100, 9, 40000);
+    for (const auto& changed : {ep4(198, 51, 100, 9, 40001), ep4(198, 51, 100, 10, 41000)}) {
+        auto key = a_key();
+        PunchSession s{PunchConfig{}, dev_of(2), {srflx(original)}, LocalView{}, &key, 1234};
+        s.begin(t0());
+        auto probe = s.poll_transmit();
+        REQUIRE(probe.has_value());
+        auto reply = PunchSession::answer_probe(ep4(203, 0, 113, 1, 50000), probe->data, &key, 1);
+        REQUIRE(reply.has_value());
+        auto forged = reply->data;
+        forged.back() ^= 1;
+        s.on_datagram(changed, forged, t0() + 1ms);
+        CHECK(!s.nominated_path().has_value());
+        CHECK(!s.poll_event().has_value());
+
+        s.on_datagram(changed, reply->data, t0() + 2ms);
+        CHECK(s.nominated_path() == changed);
+        unsigned validated = 0, nominated = 0;
+        while (auto event = s.poll_event()) {
+            if (event->kind == PunchEvent::Kind::PathValidated) { ++validated; CHECK(event->path == changed); }
+            if (event->kind == PunchEvent::Kind::Nominated) { ++nominated; CHECK(event->path == changed); }
+        }
+        CHECK(validated == 1 && nominated == 1);
+        // A duplicate from the old candidate cannot undo an established choice.
+        s.on_datagram(original, reply->data, t0() + 3ms);
+        CHECK(s.nominated_path() == changed);
+        CHECK(!s.poll_event().has_value());
+    }
+}

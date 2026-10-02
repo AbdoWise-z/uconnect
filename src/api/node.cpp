@@ -569,6 +569,7 @@ struct Node::Impl {
     Topic::Impl* topic_impl(const TopicId&);
     size_t       live_peer_count(const Topic::Impl&) const;
     size_t       total_peer_count() const;
+    bool         can_admit(const Topic::Impl&, const Peer*) const;
 };
 
 // ---------------------------------------------------------------------------
@@ -1018,6 +1019,8 @@ void Node::Impl::on_relayed(const wire::Relayed& rel, Instant now) {
                      to_hex(rel.from_dev).substr(0, 8).c_str(), cands.size());
     }
 
+    auto existing = ti->peers.find(rel.from_dev);
+    if (!can_admit(*ti, existing == ti->peers.end() ? nullptr : &existing->second)) return;
     auto& peer  = ti->peers[rel.from_dev];
     peer.dev_id = rel.from_dev;
     peer.cands  = cands;
@@ -1058,9 +1061,7 @@ void Node::Impl::begin_connect(Topic::Impl& ti, const TopicId& tid, const DevId&
     if (it == ti.peers.end() || it->second.cands.empty()) return;
     Peer& peer = it->second;
     if (peer.sess || peer.attempt) return;
-    // Caps are enforced here, so auto-connect and connect() obey the same limits.
-    if (live_peer_count(ti) >= ti.max_peers) return;
-    if (total_peer_count() >= cfg.max_total_peers) return;
+    if (!can_admit(ti, &peer)) return;
 
     AttemptNonce attempt{};
     crypto::random_bytes(attempt);
@@ -1478,6 +1479,14 @@ size_t Node::Impl::total_peer_count() const {
         n += live_peer_count(*t->impl_);
     }
     return n;
+}
+
+bool Node::Impl::can_admit(const Topic::Impl& ti, const Peer* peer) const {
+    // Glare resolution and replacing an existing attempt use its occupied
+    // slot. New introductions must pass the same caps as outgoing connects,
+    // before allocating peer state, sockets, or handshake work.
+    if (peer && (peer->sess || peer->attempt)) return true;
+    return live_peer_count(ti) < ti.max_peers && total_peer_count() < cfg.max_total_peers;
 }
 
 bool Node::Impl::send_record(Peer& peer, uint8_t kind, std::span<const uint8_t> body) {

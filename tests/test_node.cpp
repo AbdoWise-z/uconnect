@@ -365,6 +365,8 @@ TEST(both_sides_connecting_at_once_end_on_one_session) {
     LocalServer      srv;
     std::atomic<int> at_a{0}, at_b{0};
     Pair             p{srv, /*force_relay=*/false};
+    p.a->set_max_peers(1);
+    p.b->set_max_peers(1);
     REQUIRE(p.publish());
 
     p.a->on_data([&](DevId, std::span<const uint8_t>) { ++at_a; });
@@ -895,4 +897,65 @@ TEST(an_introduction_from_a_stranger_does_not_disturb_a_live_session) {
 
     CHECK(p.a->state(p.idb()) == PeerState::Connected);
     CHECK(p.a->channel_binding(p.idb()) == binding);
+}
+
+TEST(incoming_introductions_obey_zero_peer_limits) {
+    for (bool node_limit : {false, true}) {
+        LocalServer srv;
+        auto cfg = config_for(srv, true);
+        if (node_limit) cfg.max_total_peers = 0;
+        Node victim{cfg}, caller{config_for(srv, true)};
+        victim.run_in_background();
+        caller.run_in_background();
+        auto creds = TopicCreds::generate_keyed();
+        auto& v = victim.join(creds);
+        auto& c = caller.join(creds);
+        if (!node_limit) v.set_max_peers(0);
+        REQUIRE(v.publish());
+        REQUIRE(c.publish());
+        c.peers();
+        c.connect(*v.self());
+        CHECK(!wait_until([&] { return v.state(*c.self()) != PeerState::Unknown; }, 1500ms));
+        CHECK(v.connected().empty());
+    }
+}
+
+TEST(incoming_introductions_obey_full_limits_and_reuse_freed_capacity) {
+    for (bool node_limit : {false, true}) {
+        LocalServer srv;
+        auto cfg = config_for(srv, true);
+        if (node_limit) cfg.max_total_peers = 1;
+        Node victim{cfg}, first{config_for(srv, true)};
+        victim.run_in_background();
+        first.run_in_background();
+        auto creds = TopicCreds::generate_open();
+        auto& v = victim.join(creds);
+        auto& f = first.join(creds);
+        if (!node_limit) v.set_max_peers(1);
+        REQUIRE(v.publish());
+        REQUIRE(f.publish());
+        REQUIRE(connect_pair(v, f));
+        // A global limit must also prevent admission through another topic.
+        auto& target = node_limit ? victim.join(TopicCreds::generate_open()) : v;
+        REQUIRE(target.publish());
+        RawConn caller{srv.endpoint()};
+        auto caller_id = caller.register_in(target.id());
+        REQUIRE(caller_id.has_value());
+        auto introduce = [&](uint8_t nonce) {
+            std::vector<uint8_t> intro(target.id().begin(), target.id().end());
+            intro.insert(intro.end(), 16, nonce);
+            intro.push_back(0);
+            ctl::Connect c;
+            c.from_dev = *caller_id;
+            c.to_dev = *target.self();
+            c.payload = std::move(intro);
+            caller.send_raw(ctl::frame(ctl::message(wire::MsgType::Connect, nonce, c)));
+        };
+        introduce(1);
+        CHECK(!wait_until([&] { return target.state(*caller_id) != PeerState::Unknown; }, 1500ms));
+        CHECK(v.state(*f.self()) == PeerState::Connected);
+        v.disconnect(*f.self());
+        introduce(2);
+        CHECK(wait_until([&] { return target.state(*caller_id) == PeerState::Probing; }, 2s));
+    }
 }

@@ -959,3 +959,40 @@ TEST(incoming_introductions_obey_full_limits_and_reuse_freed_capacity) {
         CHECK(wait_until([&] { return target.state(*caller_id) == PeerState::Probing; }, 2s));
     }
 }
+
+TEST(shutdown_from_a_callback_stops_both_loop_modes_without_throwing) {
+    for (bool background : {true, false}) {
+        LocalServer srv;
+        std::atomic<bool> returned{false}, threw{false}, notified{false};
+        Node na{config_for(srv, true)}, nb{config_for(srv, true)};
+        struct Runner {
+            Node& node;
+            std::thread thread;
+            ~Runner() { node.shutdown(); if (thread.joinable()) thread.join(); }
+        } runner{na, {}};
+        if (background) na.run_in_background();
+        else runner.thread = std::thread([&] { na.run(); });
+        nb.run_in_background();
+        auto creds = TopicCreds::generate_keyed();
+        auto& a = na.join(creds);
+        auto& b = nb.join(creds);
+        REQUIRE(a.publish());
+        REQUIRE(b.publish());
+        REQUIRE(connect_pair(a, b));
+        const auto ida = *a.self();
+        b.on_peer_closed([&](DevId, PeerGone why) { notified = why == PeerGone::ShuttingDown; });
+        a.on_data([&](DevId, std::span<const uint8_t>) {
+            try { na.shutdown(); }
+            catch (const std::system_error&) { threw = true; }
+            returned = true;
+        });
+        REQUIRE(b.send(ida, bytes("stop")));
+        REQUIRE(wait_until([&] { return returned.load(); }, 3s));
+        CHECK(!threw.load());
+        CHECK(wait_until([&] { return !na.is_running(); }, 3s));
+        na.shutdown(); // joins a completed background loop; repeated calls are safe
+        CHECK(na.topics().empty());
+        CHECK(!na.server_connected());
+        CHECK(wait_until([&] { return notified.load(); }, 3s));
+    }
+}

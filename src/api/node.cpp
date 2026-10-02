@@ -466,6 +466,8 @@ struct Node::Impl {
     std::vector<std::function<void()>> deferred;
 
     std::thread       thread;
+    std::thread::id   loop_thread_id{}; // guarded by mu, including caller-owned run()
+    std::mutex        join_mu;
     std::atomic<bool> running{false};
     std::atomic<bool> stop{false};
 
@@ -526,6 +528,7 @@ struct Node::Impl {
 
     void gather_host_candidates();
     void loop();
+    void finish_shutdown(); // with mu held, after the loop stops using sockets
     void tick(Instant now);
 
     // control
@@ -548,6 +551,7 @@ struct Node::Impl {
     void start_session(PendingConn&, Instant now);
     void drive_peer(Topic::Impl&, const TopicId&, Peer&, Instant now);
     void flush_peer(Peer&);
+    void disconnect_peer(Topic::Impl&, Peer&, uint16_t reason);
     void end_attempt(Peer&);
     void set_peer_state(Topic::Impl&, Peer&, PeerState);
     bool send_record(Peer&, uint8_t kind, std::span<const uint8_t> body);
@@ -589,7 +593,13 @@ Topic::Impl* Node::Impl::topic_impl(const TopicId& id) {
 }
 
 void Node::Impl::loop() {
-    running = true;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (running || stop) return;
+        loop_thread_id = std::this_thread::get_id();
+        running = true;
+        cv.notify_all();
+    }
     std::vector<uint8_t> buf(64 * 1024);
 
     while (!stop) {
@@ -648,7 +658,33 @@ void Node::Impl::loop() {
         // into the library -- send a reply, look up peers, disconnect someone.
         for (auto& fn : callbacks) fn();
     }
+    // Callbacks may request shutdown themselves. Finish their queued notices
+    // on this same thread before releasing topics and sockets.
+    std::vector<std::function<void()>> callbacks;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        callbacks.swap(deferred);
+    }
+    for (auto& fn : callbacks) fn();
+    std::lock_guard<std::mutex> lk(mu);
+    finish_shutdown();
+    loop_thread_id = {};
     running = false;
+    cv.notify_all();
+}
+
+void Node::Impl::finish_shutdown() {
+    topics.clear();
+    pending.clear();
+    attempts.clear();
+    requests.clear();
+    deferred.clear();
+    ctl_out.clear();
+    control.close();
+    ctl_state = Ctl::Down;
+    listener.close();
+    udp.close();
+    udp_ready = false;
 }
 
 void Node::Impl::tick(Instant now) {
@@ -1992,21 +2028,24 @@ void Topic::connect_all(size_t max_peers) {
     }
 }
 
+void Node::Impl::disconnect_peer(Topic::Impl&, Peer& peer, uint16_t reason) {
+    if (peer.sess) {
+        // Queue the notice and get it onto the wire before the socket goes.
+        peer.sess->close(reason, now());
+        auto bytes = peer.sess->take_output();
+        peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
+        flush_peer(peer);
+        peer.sock.close();
+    }
+    end_attempt(peer);
+}
+
 void Topic::disconnect(const DevId& dev) {
     auto&                       n = *impl_->node;
     std::lock_guard<std::mutex> lk(n.mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end()) return;
-    Peer& peer = it->second;
-    if (peer.sess) {
-        // Queue the notice and get it onto the wire before the socket goes.
-        peer.sess->close(close_reason::kGoingAway, n.now());
-        auto bytes = peer.sess->take_output();
-        peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
-        n.flush_peer(peer);
-        peer.sock.close();
-    }
-    n.end_attempt(peer);
+    n.disconnect_peer(*impl_, it->second, close_reason::kGoingAway);
     impl_->peers.erase(it);
 }
 
@@ -2017,14 +2056,7 @@ void Topic::disconnect_all_with_reason(uint16_t reason) {
     std::lock_guard<std::mutex> lk(n.mu);
     for (auto& [dev, peer] : impl_->peers) {
         (void)dev;
-        if (peer.sess) {
-            peer.sess->close(reason, n.now());
-            auto bytes = peer.sess->take_output();
-            peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
-            n.flush_peer(peer);
-            peer.sock.close();
-        }
-        n.end_attempt(peer);
+        n.disconnect_peer(*impl_, peer, reason);
     }
     impl_->peers.clear();
 }
@@ -2355,42 +2387,50 @@ std::optional<ServerStats> Node::stats(std::chrono::milliseconds timeout) {
 void Node::run() { impl_->loop(); }
 
 void Node::run_in_background() {
-    if (impl_->running) return;
-    impl_->stop   = false;
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    if (impl_->running || impl_->stop || impl_->thread.joinable()) return;
     impl_->thread = std::thread([this] { impl_->loop(); });
-    for (int i = 0; i < 100 && !impl_->running; ++i) std::this_thread::sleep_for(1ms);
+    impl_->cv.wait(lk, [this] { return impl_->running || impl_->stop; });
 }
 
 void Node::shutdown() {
     if (!impl_) return;
 
-    std::vector<Topic*> all;
+    bool on_loop = false;
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
-        for (auto& [id, t] : impl_->topics) {
-            (void)id;
-            all.push_back(t.get());
+        on_loop = impl_->loop_thread_id == std::this_thread::get_id();
+        if (!impl_->stop.exchange(true)) {
+            for (auto& [id, t] : impl_->topics) {
+                (void)id;
+                auto& ti = *t->impl_;
+                if (ti.self && impl_->ctl_state == Impl::Ctl::Up) {
+                    impl_->notify(wire::MsgType::Unregister, ctl::DevRef{*ti.self});
+                }
+                ti.published = false;
+                ti.self.reset();
+                for (auto& [dev, peer] : ti.peers) {
+                    (void)dev;
+                    impl_->disconnect_peer(ti, peer, close_reason::kShutdown);
+                }
+                ti.peers.clear();
+            }
+            // Nonblocking best effort; closing the control socket also removes
+            // its registrations. No loop-thread sleep is needed to flush it.
+            while (impl_->ctl_state == Impl::Ctl::Up && !impl_->ctl_out.empty()) {
+                auto n = impl_->control.send(impl_->ctl_out);
+                if (!n || *n == 0) break;
+                impl_->ctl_out.erase(impl_->ctl_out.begin(),
+                                    impl_->ctl_out.begin() + static_cast<ptrdiff_t>(*n));
+            }
         }
     }
-    for (auto* t : all) {
-        t->unpublish();
-        t->disconnect_all_with_reason(close_reason::kShutdown);
-    }
-
-    // Give the loop one round to put the Unregisters on the wire.
-    if (impl_->running) std::this_thread::sleep_for(50ms);
-
-    impl_->stop = true;
+    if (on_loop) return; // the loop completes cleanup after this callback returns
+    std::lock_guard<std::mutex> join_lock(impl_->join_mu);
     if (impl_->thread.joinable()) impl_->thread.join();
-
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->topics.clear();
-    impl_->pending.clear();
-    impl_->requests.clear();
-    impl_->control.close();
-    impl_->listener.close();
-    impl_->udp.close();
-    impl_->udp_ready = false;
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    impl_->cv.wait(lk, [this] { return !impl_->running; }); // caller-owned run()
+    impl_->finish_shutdown(); // also handles nodes whose loop was never started
 }
 
 bool     Node::is_running() const { return impl_->running; }

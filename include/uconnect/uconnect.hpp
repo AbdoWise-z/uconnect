@@ -360,7 +360,12 @@ public:
     // --- lifecycle ---------------------------------------------------------
     void run();                // blocking
     void run_in_background();
-    void shutdown();           // tell peers and the server, close everything, stop
+    // Tell peers and the server, close everything, stop. From a callback this
+    // requests shutdown; cleanup finishes after callbacks return. From another
+    // thread it waits for the loop to finish. Keep the Node alive until then;
+    // destroying it inside a callback is not supported. A stopped Node cannot
+    // be restarted; construct a new Node instead.
+    void shutdown();
 
     bool     is_running() const;
     uint16_t local_port() const;  // the node's TCP port

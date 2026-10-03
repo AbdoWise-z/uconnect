@@ -57,6 +57,13 @@ void Session::set_path(const Endpoint& path, Instant now) {
     next_keepalive_ = now;
 }
 
+bool Session::configure_rekey_shift(uint8_t shift) {
+    if (state_ != SessionState::Established || send_counter_ != 0 || received_ != 0 ||
+        shift < 7 || shift > 63) return false;
+    cfg_.rekey_shift = shift;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Receiving
 // ---------------------------------------------------------------------------

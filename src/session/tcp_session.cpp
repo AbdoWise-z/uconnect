@@ -7,8 +7,9 @@
 namespace uconnect::session {
 namespace {
 
-// v3 binds peers to the one-way UDP epoch derivation introduced in #40.
-constexpr std::string_view kPrologueTag = "uconnect:v3:tcp";
+// v4 requires authenticated agreement on the UDP rekey schedule. Older peers
+// cannot silently accept an offer while continuing with their local schedule.
+constexpr std::string_view kPrologueTag = "uconnect:v4:tcp";
 
 // The session's own record kinds; everything from kFirstUserKind up belongs
 // to the layer above.

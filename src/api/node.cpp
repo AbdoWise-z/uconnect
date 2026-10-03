@@ -28,7 +28,7 @@
 //
 // Datagrams. One UDP socket, opened the first time a channel needs it, on P's
 // number when that is free. A channel is opened over the TCP session: each
-// side sends an offer -- the channel's epoch and its UDP candidates, including
+// side sends an offer -- the epoch, preferred rekey shift and UDP candidates, including
 // the reflexive address the server's WhoAmI reported -- and both punch with
 // probes tagged by the channel's probe key. The epoch picks the keys
 // (TcpSession::datagram_keys), so a reopened channel never reuses a nonce.
@@ -84,7 +84,7 @@ constexpr size_t kMaxQueued = 16u << 20;
 
 // Record kinds on a TcpSession that belong to this layer.
 constexpr uint8_t kMessageRecord = 0x10;  // an application message
-constexpr uint8_t kDgramOffer    = 0x11;  // epoch(4) | UDP candidates: open or answer a channel
+constexpr uint8_t kDgramOffer    = 0x11;  // epoch(4) | rekey_shift(1) | UDP candidates
 constexpr uint8_t kDgramOverTcp  = 0x12;  // one datagram, when UDP could not be had
 constexpr uint8_t kDgramClose    = 0x13;  // epoch(4): that channel is closed
 
@@ -163,10 +163,12 @@ bool decode_intro(std::span<const uint8_t> p, TopicId& topic, AttemptNonce& atte
 }
 
 
-std::vector<uint8_t> encode_dgram_offer(uint32_t epoch, const std::vector<Candidate>& cands) {
+std::vector<uint8_t> encode_dgram_offer(uint32_t epoch, uint8_t rekey_shift,
+                                       const std::vector<Candidate>& cands) {
     std::vector<uint8_t> buf(512);
     wire::Writer         w{buf};
     w.u32(epoch);
+    w.u8(rekey_shift);
     const size_t n = std::min<size_t>(cands.size(), wire::kMaxCandidates);
     w.u8(static_cast<uint8_t>(n));
     for (size_t i = 0; i < n; ++i) w.candidate(cands[i]);
@@ -174,13 +176,15 @@ std::vector<uint8_t> encode_dgram_offer(uint32_t epoch, const std::vector<Candid
     return buf;
 }
 
-bool decode_dgram_offer(std::span<const uint8_t> p, uint32_t& epoch, std::vector<Candidate>& cands) {
+bool decode_dgram_offer(std::span<const uint8_t> p, uint32_t& epoch, uint8_t& rekey_shift,
+                         std::vector<Candidate>& cands) {
     wire::Reader r{p};
     epoch          = r.u32();
+    rekey_shift    = r.u8();
     const size_t n = r.u8();
-    if (!r.ok() || n > wire::kMaxCandidates) return false;
+    if (!r.ok() || n > wire::kMaxCandidates || rekey_shift < 7 || rekey_shift > 63) return false;
     for (size_t i = 0; i < n; ++i) cands.push_back(r.candidate());
-    return r.ok();
+    return r.ok() && r.remaining() == 0;
 }
 
 std::vector<uint8_t> encode_u32(uint32_t v) {
@@ -1705,7 +1709,7 @@ void Node::Impl::on_udp(const Endpoint& from, std::span<const uint8_t> dgram, In
             if (dgram.size() < wire::Header::kSize + 4) return;
             const auto cid = *decode_u32(dgram.subspan(wire::Header::kSize, 4));
             each_channel([&](Topic::Impl&, Peer&, Dgram& d) {
-                if (!d.sess || d.conn_id != cid) return false;
+                if (!d.sess || !d.remote || d.conn_id != cid) return false;
                 d.sess->on_datagram(from, dgram, now);
                 return true;
             });
@@ -1759,7 +1763,7 @@ void Node::Impl::on_udp_from_server(std::span<const uint8_t> dgram, Instant now)
             // The payload is the peer's sealed packet; its keys decide whether
             // it is genuine, not the wrapper.
             by_relay(rd->relay_id, [&](Topic::Impl&, Peer&, Dgram& d) {
-                if (d.sess) d.sess->on_datagram(server, rd->payload, now);
+                if (d.sess && d.remote) d.sess->on_datagram(server, rd->payload, now);
             });
             return;
         }
@@ -1808,8 +1812,9 @@ bool Node::Impl::dgram_open(Topic::Impl& ti, Peer& peer, uint32_t epoch, Datagra
 void Node::Impl::dgram_on_offer(Topic::Impl& ti, Peer& peer, std::span<const uint8_t> body,
                                 Instant now) {
     uint32_t               epoch = 0;
+    uint8_t                rekey_shift = 0;
     std::vector<Candidate> cands;
-    if (!decode_dgram_offer(body, epoch, cands)) return;
+    if (!decode_dgram_offer(body, epoch, rekey_shift, cands)) return;
 
     if (peer.dgram && epoch < peer.dgram->epoch) return;  // an older channel's, overtaken
     if (!peer.dgram || epoch > peer.dgram->epoch) {
@@ -1819,7 +1824,10 @@ void Node::Impl::dgram_on_offer(Topic::Impl& ti, Peer& peer, std::span<const uin
         const auto fb = peer.dgram ? peer.dgram->fallback : cfg.datagram_fallback;
         if (!dgram_open(ti, peer, epoch, fb, now)) return;
     }
-    peer.dgram->remote = std::move(cands);
+    auto& d = *peer.dgram;
+    if (d.remote) return; // the first authenticated offer fixes this epoch's settings
+    if (!d.sess->configure_rekey_shift(std::min(cfg.rekey_shift, rekey_shift))) return;
+    d.remote = std::move(cands);
 }
 
 void Node::Impl::dgram_drop(Topic::Impl& ti, Peer& peer) {
@@ -1885,7 +1893,7 @@ void Node::Impl::drive_dgram(Topic::Impl& ti, const TopicId& tid, Peer& peer, In
 
     // Our offer: once we know our UDP mapping, or have waited long enough.
     if (!d.offered && (udp_srflx || !udp_ready || now - d.opened >= kGatherWait)) {
-        send_record(peer, kDgramOffer, encode_dgram_offer(d.epoch, udp_ready ? udp_candidates()
+        send_record(peer, kDgramOffer, encode_dgram_offer(d.epoch, cfg.rekey_shift, udp_ready ? udp_candidates()
                                                                              : std::vector<Candidate>{}));
         d.offered = true;
     }

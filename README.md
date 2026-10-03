@@ -94,7 +94,7 @@ cfg.force_relay   = false;                  // skip punching, go straight to the
 cfg.verbose       = false;                  // protocol tracing to stderr
 
 cfg.datagram_fallback = DatagramFallback::Tcp;  // for channels peers open to us
-cfg.rekey_shift       = 16;                     // ratchet datagram keys every 2^16 packets
+cfg.rekey_shift       = 16;                     // preferred interval; peers use the smaller shift
 
 Node node{cfg};
 node.run_in_background();      // or node.run() to block on this thread
@@ -535,9 +535,14 @@ new epoch, so every channel gets new keys.
 Deriving a channel consumes its epoch root: only the next root remains, and
 initial traffic-key copies are erased after constructing the channel. Retired
 epochs cannot be derived again. Epoch skips are limited to 64 to bound work.
-The TCP handshake prologue is now `uconnect:v3:tcp`; upgrade both peers together.
+The TCP handshake prologue is now `uconnect:v4:tcp`; upgrade both peers together.
 Older peer libraries fail the handshake rather than silently disagreeing about
-UDP keys. The rendezvous control protocol remains version 2.
+UDP keys or rekey schedules. The rendezvous control protocol remains version 2.
+
+Each authenticated datagram offer includes the sender's preferred rekey shift.
+The channel uses the smaller of the two shifts, fixed before UDP traffic starts.
+Malformed offers are ignored, and a repeated offer cannot change an active
+channel's schedule.
 
 If punching fails, the fallback applies. For `Relay`, a UDP relay binding is
 allocated like the TCP one, each side binds its UDP address to it with its
@@ -1022,7 +1027,7 @@ Everything is in `Node::Config`:
 | `force_relay` | `false` | skip punching when you know it cannot work |
 | `datagram_fallback` | `Tcp` | what to do with datagrams when a peer opens a channel and UDP cannot be punched |
 | `verbose` | `false` | protocol tracing to stderr |
-| `rekey_shift` | `16` | datagram key ratchet; lower only to exercise it in a test |
+| `rekey_shift` | `16` | preferred datagram key interval; peers agree on the smaller shift |
 
 ## Dashboard
 

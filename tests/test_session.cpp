@@ -601,3 +601,21 @@ TEST(a_rekey_shift_as_wide_as_the_counter_means_never_rekey) {
     p.b.on_datagram(ep(5, 5000), dgrams[1], t0() + 1s);
     CHECK_EQ(drain_data(p.b).size(), 3u);
 }
+
+TEST(a_negotiated_rekey_schedule_is_validated_and_fixed_after_use) {
+    auto p = establish();
+    CHECK(!p.a.configure_rekey_shift(6));
+    CHECK(!p.a.configure_rekey_shift(64));
+    REQUIRE(p.a.configure_rekey_shift(7));
+    REQUIRE(p.b.configure_rekey_shift(7));
+    for (int i = 0; i < 400; ++i) {
+        REQUIRE(p.a.send(bytes("a"), t0() + 1s).has_value());
+        deliver(p.a, p.b, ep(5, 5000), t0() + 1s);
+        REQUIRE(p.b.send(bytes("b"), t0() + 1s).has_value());
+        deliver(p.b, p.a, ep(4, 4000), t0() + 1s);
+    }
+    CHECK_EQ(drain_data(p.a).size(), 400u);
+    CHECK_EQ(drain_data(p.b).size(), 400u);
+    CHECK(!p.a.configure_rekey_shift(16));
+    CHECK(!p.b.configure_rekey_shift(16));
+}

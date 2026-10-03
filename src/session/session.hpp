@@ -40,13 +40,10 @@ struct SessionConfig {
 
     // Ratchet the keys every 2^rekey_shift packets.
     //
-    // Driven by the packet counter rather than a clock, and that is the whole
-    // trick: the counter travels in every header, so both ends compute the same
-    // generation from data that arrived with the packet. There is no switch to
-    // coordinate and therefore nothing to desynchronise -- which is the failure
-    // this avoids, because a key mismatch shows up as a failed AEAD tag, and a
-    // failed tag is dropped silently. Disagreeing about the current key looks
-    // exactly like total packet loss, with no counter or log line to say so.
+    // Both ends must agree on this shift before traffic starts. After that,
+    // the counter in each packet selects its generation without a separate
+    // switch message. Disagreeing about the schedule fails authentication and
+    // silently drops valid packets, looking exactly like packet loss.
     //
     // 2^16 packets is roughly 78 MB at 1200-byte payloads. It must stay above
     // ReplayWindow::kWidth: the replay window will not accept a packet more
@@ -131,6 +128,10 @@ public:
 
     // Send from now on to `path`. The counters carry on: the keys are the same.
     void set_path(const Endpoint& path, Instant now);
+
+    // Agree a schedule before exchanging any packets. Once used, the channel's
+    // keys/counters must never be reinterpreted under a different schedule.
+    bool configure_rekey_shift(uint8_t shift);
 
     // Local teardown. Nothing goes on the wire, so the peer only finds out when
     // its idle timeout expires.

@@ -330,10 +330,11 @@ public:
         // it and UDP cannot be punched. open_datagrams() takes its own.
         DatagramFallback datagram_fallback = DatagramFallback::Tcp;
 
-        // Ratchet the UDP datagram channel's keys every 2^rekey_shift packets,
-        // erasing retired keys (the receiver retains one previous generation
-        // for reordering). Driven by the packet counter, which travels in
-        // every header, so both ends agree without negotiating anything.
+        // Preferred UDP key-ratchet interval, in powers of two packets. The
+        // authenticated channel offers select the smaller of the two peers'
+        // shifts, so keys never live longer than either peer requested. That
+        // schedule is fixed for the channel; counters select each generation.
+        // Retired keys are erased, retaining one generation for reordering.
         //
         // A generation must stay above 64 packets (the replay window width):
         // that is what bounds a reordered packet to at most one generation

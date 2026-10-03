@@ -1050,6 +1050,58 @@ TEST(a_silent_inbound_connection_does_not_linger_forever) {
     CHECK(idle.closed_within(12s));
 }
 
+TEST(datagram_offers_reject_invalid_schedules_and_malformed_bodies) {
+    LocalServer srv;
+    std::atomic<int> markers{0};
+    Node n{config_for(srv)};
+    n.run_in_background();
+    const auto creds = TopicCreds::generate_open();
+    auto& topic = n.join(creds);
+    topic.on_data([&](DevId, std::span<const uint8_t>) { ++markers; });
+    REQUIRE(topic.publish());
+    RawConn control{srv.endpoint()};
+    const auto remote = control.register_in(creds.id);
+    REQUIRE(remote.has_value());
+    const auto self = *topic.self();
+    session::AttemptNonce attempt{};
+    attempt.fill(0x5A);
+    std::vector<uint8_t> intro(creds.id.begin(), creds.id.end());
+    intro.insert(intro.end(), attempt.begin(), attempt.end());
+    intro.push_back(0);
+    control.send_raw(ctl::frame(ctl::message(wire::MsgType::Connect, 7,
+                                            ctl::Connect{*remote, self, intro})));
+    RawConn conn{Endpoint{IpAddr::v4(127, 0, 0, 1), n.local_port()}};
+    const bool initiator = std::memcmp(remote->data(), self.data(), kDevIdLen) < 0;
+    const auto now = std::chrono::steady_clock::now();
+    auto s = initiator ? session::TcpSession::initiate({}, creds.id, 0, nullptr, *remote, self, attempt, now)
+                       : session::TcpSession::respond({}, creds.id, 0, nullptr, *remote, self, attempt, now);
+    if (!initiator) conn.send_raw(session::TcpSession::hello(attempt));
+    conn.send_raw(s.take_output());
+    REQUIRE(handshake_over(conn, s, [&] { return topic.state(*remote) == PeerState::Connected; }));
+
+    const std::vector<std::vector<uint8_t>> invalid{
+        {0, 0, 0, 1},             // missing shift and candidate count
+        {0, 0, 0, 1, 6, 0},       // below the replay-window bound
+        {0, 0, 0, 1, 64, 0},      // invalid shift
+        {0, 0, 0, 1, 7, 1},       // missing candidate
+        {0, 0, 0, 1, 7, 0, 99},   // trailing garbage
+    };
+    int sent = 0;
+    for (const auto& offer : invalid) {
+        REQUIRE(s.send(0x11, offer, std::chrono::steady_clock::now()));
+        REQUIRE(s.send(0x10, bytes("barrier"), std::chrono::steady_clock::now()));
+        conn.send_raw(s.take_output());
+        ++sent;
+        REQUIRE(wait_until([&] { return markers.load() == sent; }, 2s));
+        CHECK(topic.datagram_path(*remote) == DatagramPath::None);
+    }
+    // Invalid offers must not consume the epoch or prevent a later valid offer.
+    const std::vector<uint8_t> valid{0, 0, 0, 1, 7, 0};
+    REQUIRE(s.send(0x11, valid, std::chrono::steady_clock::now()));
+    conn.send_raw(s.take_output());
+    CHECK(wait_until([&] { return topic.datagram_path(*remote) == DatagramPath::Tcp; }, 3s));
+}
+
 // ---------------------------------------------------------------------------
 // Datagrams
 // ---------------------------------------------------------------------------
@@ -1134,6 +1186,25 @@ TEST(datagrams_punch_a_direct_udp_path_and_flow_both_ways) {
     REQUIRE(!p.paths_b.empty());
     CHECK(p.paths_b.front() == DatagramPath::Opening);
     CHECK(p.paths_b.back() == DatagramPath::Direct);
+}
+
+TEST(datagrams_negotiate_different_rekey_settings_before_traffic) {
+    LocalServer srv;
+    auto ca = dgram_config(srv, true, DatagramFallback::Relay);
+    auto cb = ca;
+    ca.rekey_shift = 7;
+    cb.rekey_shift = 16;
+    DgramPair p{srv, ca, cb};
+    REQUIRE(p.connect());
+    const auto ida = p.ida(), idb = p.idb();
+    REQUIRE(p.a->open_datagrams(idb, DatagramFallback::Relay));
+    REQUIRE(p.settled(DatagramPath::Relayed));
+    for (int i = 0; i < 400; ++i) {
+        CHECK(p.a->send_datagram(idb, bytes("a")));
+        CHECK(p.b->send_datagram(ida, bytes("b")));
+        std::this_thread::sleep_for(2ms);
+    }
+    CHECK(wait_until([&] { return p.count_a() >= 380 && p.count_b() >= 380; }, 3s));
 }
 
 TEST(datagrams_fall_back_over_tcp_when_udp_cannot_be_punched) {

@@ -108,6 +108,11 @@ The node connects to the server on its own, keeps that connection up, and
 reconnects — registering every published topic again — if it drops.
 `node.server_connected()` says whether it is up right now.
 
+A control connection attempt or a loop-issued request left unanswered for ten
+seconds also triggers reconnection. Keepalive and discovery requests are not
+duplicated while awaiting replies; a stalled server cannot grow those queues
+indefinitely. Blocking queries retain their own API timeouts.
+
 ## Joining a topic
 
 ```cpp

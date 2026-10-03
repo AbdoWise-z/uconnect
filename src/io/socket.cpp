@@ -645,6 +645,16 @@ void TcpSocket::close() {
     state_ = State::Idle;
 }
 
+void TcpSocket::abort() {
+    if (!is_open()) return;
+    linger reset{};
+    reset.l_onoff = 1;
+    reset.l_linger = 0;
+    ::setsockopt(raw(fd_), SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&reset),
+                 sizeof(reset));
+    close();
+}
+
 std::optional<Endpoint> TcpSocket::remote() const {
     if (!is_open()) return std::nullopt;
     sockaddr_storage ss{};

@@ -76,6 +76,7 @@ constexpr auto kHandshakeRetry    = 1s;   // after a failed handshake, a fresh i
 constexpr int  kMaxHandshakeRetries = 2;
 constexpr auto kReconnectMin      = 500ms;
 constexpr auto kReconnectMax      = 30s;
+constexpr auto kControlTimeout    = 10s;  // connect or loop-owned request deadline
 
 // Bytes allowed to queue for one peer before send() refuses more: a peer that
 // reads slowly must not grow our memory without bound.
@@ -382,11 +383,13 @@ struct Request {
     bool                 done  = false;
     ErrorCode            error = ErrorCode::None;
     std::vector<uint8_t> reply;  // the whole reply message, for blocking callers
+    Instant             deadline{};
 
-    // Issued by the loop for itself; the reply handler applies it.
+    // Registration topic for either a blocking publish or a loop-owned
+    // re-registration. The other fields describe loop-owned requests only.
+    std::optional<TopicId>                   register_for;
     std::optional<TopicId>                   keepalive_for;
     bool                                     conn_keepalive = false;  // no record: the connection itself
-    std::optional<TopicId>                   register_for;
     std::optional<TopicId>                   discover_for;
     std::optional<std::pair<TopicId, DevId>> relay_for;
     std::optional<std::pair<TopicId, DevId>> dgram_relay_for;  // a UDP relay
@@ -439,6 +442,7 @@ struct Node::Impl {
     std::vector<uint8_t> ctl_out;
     Instant              next_reconnect{};
     Instant              next_ctl_keepalive{};
+    Instant              ctl_connect_deadline{};
     std::chrono::milliseconds reconnect_backoff = kReconnectMin;
 
     std::vector<Candidate>  host_cands;
@@ -487,6 +491,7 @@ struct Node::Impl {
         auto           f   = ctl::frame(ctl::message(type, txn, body, flags));
         ctl_out.insert(ctl_out.end(), f.begin(), f.end());
         r.expect      = expect;
+        if (r.loop_owned) r.deadline = now() + kControlTimeout;
         requests[txn] = std::move(r);
         return txn;
     }
@@ -504,6 +509,14 @@ struct Node::Impl {
     void notify(wire::MsgType type, const T& body) {
         auto f = ctl::frame(ctl::message(type, alloc_txn(), body));
         ctl_out.insert(ctl_out.end(), f.begin(), f.end());
+    }
+
+    bool topic_request_pending(const TopicId& tid, wire::MsgType expect) const {
+        return std::any_of(requests.begin(), requests.end(), [&](const auto& entry) {
+            const auto& r = entry.second;
+            return !r.done && r.expect == expect &&
+                   (r.keepalive_for == tid || r.discover_for == tid);
+        });
     }
 
     // Wait, with `lk` held on `mu`, for request `txn` to finish.
@@ -729,7 +742,8 @@ void Node::Impl::tick(Instant now) {
     for (auto& [tid, t] : topics) {
         auto& ti = *t->impl_;
 
-        if (ti.published && ti.self && ctl_state == Ctl::Up && now >= ti.next_keepalive) {
+        if (ti.published && ti.self && ctl_state == Ctl::Up && now >= ti.next_keepalive &&
+            !topic_request_pending(tid, wire::MsgType::KeepaliveOk)) {
             Request r;
             r.keepalive_for = tid;
             r.loop_owned    = true;
@@ -742,7 +756,8 @@ void Node::Impl::tick(Instant now) {
         if (ti.auto_connect && ti.published && ti.self && ctl_state == Ctl::Up &&
             now >= ti.next_discovery) {
             ti.next_discovery = now + kDiscoveryInterval;
-            if (live_peer_count(ti) < ti.max_peers) {
+            if (live_peer_count(ti) < ti.max_peers &&
+                !topic_request_pending(tid, wire::MsgType::LookupOk)) {
                 Request r;
                 r.discover_for = tid;
                 r.loop_owned   = true;
@@ -796,6 +811,7 @@ void Node::Impl::drive_control(Instant now) {
             return;
         }
         ctl_state = Ctl::Connecting;
+        ctl_connect_deadline = now + kControlTimeout;
         return;
     }
 
@@ -805,7 +821,10 @@ void Node::Impl::drive_control(Instant now) {
             on_control_down(now, "connect");
             return;
         }
-        if (st != io::TcpSocket::State::Connected) return;
+        if (st != io::TcpSocket::State::Connected) {
+            if (now >= ctl_connect_deadline) on_control_down(now, "connect timeout");
+            return;
+        }
         ctl_state         = Ctl::Up;
         reconnect_backoff = kReconnectMin;
         ctl_reader        = ctl::FrameReader{};
@@ -839,6 +858,17 @@ void Node::Impl::drive_control(Instant now) {
         }
         while (auto msg = ctl_reader.next()) on_control_message(*msg, now);
     }
+    // A peer can keep accepting TCP bytes while never answering a request.
+    // Check each request rather than last-received time, so unrelated replies
+    // cannot indefinitely hide a missing registration, discovery or keepalive.
+    const bool overdue = std::any_of(requests.begin(), requests.end(), [&](const auto& entry) {
+        const auto& r = entry.second;
+        return r.loop_owned && !r.done && now >= r.deadline;
+    });
+    if (overdue) {
+        on_control_down(now, "request timeout");
+        return;
+    }
     while (!ctl_out.empty()) {
         auto n = control.send(ctl_out);
         if (!n) {
@@ -855,7 +885,9 @@ void Node::Impl::on_control_down(Instant now, const char* why) {
         std::fprintf(stderr, "[uconnect] control connection down (%s: %s)\n", why,
                      control.last_error().c_str());
     }
-    control.close();
+    // This connection's requests are being abandoned. Reset it so a timeout
+    // does not leave our one source port tied up in a graceful TCP close.
+    control.abort();
     ctl_state = Ctl::Down;
     ctl_out.clear();
     next_reconnect    = now + reconnect_backoff;
@@ -880,6 +912,10 @@ void Node::Impl::on_control_down(Instant now, const char* why) {
 }
 
 void Node::Impl::send_conn_keepalive(Instant now) {
+    next_ctl_keepalive = now + cfg.keepalive;
+    if (std::any_of(requests.begin(), requests.end(), [](const auto& entry) {
+            return entry.second.conn_keepalive && !entry.second.done;
+        })) return;
     const uint32_t txn = alloc_txn();
     auto           f   = ctl::frame(ctl::empty_message(wire::MsgType::Keepalive, txn));
     ctl_out.insert(ctl_out.end(), f.begin(), f.end());
@@ -887,8 +923,8 @@ void Node::Impl::send_conn_keepalive(Instant now) {
     r.expect         = wire::MsgType::KeepaliveOk;
     r.conn_keepalive = true;
     r.loop_owned     = true;
+    r.deadline       = now + kControlTimeout;
     requests[txn]    = std::move(r);
-    next_ctl_keepalive = now + cfg.keepalive;
 }
 
 void Node::Impl::send_register(Topic::Impl& ti, const TopicId& tid, bool loop_owned) {
@@ -995,12 +1031,28 @@ void Node::Impl::on_control_message(std::span<const uint8_t> msg, Instant now) {
         } else if (req.register_for) {
             if (auto ok = ctl::RegisterOk::decode(r)) {
                 srflx = ok->srflx;
-                if (auto* ti = topic_impl(*req.register_for)) {
+                auto* ti = topic_impl(*req.register_for);
+                if (ti) {
                     ti->reregistering = false;
                     if (ti->published) {
                         ti->self           = ok->dev_id;
                         ti->next_keepalive = now + cfg.keepalive;
                     }
+                }
+                if (!ti || !ti->published) {
+                    // unpublish()/leave() may have sent the previous server's
+                    // dev_id before this reply arrived. Remove the ID this
+                    // server actually registered, unless a newer publish is
+                    // in flight: registrations for the same topic/address
+                    // share one record, so deleting it would cancel that too.
+                    const bool publishing = std::any_of(requests.begin(), requests.end(),
+                        [&](const auto& entry) {
+                            const auto& pending_request = entry.second;
+                            return !pending_request.loop_owned &&
+                                   pending_request.register_for == req.register_for &&
+                                   pending_request.error == ErrorCode::None;
+                        });
+                    if (!publishing) notify(wire::MsgType::Unregister, ctl::DevRef{ok->dev_id});
                 }
             }
         } else if (req.discover_for) {
@@ -1958,7 +2010,9 @@ bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
     m.unlisted   = unlisted;
     m.host_cands = n.host_cands;
     m.meta       = impl_->meta;
-    const uint32_t txn = n.request(wire::MsgType::Register, wire::MsgType::RegisterOk, m, {},
+    Request registration;
+    registration.register_for = impl_->creds.id;
+    const uint32_t txn = n.request(wire::MsgType::Register, wire::MsgType::RegisterOk, m, registration,
                                    unlisted ? wire::flags::kUnlisted : uint8_t{0});
 
     // Waits out the control connection coming up, too.

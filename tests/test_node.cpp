@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -67,6 +68,11 @@ public:
     size_t connections() {
         std::lock_guard<std::mutex> lk(mu_);
         return rv_->service().connections();
+    }
+
+    void set_drop_filter(std::function<bool(std::span<const uint8_t>)> filter) {
+        std::lock_guard<std::mutex> lk(mu_);
+        rv_->drop_filter = std::move(filter);
     }
 
 private:
@@ -559,6 +565,78 @@ TEST(a_node_registers_again_after_the_server_restarts) {
     }, 10s));
 }
 
+TEST(cancelled_reregistration_is_unregistered_when_its_reply_arrives) {
+    enum class Cancel { Unpublish, Leave, Republish };
+    for (Cancel cancel : {Cancel::Unpublish, Cancel::Leave, Cancel::Republish}) {
+        io::TcpSocket listener;
+        REQUIRE(listener.open(0));
+        REQUIRE(listener.listen());
+        Node n{"127.0.0.1:" + std::to_string(listener.local_port())};
+        n.run_in_background();
+        std::optional<io::TcpSocket> accepted;
+        REQUIRE(wait_until([&] { accepted = listener.accept(); return accepted.has_value(); }, 2s));
+        auto conn = std::make_unique<RawConn>(std::move(*accepted));
+
+        const auto creds = TopicCreds::generate_open();
+        auto& topic = n.join(creds);
+        auto publish = std::async(std::launch::async, [&] { return topic.publish(); });
+        auto request = conn->expect(wire::MsgType::Register);
+        REQUIRE(request.has_value());
+        wire::Reader reader{*request};
+        auto header = wire::Header::decode(reader, ctl::kVersion);
+        REQUIRE(header.has_value());
+        DevId old_id{};
+        old_id.fill(77);
+        const Endpoint observed{IpAddr::v4(127, 0, 0, 1), n.local_port()};
+        conn->send_raw(ctl::frame(ctl::message(wire::MsgType::RegisterOk, header->txn_id,
+                                            ctl::RegisterOk{old_id, observed, 1})));
+        REQUIRE(publish.get());
+
+        // Restart: a new registry derives a new ID. Hold its RegisterOk until
+        // after cancellation so this race does not depend on thread timing.
+        conn.reset();
+        REQUIRE(wait_until([&] { accepted = listener.accept(); return accepted.has_value(); }, 4s));
+        conn = std::make_unique<RawConn>(std::move(*accepted));
+        server::Registry registry;
+        server::ControlService service{registry};
+        service.on_open(1, observed, std::chrono::steady_clock::now());
+        request = conn->expect(wire::MsgType::Register);
+        REQUIRE(request.has_value());
+        auto held = service.on_message(1, *request, std::chrono::steady_clock::now());
+        REQUIRE(registry.size() == 1);
+        REQUIRE(!held.out.empty());
+        CHECK(topic.self() == old_id);
+        if (cancel == Cancel::Leave) n.leave(creds.id);
+        else topic.unpublish();
+
+        auto unregister = conn->expect(wire::MsgType::Unregister);
+        REQUIRE(unregister.has_value());
+        service.on_message(1, *unregister, std::chrono::steady_clock::now());
+        CHECK_EQ(registry.size(), 1u); // the old ID cannot remove the new record
+        if (cancel == Cancel::Republish) {
+            auto republish = std::async(std::launch::async, [&] { return topic.publish(); });
+            request = conn->expect(wire::MsgType::Register);
+            REQUIRE(request.has_value());
+            auto renewed = service.on_message(1, *request, std::chrono::steady_clock::now());
+            for (const auto& reply : held.out) conn->send_raw(reply.bytes);
+            for (const auto& reply : renewed.out) conn->send_raw(reply.bytes);
+            REQUIRE(republish.get());
+            // The old reply must not delete the record reused by republish.
+            unregister = conn->expect(wire::MsgType::Unregister, 200ms);
+            CHECK(!unregister.has_value());
+            if (unregister) service.on_message(1, *unregister, std::chrono::steady_clock::now());
+            CHECK_EQ(registry.size(), 1u);
+            continue;
+        }
+        for (const auto& reply : held.out) conn->send_raw(reply.bytes);
+        unregister = conn->expect(wire::MsgType::Unregister);
+        REQUIRE(unregister.has_value());
+        service.on_message(1, *unregister, std::chrono::steady_clock::now());
+        CHECK_EQ(registry.size(), 0u);
+        CHECK(n.server_connected()); // cleanup must not require a disconnect
+    }
+}
+
 TEST(requests_the_loop_issues_for_itself_are_retired) {
     // #9. Keepalives and discovery LOOKUPs are issued by the loop, not by a
     // blocking caller, and must not accumulate in the request table.
@@ -575,6 +653,72 @@ TEST(requests_the_loop_issues_for_itself_are_retired) {
     std::this_thread::sleep_for(6500ms);
     CHECK(na.pending_requests() <= 2u);  // at most what is genuinely in flight
     CHECK_EQ(srv.stats().registers, 1u);  // and the keepalives did not re-register
+}
+
+TEST(a_silent_control_server_is_reconnected_with_bounded_requests) {
+    io::TcpSocket listener;
+    REQUIRE(listener.open(0));
+    REQUIRE(listener.listen());
+    Node::Config cfg;
+    cfg.server = "127.0.0.1:" + std::to_string(listener.local_port());
+    cfg.keepalive = 1s;
+    Node n{cfg};
+    n.run_in_background();
+    std::optional<io::TcpSocket> accepted;
+    REQUIRE(wait_until([&] { accepted = listener.accept(); return accepted.has_value(); }, 2s));
+    RawConn silent{std::move(*accepted)};
+    REQUIRE(silent.expect(wire::MsgType::Keepalive).has_value());
+    auto stats = std::async(std::launch::async, [&] { return n.stats(30s); });
+    size_t peak = 0;
+    const bool disconnected = wait_until([&] {
+        peak = std::max(peak, n.pending_requests());
+        return !silent.read_some().has_value();
+    }, 12s);
+    if (!disconnected) n.shutdown(); // release the blocking query even on regression
+    REQUIRE(disconnected);
+    CHECK(peak <= 2u); // one keepalive and the application's blocking stats query
+    REQUIRE(stats.wait_for(1s) == std::future_status::ready);
+    CHECK(!stats.get().has_value());
+
+    REQUIRE(wait_until([&] { accepted = listener.accept(); return accepted.has_value(); }, 4s));
+    RawConn recovered{std::move(*accepted)};
+    auto request = recovered.expect(wire::MsgType::Keepalive);
+    REQUIRE(request.has_value());
+    wire::Reader reader{*request};
+    auto header = wire::Header::decode(reader, ctl::kVersion);
+    REQUIRE(header.has_value());
+    const Endpoint observed{IpAddr::v4(127, 0, 0, 1), n.local_port()};
+    recovered.send_raw(ctl::frame(ctl::message(wire::MsgType::KeepaliveOk, header->txn_id,
+                                              ctl::KeepaliveOk{observed})));
+    CHECK(wait_until([&] { return n.reflexive() == observed; }, 2s));
+    CHECK(n.server_connected());
+}
+
+TEST(a_missing_discovery_reply_expires_despite_other_control_replies) {
+    std::atomic<int> dropped{0};
+    LocalServer srv;
+    auto cfg = config_for(srv);
+    cfg.keepalive = 1s;
+    Node n{cfg};
+    n.run_in_background();
+    auto& topic = n.create();
+    REQUIRE(topic.publish());
+    srv.set_drop_filter([&](std::span<const uint8_t> message) {
+        if (wire::peek_type(message) != wire::MsgType::Lookup) return false;
+        ++dropped;
+        return true;
+    });
+    topic.set_auto_connect(true);
+    size_t peak = 0;
+    CHECK(wait_until([&] {
+        peak = std::max(peak, n.pending_requests());
+        return srv.stats().registers >= 2;
+    }, 14s));
+    CHECK(peak <= 3u); // discovery, keepalive, and registration during reconnect
+    CHECK(dropped.load() <= 2); // at most one discovery per connection
+    srv.set_drop_filter({});
+    CHECK(topic.try_peers().has_value());
+    CHECK(n.server_connected());
 }
 
 TEST(stats_and_explore_reach_the_server) {

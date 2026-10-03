@@ -129,6 +129,10 @@ public:
     std::optional<size_t> recv(std::span<uint8_t>);
 
     void close();
+    // Abandon a failed connection with a reset, discarding unsent bytes. This
+    // permits reconnecting from the same local port without a graceful-close
+    // TIME_WAIT interval. Use only when the connection is already unusable.
+    void abort();
 
     bool                    is_open() const { return fd_ != kInvalidSocket; }
     uint16_t                local_port() const { return local_port_; }

@@ -161,11 +161,35 @@ TEST(tcp_session_an_initiator_skips_a_hello_that_arrives_after_message_1) {
     }
 }
 
-TEST(tcp_session_a_hello_for_another_attempt_is_not_our_peer) {
-    auto p = session_pair();
-    (void)p.a.take_output();
-    p.a.on_bytes(TcpSession::hello(nonce_of(8)), t0());  // we are attempt 9
-    CHECK(p.a.state() == TcpSession::State::Closed);
+TEST(tcp_session_an_initiator_skips_a_hello_naming_another_attempt) {
+    // #51. An initiator only ever sees a hello on a simultaneous open: the
+    // peer dialed it too, under an attempt of its own. When both connected at
+    // once that attempt is not ours -- their introductions crossed -- and the
+    // peer is about to adopt ours, because the smaller dev_id's attempt wins.
+    // Failing here threw away the one connection both dials had made.
+    for (size_t chunk : {size_t{1}, size_t{7}, SIZE_MAX}) {
+        auto p  = session_pair();  // both on attempt 9 by the time message 1 lands
+        auto m1 = p.a.take_output();
+        auto h  = TcpSession::hello(nonce_of(8));  // the peer's own, crossing ours
+        for (size_t off = 0; off < h.size(); off += chunk) {
+            p.a.on_bytes(std::span(h).subspan(off, std::min(chunk, h.size() - off)), t0());
+        }
+        CHECK(p.a.state() == TcpSession::State::Handshaking);
+        p.b.on_bytes(m1, t0());
+        p.a.on_bytes(p.b.take_output(), t0());
+        CHECK(p.a.state() == TcpSession::State::Established);
+        CHECK(p.b.state() == TcpSession::State::Established);
+    }
+}
+
+TEST(tcp_session_a_skipped_hello_proves_nothing) {
+    // A hello is plaintext and unauthenticated; message 2 is what decides. A
+    // responder still on the other attempt can never complete ours.
+    auto p = session_pair(nullptr, nullptr, nonce_of(9), nonce_of(8));
+    p.a.on_bytes(TcpSession::hello(nonce_of(8)), t0());
+    pump(p);
+    CHECK(p.a.state() != TcpSession::State::Established);
+    CHECK(p.b.state() == TcpSession::State::Closed);
 }
 
 TEST(tcp_session_peek_hello_needs_all_of_it) {

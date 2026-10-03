@@ -106,7 +106,9 @@ public:
     // so an initiator holding a connection it ACCEPTED can tell who is calling.
     // It is not part of the handshake, and an initiator skips it wherever it
     // lands before message 2: after a TCP simultaneous open both ends think
-    // they dialed, so the hello can arrive after message 1 has gone out.
+    // they dialed, so the hello can arrive after message 1 has gone out --
+    // and, when both introduced themselves at once, name the peer's attempt
+    // rather than ours.
     static constexpr size_t kHelloLen = 2 + kAttemptLen;
     static std::vector<uint8_t>        hello(const AttemptNonce&);
     // The attempt a hello names, once all of it has arrived; nullopt if

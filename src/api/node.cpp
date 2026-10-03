@@ -304,6 +304,7 @@ struct PendingConn {
     std::vector<uint8_t> in;        // bytes read before a session took over
     std::vector<uint8_t> out;       // bytes still to write: a hello, a RelayJoin
     bool                 greeted = false;
+    Instant              named_other{};  // when message 1 first named another attempt
 
     // RelayLeg
     wire::RelayId          relay_id = 0;
@@ -1085,7 +1086,19 @@ void Node::Impl::on_relayed(const wire::Relayed& rel, Instant now) {
 
 void Node::Impl::adopt_attempt(Topic::Impl& ti, const TopicId& tid, Peer& peer,
                                const AttemptNonce& attempt, Instant now) {
-    if (peer.attempt) attempts.erase(*peer.attempt);
+    if (peer.attempt) {
+        attempts.erase(*peer.attempt);
+        // Connections made under the attempt being replaced carry on under
+        // this one. When both ends introduced themselves at once, their two
+        // dials can be one connection, and it is the one the handshake for
+        // the winning attempt arrives on.
+        for (auto& pc : pending) {
+            if (pc->known && pc->attempt == *peer.attempt && pc->topic == tid &&
+                pc->peer == peer.dev_id) {
+                pc->attempt = attempt;
+            }
+        }
+    }
     peer.attempt         = attempt;
     peer.attempt_started = now;
     peer.punch_deadline  = cfg.force_relay ? now : now + cfg.punch_timeout;
@@ -1311,7 +1324,17 @@ void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
     }
     // On every kind of connection, relay legs included, the responder waits
     // for the initiator to speak: that way both ends are on the same one.
-    if (TcpSession::peek_attempt(pc.in)) start_session(pc, now);
+    auto named = TcpSession::peek_attempt(pc.in);
+    if (!named) return;
+    if (*named != pc.attempt) {
+        // Message 1 under the initiator's own attempt: its introduction
+        // crossed ours and has yet to arrive. Adopting it re-tags this
+        // connection; hold it that long, as an inbound one is held.
+        if (pc.named_other == Instant{}) pc.named_other = now;
+        if (now - pc.named_other >= kIntroWait) pc.dead = true;
+        return;
+    }
+    start_session(pc, now);
 }
 
 void Node::Impl::start_session(PendingConn& pc, Instant now) {

@@ -111,14 +111,19 @@ Node::Config config_for(const LocalServer& srv, bool force_relay = false) {
 // sends whatever bytes it likes, which a Node never would.
 class RawConn {
 public:
-    explicit RawConn(const Endpoint& to) {
-        if (!sock_.open(0) || !sock_.connect(to)) throw std::runtime_error("RawConn: setup failed");
+    // From `from_port` when given: a Node keeps its control connection on its
+    // listening port, and a test standing in for one must do the same.
+    explicit RawConn(const Endpoint& to, uint16_t from_port = 0) {
+        if (!sock_.open(from_port) || !sock_.connect(to)) throw std::runtime_error("RawConn: setup failed");
         const auto deadline = std::chrono::steady_clock::now() + 2s;
         while (sock_.state() == io::TcpSocket::State::Connecting &&
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(2ms);
         }
     }
+
+    // One accepted on a listener of our own.
+    explicit RawConn(io::TcpSocket accepted) : sock_(std::move(accepted)) {}
 
     bool connected() { return sock_.state() == io::TcpSocket::State::Connected; }
 
@@ -719,6 +724,154 @@ TEST(a_connection_that_arrives_before_its_introduction_is_held_for_it) {
         return s.state() == session::TcpSession::State::Established;
     }, 5s));
     CHECK(wait_until([&] { return b.state(*ida) == PeerState::Connected; }, 3s));
+}
+
+namespace {
+
+// A peer scripted byte by byte. It listens -- as a Node does -- on the port its
+// control connection comes from, so the address the server records for it is
+// one a Node's dial actually reaches. It registers until its dev_id falls on
+// the wanted side of `other`'s, which decides who is the Noise initiator.
+struct ScriptedPeer {
+    io::TcpSocket                         listener;
+    std::unique_ptr<RawConn>              ctrl;
+    DevId                                 id{};
+    std::vector<std::unique_ptr<RawConn>> dials;  // every connection the Node made to us
+
+    ScriptedPeer(const LocalServer& srv, const TopicId& topic, const DevId& other, bool want_smaller) {
+        for (int tries = 0; tries < 12; ++tries) {
+            io::TcpSocket l;
+            if (!l.open(0) || !l.listen()) throw std::runtime_error("ScriptedPeer: listen failed");
+            auto c  = std::make_unique<RawConn>(srv.endpoint(), l.local_port());
+            auto me = c->register_in(topic);
+            if (me && (std::memcmp(me->data(), other.data(), kDevIdLen) < 0) == want_smaller) {
+                listener = std::move(l);
+                ctrl     = std::move(c);
+                id       = *me;
+                return;
+            }
+        }
+        throw std::runtime_error("ScriptedPeer: no dev_id on the wanted side");
+    }
+
+    // The Node's first dial to us, once it arrives.
+    RawConn* first_dial(std::chrono::milliseconds t = 3s) {
+        wait_until([&] {
+            while (auto s = listener.accept()) dials.push_back(std::make_unique<RawConn>(std::move(*s)));
+            return !dials.empty();
+        }, t);
+        return dials.empty() ? nullptr : dials.front().get();
+    }
+
+    // CONNECT `to` under attempt `a`, naming no candidates.
+    void introduce(const TopicId& topic, const DevId& to, const session::AttemptNonce& a) {
+        std::vector<uint8_t> intro(topic.begin(), topic.end());
+        intro.insert(intro.end(), a.begin(), a.end());
+        intro.push_back(0);
+        ctl::Connect c;
+        c.from_dev = id;
+        c.to_dev   = to;
+        c.payload  = intro;
+        ctrl->send_raw(ctl::frame(ctl::message(wire::MsgType::Connect, 77, c)));
+    }
+};
+
+// Read from `conn` into `in` until `ready(in)`, or false once it closes.
+template <typename F>
+bool read_until(RawConn& conn, std::vector<uint8_t>& in, F&& ready, std::chrono::milliseconds t = 3s) {
+    return wait_until([&] {
+        auto got = conn.read_some();
+        if (!got) return false;
+        in.insert(in.end(), got->begin(), got->end());
+        return ready(in);
+    }, t);
+}
+
+// Drive `s` over `conn` until it and `done` are both satisfied.
+template <typename F>
+bool handshake_over(RawConn& conn, session::TcpSession& s, F&& done, std::chrono::milliseconds t = 4s) {
+    return wait_until([&] {
+        if (auto got = conn.read_some(); got && !got->empty()) {
+            s.on_bytes(*got, std::chrono::steady_clock::now());
+        }
+        conn.send_raw(s.take_output());
+        return s.state() == session::TcpSession::State::Established && done();
+    }, t);
+}
+
+}  // namespace
+
+TEST(an_initiator_keeps_the_connection_when_introductions_cross) {
+    // #51, the initiator's side. Both ends connect() at once and their dials
+    // meet as ONE connection, which the peer holds as its own dial and greets
+    // with a hello naming its own attempt. The node, the smaller dev_id, must
+    // not drop that connection: the peer adopts our attempt -- the smaller
+    // dev_id's always wins -- and answers message 1 on it.
+    LocalServer srv;
+    Node        na{config_for(srv)};
+    na.run_in_background();
+    const auto creds = TopicCreds::generate_open();
+    Topic&     a     = na.join(creds);
+    REQUIRE(a.publish());
+    ScriptedPeer r{srv, creds.id, *a.self(), /*want_smaller=*/false};
+    REQUIRE(a.resolve(r.id).has_value());  // learn where r is
+
+    a.connect(r.id);
+    RawConn* conn = r.first_dial();
+    REQUIRE(conn != nullptr);
+    session::AttemptNonce theirs{};
+    theirs.fill(0xB1);
+    conn->send_raw(session::TcpSession::hello(theirs));  // r's own dial, as r sees it
+    r.introduce(creds.id, *a.self(), theirs);            // and its crossing introduction
+
+    std::vector<uint8_t> in;
+    REQUIRE(read_until(*conn, in, [](auto& b) { return session::TcpSession::peek_attempt(b).has_value(); }));
+    const auto ours = *session::TcpSession::peek_attempt(in);
+    CHECK(!(ours == theirs));
+    auto s = session::TcpSession::respond({}, creds.id, 0, nullptr, r.id, *a.self(), ours,
+                                          std::chrono::steady_clock::now());
+    s.on_bytes(in, std::chrono::steady_clock::now());
+    CHECK(handshake_over(*conn, s, [&] { return a.state(r.id) == PeerState::Connected; }));
+}
+
+TEST(a_responder_follows_the_initiators_attempt_when_introductions_cross) {
+    // #51, the responder's side. The node, the larger dev_id, dialed under its
+    // own attempt; the peer's message 1 on that same connection names the
+    // peer's. Whether the peer's introduction lands after message 1 or before
+    // it, the node must answer on this connection under the peer's attempt --
+    // not refuse it as another attempt's, nor drop it as stale.
+    for (bool intro_first : {false, true}) {
+        LocalServer srv;
+        Node        nb{config_for(srv)};
+        nb.run_in_background();
+        const auto creds = TopicCreds::generate_open();
+        Topic&     b     = nb.join(creds);
+        REQUIRE(b.publish());
+        ScriptedPeer r{srv, creds.id, *b.self(), /*want_smaller=*/true};
+        REQUIRE(b.resolve(r.id).has_value());
+
+        b.connect(r.id);
+        RawConn* conn = r.first_dial();
+        REQUIRE(conn != nullptr);
+        std::vector<uint8_t> in;
+        REQUIRE(read_until(*conn, in, [](auto& v) { return session::TcpSession::peek_hello(v).has_value(); }));
+        CHECK(in.size() == session::TcpSession::kHelloLen);  // the node's greeting, under its own attempt
+
+        session::AttemptNonce ours{};
+        ours.fill(0xA1);
+        auto s = session::TcpSession::initiate({}, creds.id, 0, nullptr, r.id, *b.self(), ours,
+                                               std::chrono::steady_clock::now());
+        if (intro_first) {
+            r.introduce(creds.id, *b.self(), ours);
+            std::this_thread::sleep_for(300ms);  // adopted, and the node's own attempt retired
+            conn->send_raw(s.take_output());
+        } else {
+            conn->send_raw(s.take_output());
+            std::this_thread::sleep_for(300ms);  // message 1 waits on an attempt not yet heard of
+            r.introduce(creds.id, *b.self(), ours);
+        }
+        CHECK(handshake_over(*conn, s, [&] { return b.state(r.id) == PeerState::Connected; }));
+    }
 }
 
 TEST(a_silent_inbound_connection_does_not_linger_forever) {

@@ -138,12 +138,15 @@ void TcpSession::on_bytes(std::span<const uint8_t> bytes, Instant now) {
 
     while (state_ != State::Closed) {
         if (state_ == State::Handshaking) {
-            // The responder's hello, wherever it lands before message 2. It
-            // must name our attempt; a hello for any other is not our peer.
+            // The responder's hello, wherever it lands before message 2. An
+            // initiator only sees one on a simultaneous open -- the peer
+            // dialed us too -- and it may name the peer's own attempt rather
+            // than ours: their introductions crossed, and the peer will adopt
+            // ours, the smaller dev_id's. So whatever attempt it names, skip
+            // it. It is plaintext and proves nothing; message 2 decides.
             if (initiator_ && !in_.empty() && in_[0] == kHello0) {
                 if (in_.size() < kHelloLen) return;
-                auto named = peek_hello(in_);
-                if (!named || !crypto::ct_equal(*named, attempt_)) {
+                if (!peek_hello(in_)) {
                     fail(CloseCause::Local, now);
                     return;
                 }

@@ -90,6 +90,19 @@ if (_e2e)
                          ENVIRONMENT "${_e2e_env}")
 endif()
 
+# The same exchange as the smoke test, but driven from Python through the C
+# API's shared library: ctypes, topics by id and the event queue, end to end.
+# Needs a Python 3 interpreter rather than bash, and the server executable.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (UCONNECT_BUILD_SERVER AND Python3_Interpreter_FOUND)
+    add_test(NAME uconnect_python_e2e
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/e2e_python.py)
+    set_tests_properties(uconnect_python_e2e PROPERTIES TIMEOUT 90 LABELS "e2e"
+                         ENVIRONMENT "UCONNECT_SERVER=$<TARGET_FILE:uconnect-rendezvous>;UCONNECT_C_LIB=$<TARGET_FILE:uconnect_c>")
+elseif (UCONNECT_BUILD_SERVER)
+    message(STATUS "No Python 3 found: Python end-to-end test not registered")
+endif()
+
 # A megabyte of messages over both paths a peer can take: directly punched,
 # and relayed through the rendezvous server, verifying every byte. Slower than
 # the smoke test above, so it is labelled separately: ctest -L e2e runs both,

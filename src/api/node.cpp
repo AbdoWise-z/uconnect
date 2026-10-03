@@ -2049,7 +2049,10 @@ void Topic::connect_all(size_t max_peers) {
     }
 }
 
-void Node::Impl::disconnect_peer(Topic::Impl&, Peer& peer, uint16_t reason) {
+void Node::Impl::disconnect_peer(Topic::Impl& ti, Peer& peer, uint16_t reason) {
+    const bool was_up = peer.state == PeerState::Connected;
+    const bool live   = was_up || peer.state == PeerState::Probing ||
+                        peer.state == PeerState::Handshaking;
     if (peer.sess) {
         // Queue the notice and get it onto the wire before the socket goes.
         peer.sess->close(reason, now());
@@ -2059,6 +2062,15 @@ void Node::Impl::disconnect_peer(Topic::Impl&, Peer& peer, uint16_t reason) {
         peer.sock.close();
     }
     end_attempt(peer);
+
+    // The caller erases the peer next, so drive_peer never polls the Closed
+    // event the session just queued. Tell the application here instead, as
+    // drive_peer would have.
+    if (peer.dgram) dgram_drop(ti, peer);
+    if (was_up && ti.on_peer_closed) {
+        deferred.push_back([cb = ti.on_peer_closed, dev = peer.dev_id] { cb(dev, PeerGone::Local); });
+    }
+    if (live) set_peer_state(ti, peer, PeerState::Closed);
 }
 
 void Topic::disconnect(const DevId& dev) {

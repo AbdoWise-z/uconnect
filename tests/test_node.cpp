@@ -883,6 +883,54 @@ TEST(datagrams_need_a_connected_peer_and_respect_the_size_limit) {
     CHECK(!p.a->send_datagram(p.idb(), std::vector<uint8_t>(Topic::max_datagram() + 1)));
 }
 
+TEST(a_local_disconnect_reports_the_close_to_the_local_application) {
+    // #47. The peer was erased before its session's Closed event was polled,
+    // so the side that hung up never heard on_peer(Closed), on_peer_closed
+    // (Local) or the end of its datagram channel. Each must arrive exactly
+    // once, on the loop thread, whichever way the local side hangs up.
+    enum class How { Disconnect, DisconnectAll, Shutdown };
+    for (How how : {How::Disconnect, How::DisconnectAll, How::Shutdown}) {
+        LocalServer         srv;
+        std::atomic<int>    gone_local{0}, gone_other{0}, closed_state{0}, dgram_none{0};
+        std::atomic<bool>   off_loop{false};
+        const auto          test_thread = std::this_thread::get_id();
+        DgramPair           p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                                   dgram_config(srv, true, DatagramFallback::Tcp)};
+        REQUIRE(p.connect());
+        REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
+        REQUIRE(p.settled(DatagramPath::Tcp));
+
+        auto note_thread = [&] { if (std::this_thread::get_id() == test_thread) off_loop = true; };
+        p.a->on_peer_closed([&](DevId, PeerGone why) {
+            note_thread();
+            ++(why == PeerGone::Local ? gone_local : gone_other);
+        });
+        p.a->on_peer([&](DevId, PeerState s) {
+            note_thread();
+            if (s == PeerState::Closed) ++closed_state;
+        });
+        p.a->on_datagram_path([&](DevId, DatagramPath dp) {
+            note_thread();
+            if (dp == DatagramPath::None) ++dgram_none;
+        });
+
+        switch (how) {
+            case How::Disconnect:    p.a->disconnect(p.idb()); break;
+            case How::DisconnectAll: p.a->disconnect_all(); break;
+            case How::Shutdown:      p.na.shutdown(); break;
+        }
+        CHECK(wait_until([&] {
+            return gone_local.load() >= 1 && closed_state.load() >= 1 && dgram_none.load() >= 1;
+        }, 3s));
+        std::this_thread::sleep_for(300ms);  // and nothing more after that
+        CHECK_EQ(gone_local.load(), 1);
+        CHECK_EQ(gone_other.load(), 0);
+        CHECK_EQ(closed_state.load(), 1);
+        CHECK_EQ(dgram_none.load(), 1);
+        CHECK(!off_loop.load());
+    }
+}
+
 TEST(a_stranger_probing_the_udp_port_gets_no_answer) {
     // Probes are tagged with the channel's probe key, which only the peer
     // holds: nobody else can make the node reveal it is listening.

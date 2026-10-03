@@ -99,6 +99,12 @@ class Observer:
             raise ObserverError(
                 f"uconn-observe timed out after {self.timeout}s -- is {self.server} reachable?"
             ) from exc
+        except OSError as exc:
+            # Present but not runnable: no execute bit, or not an executable
+            # for this platform. Raised as ObserverError like every other
+            # failure, so the dashboard explains it or serves stale data
+            # rather than answering with a 500.
+            raise ObserverError(f"could not run uconn-observe at {self.binary!r}: {exc}") from exc
 
         # The tool reports failure as JSON on stdout precisely so a dashboard can
         # tell "the server says there is nothing" from "we could not reach it".

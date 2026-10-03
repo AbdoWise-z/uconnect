@@ -32,17 +32,29 @@ def check(cond, what):
         print(f"  FAIL {what}")
 
 
+def executable_for(script: str) -> str:
+    """An executable that runs the Python file `script` with this interpreter.
+
+    A shell script with a shebang on Unix. Windows cannot execute one of those
+    at all, so there it is a .cmd file, which CreateProcess runs through cmd.
+    """
+    if os.name == "nt":
+        fd, path = tempfile.mkstemp(suffix=".cmd")
+        os.write(fd, f'@"{sys.executable}" "{script}" %*\r\n'.encode())
+    else:
+        fd, path = tempfile.mkstemp(suffix=".sh")
+        os.write(fd, f"#!/bin/sh\nexec \"{sys.executable}\" \"{script}\" \"$@\"\n".encode())
+    os.close(fd)
+    os.chmod(path, 0o755)
+    return path
+
+
 def fake_binary(body: str, exit_code: int = 0) -> str:
     """A stand-in for uconn-observe that prints `body` and exits."""
     fd, path = tempfile.mkstemp(suffix=".py")
     os.write(fd, f"import sys\nsys.stdout.write({body!r})\nsys.exit({exit_code})\n".encode())
     os.close(fd)
-
-    fd2, sh = tempfile.mkstemp(suffix=".sh")
-    os.write(fd2, f"#!/bin/sh\nexec {sys.executable} {path} \"$@\"\n".encode())
-    os.close(fd2)
-    os.chmod(sh, 0o755)
-    return sh
+    return executable_for(path)
 
 
 SAMPLE = json.dumps(
@@ -108,12 +120,8 @@ def test_cache_prevents_hammering():
         ).encode(),
     )
     os.close(fd)
-    fd2, sh = tempfile.mkstemp(suffix=".sh")
-    os.write(fd2, f"#!/bin/sh\nexec {sys.executable} {path} \"$@\"\n".encode())
-    os.close(fd2)
-    os.chmod(sh, 0o755)
 
-    o = Observer("x:1", binary=sh, ttl=10.0)
+    o = Observer("x:1", binary=executable_for(path), ttl=10.0)
     for _ in range(5):
         o.overview()
     runs = len(open(counter).read()) if os.path.exists(counter) else 0
@@ -168,6 +176,25 @@ def test_missing_binary_is_explained():
         check("not found" in str(exc).lower(), "says the binary is missing, not 'invalid JSON'")
 
 
+def test_unrunnable_binary_is_explained():
+    # #52. A binary that exists but cannot be executed -- no execute bit on
+    # Linux, not a valid executable on Windows -- raised a bare OSError, which
+    # the dashboard's routes do not catch: a 500 instead of an explanation.
+    print("explains a binary that cannot be run")
+    fd, path = tempfile.mkstemp(suffix=".bin")
+    os.write(fd, b"this is not a program\n")
+    os.close(fd)
+    os.chmod(path, 0o644)
+    o = Observer("x:1", binary=path)
+    try:
+        o.overview()
+        check(False, "should have raised")
+    except ObserverError as exc:
+        check(os.path.basename(path) in str(exc), "names the binary that could not be run")
+    except OSError as exc:
+        check(False, f"leaked a raw {type(exc).__name__}: {exc}")
+
+
 def test_garbage_output_is_explained():
     print("explains unparseable output")
     o = Observer("x:1", binary=fake_binary("this is not json"))
@@ -214,6 +241,7 @@ if __name__ == "__main__":
         test_first_failure_raises,
         test_rejects_bad_topic_ids,
         test_missing_binary_is_explained,
+        test_unrunnable_binary_is_explained,
         test_garbage_output_is_explained,
         test_derived_stats,
         test_deployment_info,

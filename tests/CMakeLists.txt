@@ -12,13 +12,23 @@ add_executable(uconnect_tests
     test_registry.cpp
     test_rendezvous.cpp
     test_tcp_session.cpp
+    test_capi.cpp
+    capi_header.c
     # The server's STUN client is compiled straight in: it lives in the server
     # executable, not a library, and only its pure classification is tested.
     ${CMAKE_SOURCE_DIR}/server/stun.cpp
 )
-target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect uconnect_rendezvous)
+target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect uconnect_rendezvous uconnect_c)
 target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 uconnect_bundle_runtime(uconnect_tests)
+
+# Windows finds a DLL beside the executable, not where it was built.
+if (WIN32)
+    add_custom_command(TARGET uconnect_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:uconnect_c>" "$<TARGET_FILE_DIR:uconnect_tests>"
+        VERBATIM)
+endif()
 add_test(NAME uconnect_tests COMMAND uconnect_tests)
 
 # uconn-observe must report a server it cannot reach as a failure, not as an

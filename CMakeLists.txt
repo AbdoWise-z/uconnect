@@ -15,6 +15,10 @@ option(UCONNECT_BUILD_SERVER "Build the rendezvous server" ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# Every static library ends up inside the shared uconnect_c, and on ELF a
+# shared library cannot link code that was not compiled position-independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if (MSVC)
     add_compile_options(/W4)
 else()
@@ -66,6 +70,7 @@ endfunction()
 #   session    <- wire, crypto          (Noise over TCP and UDP, sans-IO)
 #   io         <- wire                  (the ONLY target that owns a socket)
 #   api        <- all of the above      (Node and Topic; threads and a clock)
+#   capi       <- api                   (the C ABI over it, as a shared library)
 #   store      <- wire, crypto          (server-side registry, sans-IO)
 #   rendezvous <- store, io             (the server's control service and sockets)
 # ---------------------------------------------------------------------------
@@ -77,6 +82,7 @@ add_subdirectory(src/path)
 add_subdirectory(src/session)
 add_subdirectory(src/io)
 add_subdirectory(src/api)
+add_subdirectory(src/capi)
 add_subdirectory(examples)
 add_subdirectory(tools)
 

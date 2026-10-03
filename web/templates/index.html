@@ -23,7 +23,8 @@
       <div class="stat"><div class="n">{{ d.relay_mib }}</div><div class="k">relayed MiB</div></div>
     </div>
     <p class="sub" style="margin-top:.75rem">
-      {{ s.connections }} connections · {{ s.registers }} registers · {{ s.lookups }} lookups ·
+      {{ d.node_connections }} node connection{{ '' if d.node_connections == 1 else 's' }} ·
+      {{ s.registers }} registers · {{ s.lookups }} lookups ·
       {{ s.connects }} introductions · {{ s.expired }} expired
       {%- if d.rejects_total %}
         · rejected: {{ s.rej_quota }} quota, {{ s.rej_rate_limited }} rate

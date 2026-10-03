@@ -16,13 +16,27 @@ exposure visible; it does not create any.
 from __future__ import annotations
 
 import os
+import time
 
 from flask import Flask, jsonify, render_template, request
 
-from observer import (Observer, ObserverError, deployment_info, derived_stats,
+from observer import (Observer, ObserverError, ago, deployment_info, derived_stats,
                       summarise)
 
 app = Flask(__name__)
+app.add_template_filter(ago, "ago")
+
+
+@app.template_filter("clock")
+def clock(epoch: float | None) -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(epoch)) if epoch else "?"
+
+
+@app.context_processor
+def now():
+    # Ages are worked out when the page renders; it reloads every REFRESH
+    # seconds, so they stay right on screen without any script.
+    return {"now": time.time()}
 
 SERVER = os.environ.get("UCONNECT_SERVER", "127.0.0.1:4433")
 TTL = float(os.environ.get("UCONNECT_CACHE_TTL", "5"))
@@ -40,7 +54,8 @@ def index():
         return render_template("index.html", error=str(exc), view=None, server=SERVER,
                                build=deployment_info(), refresh=REFRESH), 503
     return render_template("index.html", view=summarise(data), error=err, stale=stale,
-                           server=SERVER, build=deployment_info(), refresh=REFRESH)
+                           server=SERVER, build=deployment_info(), refresh=REFRESH,
+                           fetched_at=data.get("fetched_at"))
 
 
 @app.route("/topic/<topic_id>")
@@ -51,7 +66,8 @@ def topic(topic_id: str):
         return render_template("topic.html", error=str(exc), topic=None, server=SERVER,
                                build=deployment_info(), refresh=REFRESH), 400
     return render_template("topic.html", topic=data.get("topic"), error=err, stale=stale,
-                           server=SERVER, build=deployment_info(), refresh=REFRESH)
+                           server=SERVER, build=deployment_info(), refresh=REFRESH,
+                           fetched_at=data.get("fetched_at"))
 
 
 # --- JSON API ---------------------------------------------------------------

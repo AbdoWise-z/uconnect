@@ -26,7 +26,22 @@ __all__ = [
     "summarise",
     "derived_stats",
     "deployment_info",
+    "ago",
 ]
+
+
+def ago(seconds: float | None) -> str:
+    """'just now', '42s ago', '7 min ago', '3 h ago'."""
+    if seconds is None:
+        return "?"
+    s = max(0, int(seconds))
+    if s < 2:
+        return "just now"
+    if s < 120:
+        return f"{s}s ago"
+    if s < 7200:
+        return f"{s // 60} min ago"
+    return f"{s // 3600} h ago"
 
 
 class ObserverError(RuntimeError):
@@ -78,7 +93,8 @@ class Observer:
         self.limit = limit
 
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, Any]] = {}
+        # key -> (monotonic time, wall time, data) of the last good answer
+        self._cache: dict[str, tuple[float, float, Any]] = {}
 
     # --- process plumbing --------------------------------------------------
     def _run(self, args: list[str]) -> dict:
@@ -130,12 +146,16 @@ class Observer:
         blanking the page. A rendezvous server restarting, or one lookup hitting
         the rate limiter, should not wipe a dashboard that was correct a moment
         ago -- but it must be visibly old rather than quietly wrong.
+
+        The data carries `fetched_at`, the wall-clock time the server answered,
+        so a page can say how old it is: a quiet server and a dashboard that
+        has stopped updating otherwise look exactly alike.
         """
         now = time.monotonic()
         with self._lock:
             hit = self._cache.get(key)
             if hit and now - hit[0] < self.ttl:
-                return hit[1], False, None
+                return {**hit[2], "fetched_at": hit[1]}, False, None
 
         try:
             data = self._run(args)
@@ -143,12 +163,13 @@ class Observer:
             with self._lock:
                 hit = self._cache.get(key)
             if hit:
-                return hit[1], True, str(exc)
+                return {**hit[2], "fetched_at": hit[1]}, True, str(exc)
             raise
 
+        wall = time.time()
         with self._lock:
-            self._cache[key] = (now, data)
-        return data, False, None
+            self._cache[key] = (now, wall, data)
+        return {**data, "fetched_at": wall}, False, None
 
     # --- public API --------------------------------------------------------
     def overview(self, members: bool = True) -> tuple[dict, bool, str | None]:
@@ -170,14 +191,22 @@ class Observer:
 
 
 def deployment_info(sha_path: str | None = None) -> dict:
-    """What commit the running deployment was built from.
+    """What commit the running deployment was built from, and how the newest
+    deploy attempt went.
 
     The watcher writes the sha only after the build passed its tests and the
     service came up, so this is the commit actually serving, not merely the
     newest one pushed. That distinction is the entire reason to show it.
+
+    `attempt` is the watcher's deploy.status beside it -- building, testing,
+    failed (with why) or deployed -- or None. Without it a commit the watcher
+    refused looks exactly like no new commit at all, since the sha above just
+    stays where it was.
     """
     sha_path = sha_path or os.environ.get("UCONNECT_SHA_FILE", "/opt/uconnect/deployed.sha")
-    info: dict[str, Any] = {"sha": None, "short": None, "subject": None, "url": None}
+    info: dict[str, Any] = {"sha": None, "short": None, "subject": None, "url": None,
+                            "attempt": None}
+    folder = os.path.dirname(sha_path)
     try:
         with open(sha_path) as fh:
             sha = fh.read().strip()
@@ -187,17 +216,32 @@ def deployment_info(sha_path: str | None = None) -> dict:
             info["url"] = f"https://github.com/AbdoWise-z/uconnect/commit/{sha}"
             info["age_s"] = int(time.time() - os.path.getmtime(sha_path))
     except OSError:
-        return info
+        pass
 
     # Written by the watcher next to the sha. Deliberately not a git call: this
     # process runs as its own unprivileged user and the source tree is
     # root-owned, so git trips the dubious-ownership guard and returns nothing
     # -- indistinguishable, from here, from a commit with no subject.
+    if info["sha"]:
+        try:
+            with open(os.path.join(folder, "deployed.subject")) as fh:
+                info["subject"] = fh.read().strip() or None
+        except OSError:
+            pass
+
     try:
-        with open(os.path.join(os.path.dirname(sha_path), "deployed.subject")) as fh:
-            info["subject"] = fh.read().strip() or None
-    except OSError:
-        pass
+        with open(os.path.join(folder, "deploy.status")) as fh:
+            st = json.load(fh)
+        sha = str(st.get("sha") or "")
+        info["attempt"] = {
+            "sha": sha or None,
+            "short": sha[:7] or None,
+            "state": st.get("state"),
+            "detail": st.get("detail") or None,
+            "age_s": max(0, int(time.time() - float(st["time"]))) if st.get("time") else None,
+        }
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # absent (an older watcher) or unreadable: no attempt to report
     return info
 
 
@@ -215,6 +259,10 @@ def derived_stats(data: dict) -> dict:
     rejects = s.get("rej_quota", 0) + s.get("rej_rate_limited", 0)
 
     return {
+        # The server counts every open control connection, and the one that
+        # asked for these numbers is uconn-observe's own. An idle server
+        # reported "1 connection" -- this dashboard.
+        "node_connections": max(0, s.get("connections", 0) - 1) if s else 0,
         "listed_peers": peers,
         "listed_fresh": fresh,
         "keyed_topics": keyed,

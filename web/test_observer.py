@@ -228,8 +228,91 @@ def test_deployment_info():
     i = deployment_info(os.path.join(d, "deployed.sha"))
     check(i["short"] == "abc123d", "shortens the sha")
     check(i["subject"] == "a commit subject", "reads the subject without running git")
+    check(i["attempt"] is None, "no deploy.status: no attempt to report")
     check(deployment_info("/nonexistent/x")["short"] is None,
           "a missing file is not an error")
+
+
+def test_deploy_attempt():
+    # A commit the watcher refused is never retried, so the deployed sha just
+    # stays put: without the watcher's deploy.status, a failed deploy looked
+    # exactly like no new commit.
+    print("reports the newest deploy attempt")
+    from observer import deployment_info
+    d = tempfile.mkdtemp()
+    sha_file = os.path.join(d, "deployed.sha")
+    status = os.path.join(d, "deploy.status")
+    with open(sha_file, "w") as fh:
+        fh.write("abc123def4567890\n")
+
+    with open(status, "w") as fh:
+        json.dump({"sha": "fedcba9876543210", "state": "failed", "detail": "tests failed",
+                   "time": time.time() - 90}, fh)
+    a = deployment_info(sha_file)["attempt"]
+    check(a["short"] == "fedcba9" and a["state"] == "failed", "reads a refused commit")
+    check(a["detail"] == "tests failed", "and why it was refused")
+    check(85 <= a["age_s"] <= 95, f"and how long ago ({a['age_s']}s)")
+
+    with open(status, "w") as fh:
+        json.dump({"sha": "fedcba9876543210", "state": "testing",
+                   "detail": "running the test suite", "time": time.time()}, fh)
+    check(deployment_info(sha_file)["attempt"]["state"] == "testing", "reads one in progress")
+
+    for broken in ("not json", "[1, 2]", '{"state": "failed", "time": "soon"}'):
+        with open(status, "w") as fh:
+            fh.write(broken)
+        try:
+            info = deployment_info(sha_file)
+            check(info["attempt"] is None and info["short"] == "abc123d",
+                  f"ignores a broken status file {broken[:14]!r}")
+        except Exception as exc:  # noqa: BLE001 -- any exception is the failure
+            check(False, f"a broken status file raised {type(exc).__name__}")
+
+    # A first deploy that failed: there is no deployed.sha yet, but there is
+    # an attempt to report.
+    d2 = tempfile.mkdtemp()
+    with open(os.path.join(d2, "deploy.status"), "w") as fh:
+        json.dump({"sha": "0123456789abcdef", "state": "failed", "detail": "build failed",
+                   "time": time.time()}, fh)
+    i = deployment_info(os.path.join(d2, "deployed.sha"))
+    check(i["short"] is None and i["attempt"]["state"] == "failed",
+          "reports a failed first deploy, with nothing deployed")
+
+
+def test_reports_when_data_was_fetched():
+    # A quiet server and a dashboard that has stopped updating look the same
+    # unless the page says how old its numbers are.
+    print("says when the data was fetched")
+    o = Observer("x:1", binary=fake_binary(SAMPLE), ttl=10.0)
+    before = time.time()
+    data, _, _ = o.overview()
+    check(before - 1 <= data.get("fetched_at", 0) <= time.time() + 1, "stamps a fresh answer")
+    again, _, _ = o.overview()
+    check(again["fetched_at"] == data["fetched_at"], "a cached answer keeps its original time")
+
+    o.ttl = 0.0
+    o.binary = fake_binary(json.dumps({"ok": False, "error": "server unreachable"}))
+    stale, is_stale, _ = o.overview()
+    check(is_stale and stale["fetched_at"] == data["fetched_at"],
+          "stale data keeps the time it was really fetched")
+
+
+def test_node_connections_exclude_the_observer():
+    print("does not count its own connection as a node")
+    from observer import derived_stats
+    d = derived_stats({"stats": {"connections": 3}, "topics": []})
+    check(d["node_connections"] == 2, "three connections, one of them ours: two nodes")
+    check(derived_stats({"stats": {"connections": 1}, "topics": []})["node_connections"] == 0,
+          "an idle server has no node connections")
+    check(derived_stats({"topics": []})["node_connections"] == 0, "no stats: zero, not -1")
+
+
+def test_ago():
+    print("words an age")
+    from observer import ago
+    check(ago(0) == "just now" and ago(None) == "?", "edges")
+    check(ago(42) == "42s ago" and ago(600) == "10 min ago" and ago(10800) == "3 h ago",
+          "seconds, minutes, hours")
 
 
 if __name__ == "__main__":
@@ -245,6 +328,10 @@ if __name__ == "__main__":
         test_garbage_output_is_explained,
         test_derived_stats,
         test_deployment_info,
+        test_deploy_attempt,
+        test_reports_when_data_was_fetched,
+        test_node_connections_exclude_the_observer,
+        test_ago,
     ]:
         fn()
     print()

@@ -82,7 +82,27 @@
       <a href="{{ build.url }}" title="{{ build.subject or build.sha }}"><code>{{ build.short }}</code></a>
       {%- if build.subject %}<span style="color:var(--dim)"> — {{ build.subject[:56] }}</span>{% endif %}
     {% endif %}
+    {# How old the numbers are. A quiet server and a dashboard that stopped
+       updating look the same without it. #}
+    {% if fetched_at|default(none) %}
+      &nbsp;·&nbsp; data from {{ fetched_at|clock }} UTC ({{ (now - fetched_at)|ago }})
+    {% endif %}
   </p>
+
+  {# The newest deploy attempt, when it is not simply the commit running: one
+     in progress, or one the watcher refused -- which it never retries, so the
+     header above would otherwise just go on naming the old commit. #}
+  {% set _att = build.attempt if build else none %}
+  {% if _att and _att.state in ('building', 'testing') %}
+    <div class="banner warn">
+      Deploying <code>{{ _att.short }}</code>: {{ _att.detail or _att.state }}, started {{ _att.age_s|ago }}.
+    </div>
+  {% elif _att and _att.state == 'failed' %}
+    <div class="banner bad">
+      Commit <code>{{ _att.short }}</code> was not deployed: {{ _att.detail or 'failed' }}
+      ({{ _att.age_s|ago }}). Still serving <code>{{ build.short or 'nothing recorded' }}</code>.
+    </div>
+  {% endif %}
 
   {# default(): pages that have no notion of staleness must not have to pass
      these just to satisfy the shared chrome. #}

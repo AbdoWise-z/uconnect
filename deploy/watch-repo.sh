@@ -192,6 +192,19 @@ import observer, app          # noqa
 }
 
 # ---------------------------------------------------------------------------
+# The newest deploy attempt, for the dashboard: building, testing, failed (with
+# why) or deployed. deployed.sha alone cannot say that a newer commit was
+# refused -- and a refused commit is never tried again, since the tree already
+# matches the remote -- so a failed deploy used to look exactly like no news.
+# Written whole and renamed into place, so a reader never sees half of it.
+deploy_status() {  # sha state detail -- detail must not contain a double quote
+    local f="$WORKDIR/deploy.status"
+    printf '{"sha":"%s","state":"%s","detail":"%s","time":%s}\n' \
+        "$1" "$2" "$3" "$(date +%s)" > "$f.new" 2>/dev/null &&
+        chmod 0644 "$f.new" 2>/dev/null &&
+        mv -f "$f.new" "$f" 2>/dev/null || true
+}
+
 check_once() {
     local src="$WORKDIR/src"
 
@@ -241,14 +254,15 @@ check_once() {
     fi
 
     git fetch --depth 50 origin "$BRANCH" >/dev/null 2>&1 || {
-        log "ERROR: fetch failed"; return 1; }
+        log "ERROR: fetch failed"; deploy_status "$remote_sha" failed "fetch failed"; return 1; }
     git reset --hard "origin/$BRANCH" >/dev/null 2>&1 || {
-        log "ERROR: reset failed"; return 1; }
+        log "ERROR: reset failed"; deploy_status "$remote_sha" failed "reset failed"; return 1; }
     git clean -fd >/dev/null 2>&1
 
     local subject
     subject="$(git log -1 --pretty=%s)"
     log "building ${remote_sha:0:8}: $subject"
+    deploy_status "$remote_sha" building "building"
 
     # Update this script from the commit being deployed. Without it the watcher
     # runs forever with whatever logic install-watcher.sh happened to lay down,
@@ -276,18 +290,22 @@ check_once() {
     if ! cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release \
                -DUCONNECT_BUILD_TESTS=ON > "$WORKDIR/last-build.log" 2>&1; then
         log "ERROR: cmake configure failed -- see $WORKDIR/last-build.log"
+        deploy_status "$remote_sha" failed "cmake configure failed"
         return 1
     fi
     if ! make -C "$build" -j"$(nproc)" >> "$WORKDIR/last-build.log" 2>&1; then
         log "ERROR: build failed -- see $WORKDIR/last-build.log"
+        deploy_status "$remote_sha" failed "build failed"
         return 1
     fi
 
     # Gate on the test suite. The RFC crypto vectors in particular are the only
     # thing distinguishing a correct build from one that merely compiles.
     log "running tests"
+    deploy_status "$remote_sha" testing "running the test suite"
     if ! "$build/tests/uconnect_tests" > "$WORKDIR/last-test.log" 2>&1; then
         log "ERROR: TESTS FAILED -- refusing to deploy ${remote_sha:0:8}"
+        deploy_status "$remote_sha" failed "tests failed"
         tail -5 "$WORKDIR/last-test.log" | sed 's/^/    /'
         return 1
     fi
@@ -299,7 +317,7 @@ check_once() {
     fi
 
     install -m 0755 "$build/server/uconnect-rendezvous" "$BINARY" || {
-        log "ERROR: install failed"; return 1; }
+        log "ERROR: install failed"; deploy_status "$remote_sha" failed "install failed"; return 1; }
 
     log "restarting $SERVICE"
     systemctl restart "$SERVICE"
@@ -321,6 +339,7 @@ check_once() {
         else
             log "CRITICAL: no previous binary to roll back to"
         fi
+        deploy_status "$remote_sha" failed "the server did not start; rolled back"
         return 1
     fi
 
@@ -332,6 +351,7 @@ check_once() {
     printf '%s\n' "$subject" > "$WORKDIR/deployed.subject"
     chmod 0644 "$WORKDIR/deployed.sha" "$WORKDIR/deployed.subject" 2>/dev/null || true
     log "deployed ${remote_sha:0:8} successfully"
+    deploy_status "$remote_sha" deployed ""
 
     # Only now, with the server confirmed up. The result is ignored on purpose:
     # the dashboard is an accessory and must not be able to fail this deploy.

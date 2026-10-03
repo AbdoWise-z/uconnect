@@ -49,6 +49,19 @@ banner rather than blanking the page — a server restart or one throttled looku
 should not wipe a view that was correct a moment ago, but it must be obviously
 old rather than quietly wrong.
 
+Every page says when its data was fetched ("data from 12:04:31 UTC (3s ago)"),
+and the JSON carries it as `fetched_at`. A quiet server and a dashboard that
+has stopped updating otherwise look exactly alike. Expect a change on the
+server to show within the cache TTL plus the page refresh — 20 seconds at the
+defaults.
+
+The connection count excludes the dashboard's own: `uconn-observe` holds a
+control connection while it asks, so an idle server would otherwise report one.
+
+The dashboard watches one server, `UCONNECT_SERVER`, and nothing else. The
+test suite and `uconn-bench` run servers of their own and never appear on it;
+`uconn-bench --server host:port` runs against one you are watching.
+
 ## What it can and cannot see
 
 Everything shown is **already public to anyone who can reach the server**:
@@ -169,6 +182,13 @@ installer and the watcher build a real one and print the actual error.
 Every page header shows the deployed commit. The watcher writes that sha only
 after the build passed its tests and the service came up, so it names the
 commit actually serving rather than the newest one pushed.
+
+It also records its newest attempt in `deploy.status` beside the sha —
+building, testing, failed with the reason, or deployed — and the pages show a
+banner while a deploy is in progress or when one was refused. A refused commit
+is not retried (the watcher's tree already matches the remote), so without the
+banner a failed deploy looked exactly like no new commit. `/api/build` returns
+it as `attempt`.
 
 ## Tests
 

@@ -484,6 +484,39 @@ TEST(connect_needs_a_published_topic) {
     CHECK(p.a->state(*p.b->self()) == PeerState::Unknown);
 }
 
+TEST(a_resolved_peer_can_be_connected_without_a_lookup) {
+    // #46. resolve() returned the peer but threw its candidates away, so
+    // connect() had nowhere to dial until some peers() sample happened to
+    // include it -- in a large swarm, possibly never.
+    LocalServer srv;
+    Pair        p{srv, /*force_relay=*/false};
+    REQUIRE(p.publish());
+    REQUIRE(p.a->resolve(p.idb()).has_value());
+    p.a->connect(p.idb());
+    CHECK(p.a->state(p.idb()) != PeerState::Unknown);
+    CHECK(wait_until([&] {
+        return p.a->state(p.idb()) == PeerState::Connected &&
+               p.b->state(p.ida()) == PeerState::Connected;
+    }, 15s));
+}
+
+TEST(resolve_answers_only_for_members_of_its_own_topic) {
+    // A dev_id registered in another topic is not a peer of this one: it must
+    // not be reported as found, nor remembered as somewhere to dial.
+    LocalServer srv;
+    Pair        p{srv, /*force_relay=*/false};
+    Node        nc{config_for(srv)};
+    nc.run_in_background();
+    Topic& c = nc.join(TopicCreds::generate_keyed());
+    REQUIRE(p.publish());
+    REQUIRE(c.publish());
+    const DevId idc = *c.self();
+
+    CHECK(!p.a->resolve(idc).has_value());
+    p.a->connect(idc);
+    CHECK(p.a->state(idc) == PeerState::Unknown);
+}
+
 TEST(auto_connect_finds_and_connects_peers_on_its_own) {
     LocalServer srv;
     Pair        p{srv, /*force_relay=*/false};

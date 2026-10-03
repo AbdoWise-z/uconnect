@@ -2015,7 +2015,15 @@ std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::millisecon
         wire::Reader r{it->second.reply};
         std::optional<wire::ResolveOk> ok;
         if (wire::Header::decode(r, ctl::kVersion)) ok = wire::ResolveOk::decode(r);
-        if (ok && ok->found) {
+        // A record in some other topic is not a peer of this one. Ours is
+        // remembered as somewhere to dial, as peers() does, so connect()
+        // works on a resolved peer without a LOOKUP happening to sample it.
+        if (ok && ok->found && ok->topic == impl_->creds.id) {
+            if (!impl_->self || ok->entry.dev_id != *impl_->self) {  // never dial ourselves
+                auto& peer  = impl_->peers[ok->entry.dev_id];
+                peer.dev_id = ok->entry.dev_id;
+                peer.cands  = ok->entry.cands;
+            }
             out = PeerInfo{ok->entry.dev_id, std::chrono::seconds(ok->entry.age_secs),
                            ok->entry.stale, ok->entry.meta};
         }

@@ -1956,7 +1956,10 @@ void Node::Impl::drive_dgram(Topic::Impl& ti, const TopicId& tid, Peer& peer, In
 
     // The channel itself.
     if (!d.sess) return;
-    if (d.path == DatagramPath::Direct || d.path == DatagramPath::Relayed) d.sess->on_timeout(now);
+    // A receive-side UDP path still needs keepalives when our application sends
+    // over TCP (or has no fallback). These empty packets maintain the peer's
+    // liveness and our NAT binding without changing the application's path.
+    if (d.remote && d.sess->path().port != 0) d.sess->on_timeout(now);
     while (auto e = d.sess->poll_event()) {
         switch (e->kind) {
             case session::SessionEvent::Kind::Data:
@@ -2246,10 +2249,7 @@ bool Topic::open_datagrams(const DevId& dev, DatagramFallback fb) {
         return false;
     }
     Peer& peer = it->second;
-    if (peer.dgram && peer.dgram->path != DatagramPath::Failed) {
-        peer.dgram->fallback = fb;  // already open, or opening: just the policy
-        return true;
-    }
+    if (peer.dgram && peer.dgram->path != DatagramPath::Failed) return false;
     if (peer.dgram_epoch == UINT32_MAX) return false;
     return n.dgram_open(*impl_, peer, peer.dgram_epoch + 1, fb, n.now());
 }

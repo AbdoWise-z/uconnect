@@ -230,7 +230,10 @@ public:
     // Open a datagram channel to a connected peer. Asynchronous: watch
     // datagram_path() or on_datagram_path() for it to leave Opening. The peer
     // accepts automatically, applying its own Node::Config::datagram_fallback
-    // to its sending side. False if the peer is not connected.
+    // to its sending side. The fallback is fixed for this channel's lifetime.
+    // False if the peer is not connected or a channel is already opening or
+    // open (including one accepted from the peer). To change the policy, call
+    // close_datagrams() first. A Failed channel can be retried directly.
     bool open_datagrams(const DevId&, DatagramFallback = DatagramFallback::Tcp);
     void close_datagrams(const DevId&);
     DatagramPath datagram_path(const DevId&) const;

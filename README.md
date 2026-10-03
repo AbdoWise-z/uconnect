@@ -199,6 +199,12 @@ the TCP connection's handshake, so it authenticates the same peer and needs no
 handshake of its own; opening it only punches a UDP path. The peer accepts
 automatically.
 
+The fallback policy is fixed when the channel opens. `open_datagrams()` returns
+false if a channel is already opening or open, including one accepted from a
+peer. Call `close_datagrams()` before reopening with a different policy; a
+`Failed` channel can be retried directly. Closing the datagram channel keeps
+the peer's TCP connection up.
+
 When UDP cannot be punched, **you choose what happens**, and each side applies
 its own choice to what it sends:
 
@@ -548,6 +554,10 @@ If punching fails, the fallback applies. For `Relay`, a UDP relay binding is
 allocated like the TCP one, each side binds its UDP address to it with its
 token, and datagrams travel wrapped in `RelayData` — still sealed end to end.
 A late punch always wins over the relay or TCP.
+
+When only one peer sends application datagrams through the UDP relay, the other
+still sends encrypted UDP keepalives to maintain that incoming path. Its own
+application datagrams continue to follow its selected TCP or None policy.
 
 ### Replay window and key generations
 

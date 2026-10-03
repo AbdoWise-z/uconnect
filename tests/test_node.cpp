@@ -1207,6 +1207,41 @@ TEST(datagrams_negotiate_different_rekey_settings_before_traffic) {
     CHECK(wait_until([&] { return p.count_a() >= 380 && p.count_b() >= 380; }, 3s));
 }
 
+TEST(datagrams_with_mixed_fallbacks_survive_the_udp_idle_timeout) {
+    LocalServer srv;
+    DgramPair tcp{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                      dgram_config(srv, true, DatagramFallback::Relay)};
+    DgramPair none{srv, dgram_config(srv, true, DatagramFallback::None),
+                       dgram_config(srv, true, DatagramFallback::Relay)};
+    REQUIRE(tcp.connect());
+    REQUIRE(none.connect());
+    const auto ta = tcp.ida(), tb = tcp.idb(), na = none.ida(), nb = none.idb();
+    REQUIRE(tcp.a->open_datagrams(tb, DatagramFallback::Tcp));
+    REQUIRE(none.a->open_datagrams(nb, DatagramFallback::None));
+    auto paths_preserved = [&] {
+        return tcp.a->datagram_path(tb) == DatagramPath::Tcp &&
+               tcp.b->datagram_path(ta) == DatagramPath::Relayed &&
+               none.a->datagram_path(nb) == DatagramPath::Failed &&
+               none.b->datagram_path(na) == DatagramPath::Relayed;
+    };
+    REQUIRE(wait_until(paths_preserved, 8s));
+    // Exercise real Node timers and relay/NAT keepalives beyond the 90-second
+    // idle timeout. No application traffic should be needed to keep them up.
+    for (int i = 0; i < 19; ++i) {
+        std::this_thread::sleep_for(5s);
+        REQUIRE(paths_preserved());
+    }
+    CHECK(tcp.count_a() == 0 && tcp.count_b() == 0);
+    CHECK(none.count_a() == 0 && none.count_b() == 0); // keepalives stay internal
+    CHECK(tcp.a->send_datagram(tb, bytes("tcp")));
+    CHECK(tcp.b->send_datagram(ta, bytes("relay")));
+    CHECK(none.b->send_datagram(na, bytes("receive only")));
+    CHECK(!none.a->send_datagram(nb, bytes("no fallback")));
+    CHECK(wait_until([&] {
+        return tcp.count_a() == 1 && tcp.count_b() == 1 && none.count_a() == 1;
+    }, 3s));
+}
+
 TEST(datagrams_fall_back_over_tcp_when_udp_cannot_be_punched) {
     LocalServer srv;
     DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
@@ -1220,6 +1255,44 @@ TEST(datagrams_fall_back_over_tcp_when_udp_cannot_be_punched) {
     CHECK(wait_until([&] { return p.count_a() == 1 && p.count_b() == 1; }, 3s));
     std::lock_guard<std::mutex> lk(p.mu);
     CHECK(p.at_b.front() == "over tcp");
+}
+
+TEST(datagram_policy_is_fixed_until_close_or_failure) {
+    LocalServer srv;
+    std::atomic<int> opening_calls{0};
+    std::atomic<bool> reopened_while_opening{false};
+    DgramPair p{srv, dgram_config(srv, true, DatagramFallback::Tcp),
+                    dgram_config(srv, true, DatagramFallback::Tcp)};
+    REQUIRE(p.connect());
+    const auto ida = p.ida(), idb = p.idb();
+    p.a->on_datagram_path([&](DevId dev, DatagramPath path) {
+        if (path != DatagramPath::Opening || opening_calls.load() != 0) return;
+        // Even an identical policy must be rejected while opening.
+        const bool same = p.a->open_datagrams(dev, DatagramFallback::Tcp);
+        const bool changed = p.a->open_datagrams(dev, DatagramFallback::None);
+        reopened_while_opening = same || changed;
+        ++opening_calls;
+    });
+    REQUIRE(p.a->open_datagrams(idb, DatagramFallback::Tcp));
+    REQUIRE(wait_until([&] { return opening_calls.load() == 1; }, 2s));
+    CHECK(!reopened_while_opening.load());
+    REQUIRE(p.settled(DatagramPath::Tcp));
+    CHECK(!p.a->open_datagrams(idb, DatagramFallback::Tcp));
+    CHECK(!p.a->open_datagrams(idb, DatagramFallback::None));
+    // A channel accepted automatically is already open as well.
+    CHECK(!p.b->open_datagrams(ida, DatagramFallback::Relay));
+    CHECK(p.a->send_datagram(idb, bytes("original policy")));
+    CHECK(wait_until([&] { return p.count_b() == 1; }, 2s));
+
+    p.a->close_datagrams(idb);
+    REQUIRE(p.settled(DatagramPath::None, 3s));
+    REQUIRE(p.a->open_datagrams(idb, DatagramFallback::None));
+    REQUIRE(wait_until([&] { return p.a->datagram_path(idb) == DatagramPath::Failed; }, 3s));
+    // Failure permits a fresh attempt with a different policy and fresh keys.
+    REQUIRE(p.a->open_datagrams(idb, DatagramFallback::Tcp));
+    REQUIRE(p.settled(DatagramPath::Tcp));
+    CHECK(p.a->send_datagram(idb, bytes("new channel")));
+    CHECK(wait_until([&] { return p.count_b() == 2; }, 2s));
 }
 
 TEST(datagrams_fall_back_to_the_udp_relay_when_asked_to) {

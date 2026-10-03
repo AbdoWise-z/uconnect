@@ -728,10 +728,26 @@ TEST(a_connection_that_arrives_before_its_introduction_is_held_for_it) {
 
 namespace {
 
+// A topic `n` has joined and published, chosen so that n's dev_id lies in the
+// lower half of the id space (the upper, with low=false). A ScriptedPeer that
+// wants the other side of it then lands there on each try with odds of at
+// least one half. Left to chance, a dev_id near either end of the space leaves
+// it almost none: its twelve tries ran out about one run in fifteen.
+Topic* join_in_half(Node& n, bool low) {
+    for (int tries = 0; tries < 32; ++tries) {
+        const auto creds = TopicCreds::generate_open();  // a new topic, so a new dev_id
+        Topic&     t     = n.join(creds);
+        if (t.publish() && t.self() && (((*t.self())[0] & 0x80) == 0) == low) return &t;
+        n.leave(creds.id);
+    }
+    return nullptr;
+}
+
 // A peer scripted byte by byte. It listens -- as a Node does -- on the port its
 // control connection comes from, so the address the server records for it is
 // one a Node's dial actually reaches. It registers until its dev_id falls on
-// the wanted side of `other`'s, which decides who is the Noise initiator.
+// the wanted side of `other`'s, which decides who is the Noise initiator;
+// ok() is false if it never did.
 struct ScriptedPeer {
     io::TcpSocket                         listener;
     std::unique_ptr<RawConn>              ctrl;
@@ -751,8 +767,9 @@ struct ScriptedPeer {
                 return;
             }
         }
-        throw std::runtime_error("ScriptedPeer: no dev_id on the wanted side");
     }
+
+    bool ok() const { return ctrl != nullptr; }
 
     // The Node's first dial to us, once it arrives.
     RawConn* first_dial(std::chrono::milliseconds t = 3s) {
@@ -810,10 +827,12 @@ TEST(an_initiator_keeps_the_connection_when_introductions_cross) {
     LocalServer srv;
     Node        na{config_for(srv)};
     na.run_in_background();
-    const auto creds = TopicCreds::generate_open();
-    Topic&     a     = na.join(creds);
-    REQUIRE(a.publish());
-    ScriptedPeer r{srv, creds.id, *a.self(), /*want_smaller=*/false};
+    Topic* pa = join_in_half(na, /*low=*/true);
+    REQUIRE(pa != nullptr);
+    Topic&        a     = *pa;
+    const TopicId topic = a.id();
+    ScriptedPeer  r{srv, topic, *a.self(), /*want_smaller=*/false};
+    REQUIRE(r.ok());
     REQUIRE(a.resolve(r.id).has_value());  // learn where r is
 
     a.connect(r.id);
@@ -822,13 +841,13 @@ TEST(an_initiator_keeps_the_connection_when_introductions_cross) {
     session::AttemptNonce theirs{};
     theirs.fill(0xB1);
     conn->send_raw(session::TcpSession::hello(theirs));  // r's own dial, as r sees it
-    r.introduce(creds.id, *a.self(), theirs);            // and its crossing introduction
+    r.introduce(topic, *a.self(), theirs);               // and its crossing introduction
 
     std::vector<uint8_t> in;
     REQUIRE(read_until(*conn, in, [](auto& b) { return session::TcpSession::peek_attempt(b).has_value(); }));
     const auto ours = *session::TcpSession::peek_attempt(in);
     CHECK(!(ours == theirs));
-    auto s = session::TcpSession::respond({}, creds.id, 0, nullptr, r.id, *a.self(), ours,
+    auto s = session::TcpSession::respond({}, topic, 0, nullptr, r.id, *a.self(), ours,
                                           std::chrono::steady_clock::now());
     s.on_bytes(in, std::chrono::steady_clock::now());
     CHECK(handshake_over(*conn, s, [&] { return a.state(r.id) == PeerState::Connected; }));
@@ -844,10 +863,12 @@ TEST(a_responder_follows_the_initiators_attempt_when_introductions_cross) {
         LocalServer srv;
         Node        nb{config_for(srv)};
         nb.run_in_background();
-        const auto creds = TopicCreds::generate_open();
-        Topic&     b     = nb.join(creds);
-        REQUIRE(b.publish());
-        ScriptedPeer r{srv, creds.id, *b.self(), /*want_smaller=*/true};
+        Topic* pb = join_in_half(nb, /*low=*/false);
+        REQUIRE(pb != nullptr);
+        Topic&        b     = *pb;
+        const TopicId topic = b.id();
+        ScriptedPeer  r{srv, topic, *b.self(), /*want_smaller=*/true};
+        REQUIRE(r.ok());
         REQUIRE(b.resolve(r.id).has_value());
 
         b.connect(r.id);
@@ -859,16 +880,16 @@ TEST(a_responder_follows_the_initiators_attempt_when_introductions_cross) {
 
         session::AttemptNonce ours{};
         ours.fill(0xA1);
-        auto s = session::TcpSession::initiate({}, creds.id, 0, nullptr, r.id, *b.self(), ours,
+        auto s = session::TcpSession::initiate({}, topic, 0, nullptr, r.id, *b.self(), ours,
                                                std::chrono::steady_clock::now());
         if (intro_first) {
-            r.introduce(creds.id, *b.self(), ours);
+            r.introduce(topic, *b.self(), ours);
             std::this_thread::sleep_for(300ms);  // adopted, and the node's own attempt retired
             conn->send_raw(s.take_output());
         } else {
             conn->send_raw(s.take_output());
             std::this_thread::sleep_for(300ms);  // message 1 waits on an attempt not yet heard of
-            r.introduce(creds.id, *b.self(), ours);
+            r.introduce(topic, *b.self(), ours);
         }
         CHECK(handshake_over(*conn, s, [&] { return b.state(r.id) == PeerState::Connected; }));
     }

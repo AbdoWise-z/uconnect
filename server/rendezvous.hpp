@@ -23,6 +23,9 @@
 
 namespace uconnect::server {
 
+// The largest UDP datagram the server reads whole; anything longer is cut.
+inline constexpr size_t kMaxUdpDatagram = 2048;
+
 struct RendezvousConfig {
     uint16_t    port = 4433;  // 0 = ephemeral; TCP and UDP get the same number
     std::string bind_host;    // UDP only; empty = all interfaces. TCP listens on all.

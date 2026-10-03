@@ -14,12 +14,15 @@ add_executable(uconnect_tests
     test_tcp_session.cpp
     test_capi.cpp
     capi_header.c
+    test_server_config.cpp
     # The server's STUN client is compiled straight in: it lives in the server
     # executable, not a library, and only its pure classification is tested.
     ${CMAKE_SOURCE_DIR}/server/stun.cpp
 )
 target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect uconnect_rendezvous uconnect_c)
 target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# For checked-in files a test reads, such as the server's example config.
+target_compile_definitions(uconnect_tests PRIVATE UCONNECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 uconnect_bundle_runtime(uconnect_tests)
 
 # Windows finds a DLL beside the executable, not where it was built.
@@ -36,6 +39,16 @@ add_test(NAME uconnect_tests COMMAND uconnect_tests)
 add_test(NAME uconn_observe_reports_unreachable_server
          COMMAND ${CMAKE_COMMAND} -DOBSERVE=$<TARGET_FILE:uconn-observe>
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/observe_unreachable.cmake)
+
+# The server binary reading its configuration file: printing it, reading its
+# own output back, a flag overriding it, a bad one refused with file and line.
+if (UCONNECT_BUILD_SERVER)
+    add_test(NAME uconnect_server_config
+             COMMAND ${CMAKE_COMMAND} -DSERVER=$<TARGET_FILE:uconnect-rendezvous>
+                     -DEXAMPLE=${CMAKE_SOURCE_DIR}/server/rendezvous.example.yaml
+                     -DWORK=${CMAKE_CURRENT_BINARY_DIR}/server_config
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/server_config.cmake)
+endif()
 
 # The end-to-end tests below are bash scripts, and the bash must be one that
 # understands Windows paths. A bare "bash" on Windows can resolve to the WSL

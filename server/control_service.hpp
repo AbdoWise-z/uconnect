@@ -43,6 +43,11 @@ struct UdpOut {
 
 class ControlService {
 public:
+    // What one control message costs against its connection's budget, beyond
+    // its own bytes. A burst smaller than one largest frame plus this would
+    // disconnect any node that sent one.
+    static constexpr size_t kMessageOverhead = 64;
+
     explicit ControlService(Registry&, ControlConfig = {});
 
     // A control connection from `peer` -- its observed TCP address -- is up.

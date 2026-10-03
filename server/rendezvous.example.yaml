@@ -1,0 +1,45 @@
+# uconnect-rendezvous configuration: every key, at its default.
+#
+#   uconnect-rendezvous --config rendezvous.yaml
+#
+# Keep only the keys you change; the rest keep these defaults. Flags on the
+# command line (--port, --bind, --stale, --max-per-ip, --no-relay) override
+# this file. --print-config shows what is finally in force.
+#
+# Durations: seconds, or with a unit: 90s, 2m, 1h.
+# Sizes: bytes, or with a unit: 4096, 256KiB, 32MiB, 1GiB.
+#
+# This is a strict subset of YAML: nested keys and plain or quoted values. An
+# unknown key, or a value out of range, stops the server with its line number.
+# (The test suite holds this file to the server's compiled defaults.)
+
+port: 4433          # TCP and UDP; 0 picks a free one
+bind: ""            # UDP address to bind; empty for all. TCP listens on all.
+
+connections:
+  max: 20000                  # control connections and relay legs, all told
+  max_per_ip: 64              # from one source address
+  idle_timeout: 90s           # a control connection silent this long is closed
+  first_frame_timeout: 10s    # a new connection must say what it is within this
+
+registry:
+  stale_after: 45s            # an unrefreshed record is still listed, flagged stale
+  max_per_ip_per_topic: 16    # records one source address may hold in one topic
+  max_per_ip_total: 256       # ... and across all topics
+  max_entries: 1000000        # records, server-wide
+  max_topics: 100000          # topics, server-wide
+
+relay:
+  enabled: true               # false refuses every relay allocation
+  expiry: 90s                 # an unused binding is released after this
+  max: 4096                   # bindings, server-wide
+  max_per_ip: 8               # bindings one source address may hold
+  max_bytes: 32MiB            # carried per binding, both ways, before it is cut
+  join_timeout: 20s           # one relay leg waits this long for the other
+  splice_buffer: 256KiB       # held for a slow receiver before the sender is paused
+
+rate_limits:
+  control_bytes_per_sec: 256KiB   # per control connection; over it, it is closed
+  control_burst_bytes: 1MiB       # at least 32KiB + 64: one largest frame
+  udp_bytes_per_sec: 4MiB         # per source address: WhoAmI, relay binds, relayed datagrams
+  udp_burst_bytes: 8MiB           # at least 2KiB: one largest datagram

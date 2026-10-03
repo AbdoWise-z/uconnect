@@ -337,7 +337,7 @@ void Rendezvous::reap(Instant now) {
 }
 
 void Rendezvous::read_udp(Instant now) {
-    std::vector<uint8_t> buf(2048);
+    std::vector<uint8_t> buf(kMaxUdpDatagram);
     for (int i = 0; i < 256; ++i) {
         auto got = udp_.recv_from(buf);
         if (!got) return;

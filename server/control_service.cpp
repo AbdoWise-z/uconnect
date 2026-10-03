@@ -69,8 +69,8 @@ ControlService::Result ControlService::on_message(ConnKey key, std::span<const u
 
     // Over its budget, a connection is closed rather than answered: it is a
     // real TCP peer, so dropping it costs nothing and helps nobody abuse us.
-    if (!take(conn.budget, msg.size() + 64, cfg_.rate_bytes_per_sec, cfg_.rate_burst_bytes,
-              now)) {
+    if (!take(conn.budget, msg.size() + kMessageOverhead, cfg_.rate_bytes_per_sec,
+              cfg_.rate_burst_bytes, now)) {
         ++rej_rate_limited_;
         out.close = true;
         return out;

@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
+#include "config.hpp"
 #include "rendezvous.hpp"
 #include "socket.hpp"
 #include "stun.hpp"
@@ -34,6 +36,10 @@ void usage() {
     std::printf(
         "uconnect-rendezvous -- rendezvous server for uConnect\n"
         "\n"
+        "  --config <file>       read settings and limits from a YAML file; see\n"
+        "                        server/rendezvous.example.yaml for every key.\n"
+        "                        The flags below override it, wherever they appear\n"
+        "  --print-config        print the configuration in force and exit\n"
         "  --port <n>            TCP and UDP port to bind (default 4433)\n"
         "  --bind <addr>         bind UDP to a specific address (default: all\n"
         "                        interfaces); TCP always listens on all of them\n"
@@ -93,25 +99,24 @@ int nat_check(io::UdpSocket& sock) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool                     quiet     = false;
-    bool                     check_nat = false;
-    server::RendezvousConfig cfg;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](int& idx) -> const char* {
-            return idx + 1 < argc ? argv[++idx] : nullptr;
-        };
-        if (a == "--help" || a == "-h") { usage(); return 0; }
-        else if (a == "--quiet") quiet = true;
-        else if (a == "--nat-check") check_nat = true;
-        else if (a == "--no-relay") cfg.registry.relay_enabled = false;
-        else if (a == "--bind") { if (auto* v = next(i)) cfg.bind_host = v; }
-        else if (a == "--port") { if (auto* v = next(i)) cfg.port = static_cast<uint16_t>(std::atoi(v)); }
-        else if (a == "--stale") { if (auto* v = next(i)) cfg.registry.stale_after = std::chrono::seconds(std::atoi(v)); }
-        else if (a == "--max-per-ip") { if (auto* v = next(i)) cfg.registry.max_per_ip_per_topic = static_cast<size_t>(std::atoi(v)); }
-        else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
+    server::ServerOptions opts;
+    std::string           error;
+    if (!server::parse_server_args(std::vector<std::string>(argv + 1, argv + argc), opts, error)) {
+        std::fprintf(stderr, "%s\n(--help lists the options)\n", error.c_str());
+        return 2;
     }
+    if (opts.help) {
+        usage();
+        return 0;
+    }
+    // Before any socket: checking a configuration must not need the port.
+    if (opts.print_config) {
+        std::fputs(server::to_yaml(opts.cfg).c_str(), stdout);
+        return 0;
+    }
+    const bool                      quiet     = opts.quiet;
+    const bool                      check_nat = opts.nat_check;
+    const server::RendezvousConfig& cfg       = opts.cfg;
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

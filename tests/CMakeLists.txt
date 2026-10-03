@@ -50,6 +50,17 @@ if (UCONNECT_BUILD_SERVER)
                      -P ${CMAKE_CURRENT_SOURCE_DIR}/server_config.cmake)
 endif()
 
+# The throughput benchmark, shortened: two nodes over every path, so that it
+# keeps working. It fails only when a mesh will not form, a link takes the
+# wrong path, or nothing arrives -- never on a number, which this machine's
+# load would make flaky. Run tools/uconn-bench by hand for the real figures.
+if (TARGET uconn-bench)
+    add_test(NAME uconnect_bench_smoke
+             COMMAND uconn-bench --nodes 2 --seconds 1 --warmup 0.3 --ladder-seconds 0.5
+                     --server-config ${CMAKE_SOURCE_DIR}/tools/uconn-bench.server.yaml)
+    set_tests_properties(uconnect_bench_smoke PROPERTIES TIMEOUT 240 LABELS "bench;slow")
+endif()
+
 # The end-to-end tests below are bash scripts, and the bash must be one that
 # understands Windows paths. A bare "bash" on Windows can resolve to the WSL
 # launcher in System32 (or WindowsApps), which runs Linux -- and Linux cannot

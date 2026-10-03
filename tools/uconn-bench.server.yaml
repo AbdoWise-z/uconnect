@@ -1,0 +1,27 @@
+# The rendezvous limits uconn-bench runs under. Every key not here keeps its
+# default (see server/rendezvous.example.yaml).
+#
+# Each is lifted for one reason: on loopback every node comes from the same
+# address, so the per-address quotas -- there to stop one host hogging a
+# public server -- would cap the benchmark instead of measuring the library.
+# An 8-node relayed mesh needs 28 relays per kind and 64+ connections from
+# 127.0.0.1, and a relay carries far more than 32 MiB in a five-second run.
+#
+# Nothing that shapes throughput is changed: the splice buffer, the server's
+# single thread and its socket handling are as shipped.
+
+connections:
+  max_per_ip: 100000
+
+registry:
+  max_per_ip_per_topic: 100000
+  max_per_ip_total: 100000
+
+relay:
+  max: 100000
+  max_per_ip: 100000
+  max_bytes: 4095GiB          # the most a binding can be granted
+
+rate_limits:
+  udp_bytes_per_sec: 1024GiB  # relayed datagrams, all from 127.0.0.1
+  udp_burst_bytes: 1024GiB

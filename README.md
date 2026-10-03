@@ -1074,6 +1074,43 @@ processes: `smoke.sh` for punch, handshake, messages and goodbyes, and
 the punched and the relayed paths. `python3 web/test_observer.py` covers the
 dashboard's data layer (POSIX only: it fakes the observer with a shell script).
 
+## Benchmark
+
+`uconn-bench` measures how fast nodes share data, by node count and path. Each
+run hosts a rendezvous server in-process and a full mesh of nodes on loopback,
+checks that every link takes the path under test, then has every node send to
+every peer at once:
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release
+./build-release/tools/uconn-bench --server-config tools/uconn-bench.server.yaml
+./build-release/tools/uconn-bench --nodes 2,4 --modes tcp,udp-relay --csv out.csv
+```
+
+Modes are `tcp` and `udp` (punched directly) and `tcp-relay` and `udp-relay`
+(through the server). `tools/uconn-bench.server.yaml` lifts the server's
+per-address quotas, which loopback would otherwise hit, since every node comes
+from 127.0.0.1. TCP is measured flat out. Datagrams are measured twice: flooded,
+and then paced up a ladder of rates to find the highest at which at least 99%
+arrive.
+
+Medians of three runs on an i7-11800H (8 cores/16 threads, Windows, MinGW
+Release), 2026-10-03. Totals are across all links; a link is one direction
+between two nodes.
+
+| Nodes (links) | TCP | TCP relayed | UDP, ≥99% arriving | UDP relayed, ≥99% arriving |
+|---|---|---|---|---|
+| 2 (2)  | 155 MiB/s | 161 MiB/s | 67 MiB/s (32 000/s per link) | 67 MiB/s (32 000/s per link) |
+| 4 (12) | 320 MiB/s | 175 MiB/s | 101 MiB/s (8 000/s) | 50 MiB/s (4 000/s) |
+| 6 (30) | 343 MiB/s | 146 MiB/s | 126 MiB/s (4 000/s) | 32 MiB/s (1 000/s) |
+| 8 (56) | 439 MiB/s | 108 MiB/s | 116 MiB/s (2 000/s) | 29 MiB/s (500/s) |
+
+Everything shares one machine, so these are the library's ceilings, not a
+network's. Relayed totals fall as nodes are added because one server thread
+carries every relayed byte. Flooded datagrams fare far worse than paced ones
+(8–65 MiB/s with 7–22% arriving): a node sending datagrams in a tight loop
+holds the lock its own receive loop needs to drain its socket.
+
 ---
 
 # Public servers

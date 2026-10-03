@@ -1091,6 +1091,7 @@ every peer at once:
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release
 ./build-release/tools/uconn-bench --server-config tools/uconn-bench.server.yaml
 ./build-release/tools/uconn-bench --nodes 2,4 --modes tcp,udp-relay --csv out.csv
+./build-release/tools/uconn-bench --server 1.2.3.4:4433   # a real server, under its own limits
 ```
 
 Modes are `tcp` and `udp` (punched directly) and `tcp-relay` and `udp-relay`

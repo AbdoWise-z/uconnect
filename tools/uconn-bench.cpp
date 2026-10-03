@@ -72,6 +72,7 @@ struct Options {
     double            warmup   = 1;
     double            ladder_seconds = 1.5;  // each paced datagram step
     size_t            msg_size = 64 * 1024;
+    std::string       server;  // a real server instead of the in-process one
     std::string       server_config;
     int               server_threads = 0;  // 0: as the config says
     std::string       csv;
@@ -153,9 +154,15 @@ Result run(Mode mode, int n, const server::RendezvousConfig& scfg, const Options
     r.mode  = mode;
     r.nodes = n;
 
-    server::RendezvousConfig cfg = scfg;
-    cfg.port = 0;
-    Server srv{cfg};
+    // In-process unless --server names a real one, whose limits then apply.
+    std::optional<Server> local;
+    std::string           address = o.server;
+    if (address.empty()) {
+        server::RendezvousConfig cfg = scfg;
+        cfg.port = 0;
+        local.emplace(cfg);
+        address = local->address();
+    }
 
     const auto        t_setup = Clock::now();
     const TopicCreds  creds   = TopicCreds::generate_keyed();
@@ -165,7 +172,7 @@ Result run(Mode mode, int n, const server::RendezvousConfig& scfg, const Options
     for (int i = 0; i < n; ++i) {
         auto mb = std::make_unique<Member>();
         Node::Config c;
-        c.server            = srv.address();
+        c.server            = address;
         c.force_relay       = relayed(mode);
         c.verbose           = o.verbose;
         c.datagram_fallback = mode == Mode::UdpRelay ? DatagramFallback::Relay : DatagramFallback::None;
@@ -401,6 +408,9 @@ void usage() {
         "  --server-config <yaml>  the in-process server's limits; without it the\n"
         "                          shipped defaults, which cap relayed runs\n"
         "  --server-threads <n>    the server's threads, overriding the config\n"
+        "  --server <host:port>    run against this rendezvous server instead of\n"
+        "                          one in-process; its own limits apply, and a\n"
+        "                          dashboard watching it sees the run\n"
         "  --nodes <list>          node counts (default 2,4,6,8)\n"
         "  --modes <list>          tcp, tcp-relay, udp, udp-relay (default all)\n"
         "  --seconds <s>           measured window per run (default 5)\n"
@@ -426,6 +436,8 @@ bool parse(int argc, char** argv, Options& o) {
             return false;
         } else if (a == "--server-config") {
             o.server_config = v;
+        } else if (a == "--server") {
+            o.server = v;
         } else if (a == "--server-threads") {
             o.server_threads = std::atoi(v);
         } else if (a == "--csv") {
@@ -479,7 +491,11 @@ int main(int argc, char** argv) {
     if (!parse(argc, argv, o)) return 2;
 
     server::RendezvousConfig scfg;
-    if (!o.server_config.empty()) {
+    if (!o.server.empty()) {
+        if (!o.server_config.empty() || o.server_threads > 0) {
+            std::fprintf(stderr, "note: --server given; the in-process server's options are ignored\n");
+        }
+    } else if (!o.server_config.empty()) {
         std::string err;
         if (!server::load_config_file(o.server_config, scfg, err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
@@ -492,8 +508,12 @@ int main(int argc, char** argv) {
 
     std::printf("uconn-bench: %.1fs window after %.1fs warm-up; TCP messages %zu B, datagrams %zu B\n",
                 o.seconds, o.warmup, o.msg_size, Topic::max_datagram());
-    std::printf("server limits: %s, %zu thread(s)\n\n",
-                o.server_config.empty() ? "(defaults)" : o.server_config.c_str(), scfg.threads);
+    if (!o.server.empty()) {
+        std::printf("server: %s (external: its own limits apply)\n\n", o.server.c_str());
+    } else {
+        std::printf("server limits: %s, %zu thread(s)\n\n",
+                    o.server_config.empty() ? "(defaults)" : o.server_config.c_str(), scfg.threads);
+    }
     std::printf("%-10s %5s %6s %11s %10s %10s %11s %7s %9s\n", "mode", "nodes", "links",
                 "total MiB/s", "per link", "per node", "units/s", "arrived", "setup");
 

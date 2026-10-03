@@ -21,6 +21,12 @@ target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 uconnect_bundle_runtime(uconnect_tests)
 add_test(NAME uconnect_tests COMMAND uconnect_tests)
 
+# uconn-observe must report a server it cannot reach as a failure, not as an
+# empty directory. Runs the real binary; needs no server, so it is not e2e.
+add_test(NAME uconn_observe_reports_unreachable_server
+         COMMAND ${CMAKE_COMMAND} -DOBSERVE=$<TARGET_FILE:uconn-observe>
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/observe_unreachable.cmake)
+
 # End-to-end: a real server and two real peers that must punch, handshake and
 # exchange data over actual TCP sockets. Separate from the unit suite because
 # it binds a port and takes ~15s; the sans-IO tests above cover the protocol

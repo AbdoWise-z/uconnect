@@ -88,14 +88,15 @@ void print_peer(const PeerInfo& p, bool last) {
 }
 
 // Look up one topic's members. No key is needed: LOOKUP is keyed by topic_id
-// alone, so a bogus key here is never used for anything.
-std::vector<PeerInfo> members_of(Node& node, const TopicId& id, uint8_t limit,
-                                 std::chrono::milliseconds timeout) {
+// alone, so a bogus key here is never used for anything. Nullopt if the lookup
+// failed, as opposed to finding nobody.
+std::optional<std::vector<PeerInfo>> members_of(Node& node, const TopicId& id, uint8_t limit,
+                                                std::chrono::milliseconds timeout) {
     TopicCreds creds;
     creds.id  = id;
     creds.key = std::nullopt;
     auto& t   = node.join(creds);
-    auto  out = t.peers(limit, /*want_meta=*/true, timeout);
+    auto  out = t.try_peers(limit, /*want_meta=*/true, timeout);
     node.leave(id);
     return out;
 }
@@ -138,8 +139,12 @@ int main(int argc, char** argv) {
     // Errors go to stdout as JSON too. A dashboard needs to distinguish "the
     // server said there is nothing" from "we could not reach the server", and a
     // non-zero exit with an empty body cannot carry that.
-    auto fail = [](const char* what) {
-        std::printf("{\"ok\":false,\"error\":\"%s\"}\n", what);
+    //
+    // So nothing is printed until every query has answered: ok:true is only
+    // ever followed by results the server actually gave.
+    auto fail = [&](const std::string& what) {
+        std::printf("{\"ok\":false,\"server\":\"%s\",\"error\":\"%s\"}\n",
+                    json_escape(server).c_str(), json_escape(what).c_str());
         return 1;
     };
 
@@ -154,61 +159,72 @@ int main(int argc, char** argv) {
             auto id = from_hex<16>(one_topic);
             if (!id) { return fail("bad topic id"); }
 
-            std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
             auto peers = members_of(node, *id, static_cast<uint8_t>(limit), timeout);
+            if (!peers) return fail("lookup failed: server unreachable or did not answer");
+            std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
             std::printf(",\n  \"topic\":{\"id\":\"%s\",\"members\":[\n",
                         to_hex(*id).c_str());
-            for (size_t i = 0; i < peers.size(); ++i) print_peer(peers[i], i + 1 == peers.size());
+            for (size_t i = 0; i < peers->size(); ++i) print_peer((*peers)[i], i + 1 == peers->size());
             std::printf("  ]}\n}\n");
             node.shutdown();
             return 0;
         }
 
-        std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
-
-        if (auto s = node.stats(timeout)) {
-            std::printf(
-                ",\n  \"stats\":{"
-                "\"topics_total\":%llu,\"topics_listed\":%llu,"
-                "\"entries_total\":%llu,\"entries_fresh\":%llu,"
-                "\"registers\":%llu,\"lookups\":%llu,"
-                "\"connects\":%llu,\"expired\":%llu,"
-                "\"rej_quota\":%llu,\"rej_rate_limited\":%llu,"
-                "\"relays_open\":%llu,\"relays_allocated\":%llu,\"relay_bytes\":%llu,"
-                "\"connections\":%llu}",
-                (unsigned long long)s->topics_total, (unsigned long long)s->topics_listed,
-                (unsigned long long)s->entries_total, (unsigned long long)s->entries_fresh,
-                (unsigned long long)s->registers,
-                (unsigned long long)s->lookups, (unsigned long long)s->connects,
-                (unsigned long long)s->expired,
-                (unsigned long long)s->rej_quota,
-                (unsigned long long)s->rej_rate_limited,
-                (unsigned long long)s->relays_open, (unsigned long long)s->relays_allocated,
-                (unsigned long long)s->relay_bytes, (unsigned long long)s->connections);
-        } else {
-            std::printf(",\n  \"stats\":null");
-        }
+        // The server always answers STATS, so no answer means no server.
+        auto s = node.stats(timeout);
+        if (!s) return fail("stats failed: server unreachable or did not answer");
 
         // Only topics that opted in to the listing appear here. An unlisted
         // topic is still reachable by id -- see --topic -- exactly as it is for
         // any other client; "unlisted" means absent from the directory, not
         // secret.
         // Every listed topic, not just the first page -- up to a sanity cap.
-        auto topics = node.explore(0, 10000, timeout);
+        auto topics = node.try_explore(0, 10000, timeout);
+        if (!topics) return fail("explore failed: server unreachable or did not answer");
+
+        std::vector<std::vector<PeerInfo>> members;
+        if (want_members) {
+            for (const auto& t : *topics) {
+                auto peers = members_of(node, t.id, static_cast<uint8_t>(limit), timeout);
+                if (!peers) return fail("lookup failed for topic " + to_hex(t.id));
+                members.push_back(std::move(*peers));
+            }
+        }
+
+        std::printf("{\"ok\":true,\"server\":\"%s\"", json_escape(server).c_str());
+        std::printf(
+            ",\n  \"stats\":{"
+            "\"topics_total\":%llu,\"topics_listed\":%llu,"
+            "\"entries_total\":%llu,\"entries_fresh\":%llu,"
+            "\"registers\":%llu,\"lookups\":%llu,"
+            "\"connects\":%llu,\"expired\":%llu,"
+            "\"rej_quota\":%llu,\"rej_rate_limited\":%llu,"
+            "\"relays_open\":%llu,\"relays_allocated\":%llu,\"relay_bytes\":%llu,"
+            "\"connections\":%llu}",
+            (unsigned long long)s->topics_total, (unsigned long long)s->topics_listed,
+            (unsigned long long)s->entries_total, (unsigned long long)s->entries_fresh,
+            (unsigned long long)s->registers,
+            (unsigned long long)s->lookups, (unsigned long long)s->connects,
+            (unsigned long long)s->expired,
+            (unsigned long long)s->rej_quota,
+            (unsigned long long)s->rej_rate_limited,
+            (unsigned long long)s->relays_open, (unsigned long long)s->relays_allocated,
+            (unsigned long long)s->relay_bytes, (unsigned long long)s->connections);
+
         std::printf(",\n  \"topics\":[\n");
-        for (size_t i = 0; i < topics.size(); ++i) {
-            const auto& t = topics[i];
+        for (size_t i = 0; i < topics->size(); ++i) {
+            const auto& t = (*topics)[i];
             std::printf("    {\"id\":\"%s\",\"mode\":\"%s\",\"peers\":%u,\"fresh_peers\":%u",
                         to_hex(t.id).c_str(), mode_name(t.mode), t.peers, t.fresh_peers);
             if (want_members) {
-                auto peers = members_of(node, t.id, static_cast<uint8_t>(limit), timeout);
+                const auto& peers = members[i];
                 std::printf(",\"members\":[\n");
                 for (size_t j = 0; j < peers.size(); ++j) {
                     print_peer(peers[j], j + 1 == peers.size());
                 }
                 std::printf("    ]");
             }
-            std::printf("}%s\n", i + 1 == topics.size() ? "" : ",");
+            std::printf("}%s\n", i + 1 == topics->size() ? "" : ",");
         }
         std::printf("  ]\n}\n");
 

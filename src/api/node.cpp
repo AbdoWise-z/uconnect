@@ -527,6 +527,11 @@ struct Node::Impl {
         return c;
     }
 
+    // Follow the topic listing's pages into `out`, with `lk` held on `mu`.
+    // False if a page could not be had; `out` keeps the pages that were.
+    bool explore_pages(std::unique_lock<std::mutex>& lk, uint32_t cursor, size_t limit,
+                       std::chrono::milliseconds timeout, std::vector<TopicSummary>& out);
+
     void gather_host_candidates();
     void loop();
     void finish_shutdown(); // with mu held, after the loop stops using sockets
@@ -1968,9 +1973,14 @@ std::optional<DevId> Topic::self() const {
 }
 
 std::vector<PeerInfo> Topic::peers(uint8_t max, bool want_meta, std::chrono::milliseconds timeout) {
+    return try_peers(max, want_meta, timeout).value_or(std::vector<PeerInfo>{});
+}
+
+std::optional<std::vector<PeerInfo>> Topic::try_peers(uint8_t max, bool want_meta,
+                                                      std::chrono::milliseconds timeout) {
     auto&                        n = *impl_->node;
     std::unique_lock<std::mutex> lk(n.mu);
-    if (n.on_loop_thread()) return {};
+    if (n.on_loop_thread()) return std::nullopt;
     ctl::Lookup                  l;
     l.id        = impl_->creds.id;
     l.max       = max;
@@ -1979,25 +1989,25 @@ std::vector<PeerInfo> Topic::peers(uint8_t max, bool want_meta, std::chrono::mil
                                    want_meta ? wire::flags::kWantMeta : uint8_t{0});
     n.wait_for(lk, txn, std::chrono::steady_clock::now() + timeout);
 
-    std::vector<PeerInfo> out;
-    auto                  it = n.requests.find(txn);
-    if (it == n.requests.end()) return out;
+    auto it = n.requests.find(txn);
+    if (it == n.requests.end()) return std::nullopt;
+    std::optional<ctl::LookupOk> ok;
     if (it->second.done && it->second.error == ErrorCode::None) {
         wire::Reader r{it->second.reply};
-        std::optional<ctl::LookupOk> ok;
         if (wire::Header::decode(r, ctl::kVersion)) ok = ctl::LookupOk::decode(r);
-        if (ok) {
-            for (auto& e : ok->entries) {
-                // Never return ourselves: our own record is in the topic too.
-                if (impl_->self && e.dev_id == *impl_->self) continue;
-                auto& peer  = impl_->peers[e.dev_id];  // remember where to dial
-                peer.dev_id = e.dev_id;
-                peer.cands  = e.cands;
-                out.push_back(PeerInfo{e.dev_id, std::chrono::seconds(e.age_secs), e.stale, e.meta});
-            }
-        }
     }
     n.requests.erase(it);
+    if (!ok) return std::nullopt;
+
+    std::vector<PeerInfo> out;
+    for (auto& e : ok->entries) {
+        // Never return ourselves: our own record is in the topic too.
+        if (impl_->self && e.dev_id == *impl_->self) continue;
+        auto& peer  = impl_->peers[e.dev_id];  // remember where to dial
+        peer.dev_id = e.dev_id;
+        peer.cands  = e.cands;
+        out.push_back(PeerInfo{e.dev_id, std::chrono::seconds(e.age_secs), e.stale, e.meta});
+    }
     return out;
 }
 
@@ -2343,32 +2353,29 @@ const TopicCreds* Node::creds(const TopicId& id) const {
     return it == impl_->topics.end() ? nullptr : &it->second->impl_->creds;
 }
 
-std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
-                                        std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lk(impl_->mu);
-    if (impl_->on_loop_thread()) return {};
-    const auto                   deadline = std::chrono::steady_clock::now() + timeout;
+bool Node::Impl::explore_pages(std::unique_lock<std::mutex>& lk, uint32_t cursor, size_t limit,
+                               std::chrono::milliseconds timeout, std::vector<TopicSummary>& out) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
 
     // One TOPICS request carries at most 255. Follow next_cursor until `limit`
     // is met or the listing ends.
-    std::vector<TopicSummary> out;
-    uint32_t                  at = cursor;
+    uint32_t at = cursor;
     while (out.size() < limit) {
         ctl::Topics q;
         q.cursor           = at;
         q.limit            = static_cast<uint8_t>(std::min<size_t>(limit - out.size(), 255));
-        const uint32_t txn = impl_->request(wire::MsgType::Topics, wire::MsgType::TopicsOk, q);
-        const bool     ok  = impl_->wait_for(lk, txn, deadline);
+        const uint32_t txn = request(wire::MsgType::Topics, wire::MsgType::TopicsOk, q);
+        const bool     ok  = wait_for(lk, txn, deadline);
 
-        auto it = impl_->requests.find(txn);
-        if (it == impl_->requests.end()) break;
+        auto it = requests.find(txn);
+        if (it == requests.end()) return false;
         std::optional<ctl::TopicsOk> page;
         if (ok && it->second.error == ErrorCode::None) {
             wire::Reader r{it->second.reply};
             if (wire::Header::decode(r, ctl::kVersion)) page = ctl::TopicsOk::decode(r);
         }
-        impl_->requests.erase(it);
-        if (!page) break;
+        requests.erase(it);
+        if (!page) return false;
         for (const auto& t : page->topics) {
             if (out.size() >= limit) break;
             out.push_back(TopicSummary{t.id, t.mode, t.peers, t.fresh_peers});
@@ -2376,6 +2383,24 @@ std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
         if (page->next_cursor == 0 || page->topics.empty()) break;
         at = page->next_cursor;
     }
+    return true;
+}
+
+std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
+                                        std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    if (impl_->on_loop_thread()) return {};
+    std::vector<TopicSummary> out;
+    impl_->explore_pages(lk, cursor, limit, timeout, out);  // what it had, on failure
+    return out;
+}
+
+std::optional<std::vector<TopicSummary>> Node::try_explore(uint32_t cursor, size_t limit,
+                                                           std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    if (impl_->on_loop_thread()) return std::nullopt;
+    std::vector<TopicSummary> out;
+    if (!impl_->explore_pages(lk, cursor, limit, timeout, out)) return std::nullopt;
     return out;
 }
 

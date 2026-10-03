@@ -194,6 +194,12 @@ public:
     // dial 5000 peers.
     std::vector<PeerInfo> peers(uint8_t max = 30, bool want_meta = false,
                                 std::chrono::milliseconds timeout = std::chrono::seconds(3));
+    // As peers(), but nullopt when the lookup itself failed -- no server, no
+    // reply in time, or an error -- where peers() would return an empty list
+    // indistinguishable from an empty topic.
+    std::optional<std::vector<PeerInfo>> try_peers(
+        uint8_t max = 30, bool want_meta = false,
+        std::chrono::milliseconds timeout = std::chrono::seconds(3));
     std::optional<PeerInfo> resolve(const DevId&,
                                     std::chrono::milliseconds timeout = std::chrono::seconds(3));
 
@@ -239,9 +245,9 @@ public:
     static constexpr size_t max_datagram() { return 1100; }
 
     // --- events (invoked on the node's loop thread; do not block) ----------
-    // Synchronous publish(), peers(), resolve(), Node::explore() and
-    // Node::stats() reject calls on this thread immediately (false, empty, or
-    // nullopt) without sending a request. connect_all() is consequently a
+    // Synchronous publish(), peers(), try_peers(), resolve(), Node::explore(),
+    // Node::try_explore() and Node::stats() reject calls on this thread
+    // immediately (false, empty, or nullopt) without sending a request. connect_all() is consequently a
     // no-op here. Run those calls on an application thread instead.
     void on_peer(std::function<void(DevId, PeerState)>);
     void on_data(std::function<void(DevId, std::span<const uint8_t>)>);
@@ -347,6 +353,13 @@ public:
     // the listing). Follows the server's paging across as many requests as
     // `limit` needs, within one overall `timeout`.
     std::vector<TopicSummary> explore(
+        uint32_t cursor = 0,
+        size_t limit = 100,
+        std::chrono::milliseconds timeout = std::chrono::seconds(3));
+    // As explore(), but nullopt when any request it needed failed, where
+    // explore() returns what it had -- possibly nothing, which an empty
+    // listing would also look like.
+    std::optional<std::vector<TopicSummary>> try_explore(
         uint32_t cursor = 0,
         size_t limit = 100,
         std::chrono::milliseconds timeout = std::chrono::seconds(3));

@@ -589,6 +589,40 @@ TEST(stats_and_explore_reach_the_server) {
     CHECK_EQ(nb.explore().size(), 1u);
 }
 
+TEST(try_queries_tell_a_failed_request_from_an_empty_answer) {
+    // #48. explore() and peers() return an empty list for an unreachable
+    // server and for an empty one alike; the try_ forms must not.
+    {
+        Node::Config cfg;
+        cfg.server = "127.0.0.1:1";  // nothing listens here
+        Node lonely{cfg};
+        lonely.run_in_background();
+        Topic& t = lonely.join(TopicCreds::generate_open());
+        CHECK(!lonely.try_explore(0, 10, 300ms).has_value());
+        CHECK(!t.try_peers(10, false, 300ms).has_value());
+        CHECK(lonely.explore(0, 10, 300ms).empty());  // the old forms are unchanged
+        CHECK(t.peers(10, false, 300ms).empty());
+    }
+    LocalServer srv;
+    Node        na{config_for(srv)};
+    na.run_in_background();
+    Topic& t = na.join(TopicCreds::generate_open());
+
+    auto listing = na.try_explore(0, 10, 3s);
+    REQUIRE(listing.has_value());
+    CHECK(listing->empty());  // reachable, and genuinely nothing listed
+    auto members = t.try_peers(10, false, 3s);
+    REQUIRE(members.has_value());
+    CHECK(members->empty());
+
+    REQUIRE(t.publish());
+    Node   nb{config_for(srv)};
+    nb.run_in_background();
+    Topic& u = nb.join(*na.creds(t.id()));
+    CHECK_EQ(nb.try_explore(0, 10, 3s).value_or(std::vector<TopicSummary>{}).size(), 1u);
+    CHECK_EQ(u.try_peers(10, false, 3s).value_or(std::vector<PeerInfo>{}).size(), 1u);
+}
+
 TEST(explore_follows_the_cursor_past_one_request) {
     // #32. explore() must follow next_cursor past the first page, and a limit
     // above one request's 255 must not be silently cut to it.

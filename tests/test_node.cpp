@@ -1313,6 +1313,39 @@ TEST(datagrams_fall_back_to_the_udp_relay_when_asked_to) {
     CHECK(wait_until([&] { return p.count_a() >= 8 && p.count_b() >= 8; }, 3s));
 }
 
+TEST(datagrams_flooded_both_ways_still_arrive) {
+    // An application thread calling send_datagram() in a tight loop used to
+    // hold the node's lock nearly all the time, starving the node's own loop
+    // -- the one thread that drains its UDP socket. With both sides flooding,
+    // about 7% arrived; the loop now takes the lock ahead of callers.
+    LocalServer srv;
+    DgramPair   p{srv, dgram_config(srv, false, DatagramFallback::None),
+                  dgram_config(srv, false, DatagramFallback::None)};
+    REQUIRE(p.connect());
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::None));
+    REQUIRE(p.settled(DatagramPath::Direct));
+
+    std::atomic<bool>   stop{false};
+    std::atomic<size_t> sent_a{0}, sent_b{0};
+    auto flood = [&](Topic* from, DevId to, std::atomic<size_t>& sent) {
+        const auto payload = std::vector<uint8_t>(Topic::max_datagram(), 1);
+        while (!stop) {
+            if (from->send_datagram(to, payload)) ++sent;
+        }
+    };
+    std::thread ta([&] { flood(p.a, p.idb(), sent_a); });
+    std::thread tb([&] { flood(p.b, p.ida(), sent_b); });
+    std::this_thread::sleep_for(1s);
+    stop = true;
+    ta.join();
+    tb.join();
+    std::this_thread::sleep_for(500ms);  // the tail, in flight
+
+    REQUIRE(sent_a > 1000 && sent_b > 1000);
+    CHECK(p.count_b() * 2 >= sent_a.load());  // at least half arrives, each way
+    CHECK(p.count_a() * 2 >= sent_b.load());
+}
+
 TEST(datagrams_with_no_fallback_report_failure_and_refuse_to_send) {
     LocalServer srv;
     DgramPair   p{srv, dgram_config(srv, true, DatagramFallback::None),

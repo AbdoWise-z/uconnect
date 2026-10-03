@@ -82,6 +82,51 @@ constexpr auto kControlTimeout    = 10s;  // connect or loop-owned request deadl
 // reads slowly must not grow our memory without bound.
 constexpr size_t kMaxQueued = 16u << 20;
 
+// The node's one lock, which its loop thread takes ahead of everyone else.
+//
+// std::mutex promises no fairness, and a thread that releases it and asks
+// again at once usually wins. An application calling send() or
+// send_datagram() in a loop is that thread: it held the lock nearly all the
+// time while the loop -- the only thread draining the sockets -- waited, and
+// the UDP socket overflowed. With both sides of a pair flooding datagrams,
+// 7.6% arrived; with one side, 100%.
+//
+// So the loop says when it is waiting, and every other locker yields until it
+// has the lock. The loop still waits for whoever holds it now, and one caller
+// may slip in as it announces itself, but nobody else gets ahead of it.
+class LoopFirstMutex {
+public:
+    void lock() {
+        while (loop_waiting_.load(std::memory_order_acquire)) std::this_thread::yield();
+        m_.lock();
+    }
+    bool try_lock() { return !loop_waiting_.load(std::memory_order_acquire) && m_.try_lock(); }
+    void unlock() { m_.unlock(); }
+
+    // For the loop thread only.
+    void lock_for_loop() {
+        loop_waiting_.store(true, std::memory_order_release);
+        m_.lock();
+        loop_waiting_.store(false, std::memory_order_release);
+    }
+
+private:
+    std::mutex        m_;
+    std::atomic<bool> loop_waiting_{false};
+};
+
+// lock_guard for the loop thread.
+class LoopLock {
+public:
+    explicit LoopLock(LoopFirstMutex& m) : m_(m) { m_.lock_for_loop(); }
+    ~LoopLock() { m_.unlock(); }
+    LoopLock(const LoopLock&)            = delete;
+    LoopLock& operator=(const LoopLock&) = delete;
+
+private:
+    LoopFirstMutex& m_;
+};
+
 // Record kinds on a TcpSession that belong to this layer.
 constexpr uint8_t kMessageRecord = 0x10;  // an application message
 constexpr uint8_t kDgramOffer    = 0x11;  // epoch(4) | rekey_shift(1) | UDP candidates
@@ -460,8 +505,8 @@ struct Node::Impl {
     uint64_t                whoami_nonce = 0;
     Instant                 next_whoami{};
 
-    mutable std::mutex      mu;
-    std::condition_variable cv;
+    mutable LoopFirstMutex  mu;
+    std::condition_variable_any cv;
 
     std::map<TopicId, std::unique_ptr<Topic>, TopicIdLess> topics;
     std::unordered_map<uint32_t, Request>                  requests;
@@ -524,7 +569,7 @@ struct Node::Impl {
     }
 
     // Wait, with `lk` held on `mu`, for request `txn` to finish.
-    bool wait_for(std::unique_lock<std::mutex>& lk, uint32_t txn,
+    bool wait_for(std::unique_lock<LoopFirstMutex>& lk, uint32_t txn,
                   std::chrono::steady_clock::time_point deadline) {
         while (std::chrono::steady_clock::now() < deadline) {
             auto it = requests.find(txn);
@@ -547,7 +592,7 @@ struct Node::Impl {
 
     // Follow the topic listing's pages into `out`, with `lk` held on `mu`.
     // False if a page could not be had; `out` keeps the pages that were.
-    bool explore_pages(std::unique_lock<std::mutex>& lk, uint32_t cursor, size_t limit,
+    bool explore_pages(std::unique_lock<LoopFirstMutex>& lk, uint32_t cursor, size_t limit,
                        std::chrono::milliseconds timeout, std::vector<TopicSummary>& out);
 
     void gather_host_candidates();
@@ -618,7 +663,7 @@ Topic::Impl* Node::Impl::topic_impl(const TopicId& id) {
 
 void Node::Impl::loop() {
     {
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<LoopFirstMutex> lk(mu);
         if (running || stop) return;
         loop_thread_id = std::this_thread::get_id();
         running = true;
@@ -630,7 +675,7 @@ void Node::Impl::loop() {
         // Build the poll set under the lock, wait without it.
         std::vector<io::PollItem> items;
         {
-            std::lock_guard<std::mutex> lk(mu);
+            LoopLock lk(mu);
             io::PollItem li;
             li.fd        = listener.native();
             li.want_read = true;
@@ -674,7 +719,7 @@ void Node::Impl::loop() {
 
         std::vector<std::function<void()>> callbacks;
         {
-            std::lock_guard<std::mutex> lk(mu);
+            LoopLock lk(mu);
             tick(now());
             callbacks.swap(deferred);
         }
@@ -687,11 +732,11 @@ void Node::Impl::loop() {
     // on this same thread before releasing topics and sockets.
     std::vector<std::function<void()>> callbacks;
     {
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<LoopFirstMutex> lk(mu);
         callbacks.swap(deferred);
     }
     for (auto& fn : callbacks) fn();
-    std::lock_guard<std::mutex> lk(mu);
+    std::lock_guard<LoopFirstMutex> lk(mu);
     finish_shutdown();
     loop_thread_id = {};
     running = false;
@@ -2010,7 +2055,7 @@ bool           Topic::is_authenticated() const { return impl_->keyed; }
 
 bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
     auto&                        n = *impl_->node;
-    std::unique_lock<std::mutex> lk(n.mu);
+    std::unique_lock<LoopFirstMutex> lk(n.mu);
     if (n.on_loop_thread()) return false;
     impl_->meta.assign(meta.begin(), meta.end());
     impl_->unlisted = unlisted;
@@ -2047,7 +2092,7 @@ bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
 
 void Topic::unpublish() {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     if (impl_->self && n.ctl_state == Node::Impl::Ctl::Up) {
         n.notify(wire::MsgType::Unregister, ctl::DevRef{*impl_->self});
     }
@@ -2056,7 +2101,7 @@ void Topic::unpublish() {
 }
 
 std::optional<DevId> Topic::self() const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     return impl_->self;
 }
 
@@ -2067,7 +2112,7 @@ std::vector<PeerInfo> Topic::peers(uint8_t max, bool want_meta, std::chrono::mil
 std::optional<std::vector<PeerInfo>> Topic::try_peers(uint8_t max, bool want_meta,
                                                       std::chrono::milliseconds timeout) {
     auto&                        n = *impl_->node;
-    std::unique_lock<std::mutex> lk(n.mu);
+    std::unique_lock<LoopFirstMutex> lk(n.mu);
     if (n.on_loop_thread()) return std::nullopt;
     ctl::Lookup                  l;
     l.id        = impl_->creds.id;
@@ -2101,7 +2146,7 @@ std::optional<std::vector<PeerInfo>> Topic::try_peers(uint8_t max, bool want_met
 
 std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::milliseconds timeout) {
     auto&                        n = *impl_->node;
-    std::unique_lock<std::mutex> lk(n.mu);
+    std::unique_lock<LoopFirstMutex> lk(n.mu);
     if (n.on_loop_thread()) return std::nullopt;
     const uint32_t txn = n.request(wire::MsgType::Resolve, wire::MsgType::ResolveOk, ctl::Resolve{dev});
     n.wait_for(lk, txn, std::chrono::steady_clock::now() + timeout);
@@ -2132,7 +2177,7 @@ std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::millisecon
 
 void Topic::connect(const DevId& dev) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     n.begin_connect(*impl_, impl_->creds.id, dev, n.now());
 }
 
@@ -2173,7 +2218,7 @@ void Node::Impl::disconnect_peer(Topic::Impl& ti, Peer& peer, uint16_t reason) {
 
 void Topic::disconnect(const DevId& dev) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end()) return;
     n.disconnect_peer(*impl_, it->second, close_reason::kGoingAway);
@@ -2184,7 +2229,7 @@ void Topic::disconnect_all() { disconnect_all_with_reason(close_reason::kGoingAw
 
 void Topic::disconnect_all_with_reason(uint16_t reason) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     for (auto& [dev, peer] : impl_->peers) {
         (void)dev;
         n.disconnect_peer(*impl_, peer, reason);
@@ -2193,7 +2238,7 @@ void Topic::disconnect_all_with_reason(uint16_t reason) {
 }
 
 std::vector<DevId> Topic::connected() const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     std::vector<DevId>          out;
     for (const auto& [dev, peer] : impl_->peers) {
         if (peer.state == PeerState::Connected) out.push_back(dev);
@@ -2202,13 +2247,13 @@ std::vector<DevId> Topic::connected() const {
 }
 
 PeerState Topic::state(const DevId& dev) const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     auto                        it = impl_->peers.find(dev);
     return it == impl_->peers.end() ? PeerState::Unknown : it->second.state;
 }
 
 std::optional<LinkInfo> Topic::link(const DevId& dev) const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.sess ||
         it->second.sess->state() != TcpSession::State::Established) {
@@ -2221,7 +2266,7 @@ std::optional<LinkInfo> Topic::link(const DevId& dev) const {
 
 bool Topic::send(const DevId& dev, std::span<const uint8_t> payload) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.sess) return false;
     if (payload.size() > max_message()) return false;
@@ -2242,7 +2287,7 @@ size_t Topic::broadcast(std::span<const uint8_t> payload) {
 
 bool Topic::open_datagrams(const DevId& dev, DatagramFallback fb) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.sess ||
         it->second.sess->state() != TcpSession::State::Established) {
@@ -2256,7 +2301,7 @@ bool Topic::open_datagrams(const DevId& dev, DatagramFallback fb) {
 
 void Topic::close_datagrams(const DevId& dev) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.dgram) return;
     Peer& peer = it->second;
@@ -2265,7 +2310,7 @@ void Topic::close_datagrams(const DevId& dev) {
 }
 
 DatagramPath Topic::datagram_path(const DevId& dev) const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.dgram) return DatagramPath::None;
     return it->second.dgram->path;
@@ -2273,7 +2318,7 @@ DatagramPath Topic::datagram_path(const DevId& dev) const {
 
 bool Topic::send_datagram(const DevId& dev, std::span<const uint8_t> payload) {
     auto&                       n = *impl_->node;
-    std::lock_guard<std::mutex> lk(n.mu);
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
     if (payload.size() > max_datagram()) return false;
     auto it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.dgram || !it->second.sess) return false;
@@ -2296,42 +2341,42 @@ bool Topic::send_datagram(const DevId& dev, std::span<const uint8_t> payload) {
 }
 
 void Topic::on_peer(std::function<void(DevId, PeerState)> cb) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->on_peer = std::move(cb);
 }
 
 void Topic::on_data(std::function<void(DevId, std::span<const uint8_t>)> cb) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->on_data = std::move(cb);
 }
 
 void Topic::on_peer_closed(std::function<void(DevId, PeerGone)> cb) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->on_peer_closed = std::move(cb);
 }
 
 void Topic::on_datagram(std::function<void(DevId, std::span<const uint8_t>)> cb) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->on_datagram = std::move(cb);
 }
 
 void Topic::on_datagram_path(std::function<void(DevId, DatagramPath)> cb) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->on_datagram_path = std::move(cb);
 }
 
 void Topic::set_max_peers(size_t n) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->max_peers = n;
 }
 
 void Topic::set_auto_connect(bool on) {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     impl_->auto_connect = on;
 }
 
 std::optional<std::string> Topic::sas(const DevId& dev) const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.sess ||
         it->second.sess->state() != TcpSession::State::Established) {
@@ -2341,7 +2386,7 @@ std::optional<std::string> Topic::sas(const DevId& dev) const {
 }
 
 std::optional<std::array<uint8_t, 32>> Topic::channel_binding(const DevId& dev) const {
-    std::lock_guard<std::mutex> lk(impl_->node->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.sess ||
         it->second.sess->state() != TcpSession::State::Established) {
@@ -2390,7 +2435,7 @@ Node::Node(std::string server) : Node(Config{std::move(server)}) {}
 Node::~Node() { shutdown(); }
 
 Topic& Node::join(const TopicCreds& creds) {
-    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     auto                        it = impl_->topics.find(creds.id);
     if (it != impl_->topics.end()) return *it->second;
 
@@ -2412,7 +2457,7 @@ Topic& Node::create(bool keyed) {
 void Node::leave(const TopicId& id) {
     std::unique_ptr<Topic> owned;
     {
-        std::lock_guard<std::mutex> lk(impl_->mu);
+        std::lock_guard<LoopFirstMutex> lk(impl_->mu);
         auto                        it = impl_->topics.find(id);
         if (it == impl_->topics.end()) return;
         owned = std::move(it->second);
@@ -2423,7 +2468,7 @@ void Node::leave(const TopicId& id) {
 }
 
 std::vector<TopicId> Node::topics() const {
-    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     std::vector<TopicId>        out;
     for (const auto& [id, t] : impl_->topics) {
         (void)t;
@@ -2433,12 +2478,12 @@ std::vector<TopicId> Node::topics() const {
 }
 
 const TopicCreds* Node::creds(const TopicId& id) const {
-    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     auto                        it = impl_->topics.find(id);
     return it == impl_->topics.end() ? nullptr : &it->second->impl_->creds;
 }
 
-bool Node::Impl::explore_pages(std::unique_lock<std::mutex>& lk, uint32_t cursor, size_t limit,
+bool Node::Impl::explore_pages(std::unique_lock<LoopFirstMutex>& lk, uint32_t cursor, size_t limit,
                                std::chrono::milliseconds timeout, std::vector<TopicSummary>& out) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
@@ -2473,7 +2518,7 @@ bool Node::Impl::explore_pages(std::unique_lock<std::mutex>& lk, uint32_t cursor
 
 std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
                                         std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lk(impl_->mu);
+    std::unique_lock<LoopFirstMutex> lk(impl_->mu);
     if (impl_->on_loop_thread()) return {};
     std::vector<TopicSummary> out;
     impl_->explore_pages(lk, cursor, limit, timeout, out);  // what it had, on failure
@@ -2482,7 +2527,7 @@ std::vector<TopicSummary> Node::explore(uint32_t cursor, size_t limit,
 
 std::optional<std::vector<TopicSummary>> Node::try_explore(uint32_t cursor, size_t limit,
                                                            std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lk(impl_->mu);
+    std::unique_lock<LoopFirstMutex> lk(impl_->mu);
     if (impl_->on_loop_thread()) return std::nullopt;
     std::vector<TopicSummary> out;
     if (!impl_->explore_pages(lk, cursor, limit, timeout, out)) return std::nullopt;
@@ -2490,7 +2535,7 @@ std::optional<std::vector<TopicSummary>> Node::try_explore(uint32_t cursor, size
 }
 
 std::optional<ServerStats> Node::stats(std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lk(impl_->mu);
+    std::unique_lock<LoopFirstMutex> lk(impl_->mu);
     if (impl_->on_loop_thread()) return std::nullopt;
     const uint32_t txn = impl_->request_empty(wire::MsgType::Stats, wire::MsgType::StatsOk);
     const bool     ok  = impl_->wait_for(lk, txn, std::chrono::steady_clock::now() + timeout);
@@ -2528,7 +2573,7 @@ std::optional<ServerStats> Node::stats(std::chrono::milliseconds timeout) {
 void Node::run() { impl_->loop(); }
 
 void Node::run_in_background() {
-    std::unique_lock<std::mutex> lk(impl_->mu);
+    std::unique_lock<LoopFirstMutex> lk(impl_->mu);
     if (impl_->running || impl_->stop || impl_->thread.joinable()) return;
     impl_->thread = std::thread([this] { impl_->loop(); });
     impl_->cv.wait(lk, [this] { return impl_->running || impl_->stop; });
@@ -2539,7 +2584,7 @@ void Node::shutdown() {
 
     bool on_loop = false;
     {
-        std::lock_guard<std::mutex> lk(impl_->mu);
+        std::lock_guard<LoopFirstMutex> lk(impl_->mu);
         on_loop = impl_->loop_thread_id == std::this_thread::get_id();
         if (!impl_->stop.exchange(true)) {
             for (auto& [id, t] : impl_->topics) {
@@ -2569,7 +2614,7 @@ void Node::shutdown() {
     if (on_loop) return; // the loop completes cleanup after this callback returns
     std::lock_guard<std::mutex> join_lock(impl_->join_mu);
     if (impl_->thread.joinable()) impl_->thread.join();
-    std::unique_lock<std::mutex> lk(impl_->mu);
+    std::unique_lock<LoopFirstMutex> lk(impl_->mu);
     impl_->cv.wait(lk, [this] { return !impl_->running; }); // caller-owned run()
     impl_->finish_shutdown(); // also handles nodes whose loop was never started
 }
@@ -2578,17 +2623,17 @@ bool     Node::is_running() const { return impl_->running; }
 uint16_t Node::local_port() const { return impl_->port; }
 
 std::optional<Endpoint> Node::reflexive() const {
-    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     return impl_->srflx;
 }
 
 bool Node::server_connected() const {
-    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     return impl_->ctl_state == Impl::Ctl::Up;
 }
 
 size_t Node::pending_requests() const {
-    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     return impl_->requests.size();
 }
 

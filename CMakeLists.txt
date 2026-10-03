@@ -80,7 +80,10 @@ add_subdirectory(src/api)
 add_subdirectory(examples)
 add_subdirectory(tools)
 
-if (UCONNECT_BUILD_SERVER)
+# The tests need the server's libraries even when its executable is off: the
+# Node tests run a real Rendezvous in-process. UCONNECT_BUILD_SERVER gates the
+# executable alone (see server/CMakeLists.txt).
+if (UCONNECT_BUILD_SERVER OR UCONNECT_BUILD_TESTS)
     add_subdirectory(server)
 endif()
 

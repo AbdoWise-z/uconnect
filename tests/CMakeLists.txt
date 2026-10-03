@@ -31,7 +31,9 @@ add_test(NAME uconn_observe_reports_unreachable_server
 # exchange data over actual TCP sockets. Separate from the unit suite because
 # it binds a port and takes ~15s; the sans-IO tests above cover the protocol
 # logic deterministically in milliseconds.
-if (UCONNECT_BUILD_SERVER AND UNIX OR MINGW)
+#
+# Both run the server executable, so they exist only when it is built.
+if (UCONNECT_BUILD_SERVER AND (UNIX OR MINGW))
     add_test(NAME uconnect_smoke
              COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/smoke.sh)
     set_tests_properties(uconnect_smoke PROPERTIES TIMEOUT 90 LABELS "e2e")
@@ -41,7 +43,7 @@ endif()
 # and relayed through the rendezvous server, verifying every byte. Slower than
 # the smoke test above, so it is labelled separately: ctest -L e2e runs both,
 # ctest -LE slow skips this one.
-if (UCONNECT_BUILD_SERVER AND UNIX OR MINGW)
+if (UCONNECT_BUILD_SERVER AND (UNIX OR MINGW))
     add_test(NAME uconnect_transfer_smoke
              COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/transfer-smoke.sh)
     set_tests_properties(uconnect_transfer_smoke PROPERTIES TIMEOUT 200 LABELS "e2e;slow")

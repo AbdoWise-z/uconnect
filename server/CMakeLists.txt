@@ -14,11 +14,14 @@ add_library(uconnect_rendezvous STATIC
 target_include_directories(uconnect_rendezvous PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uconnect_rendezvous PUBLIC uconnect_store uconnect_io)
 
-# The binary is the only part here that touches the network.
-add_executable(uconnect-rendezvous
-        main.cpp
-        stun.hpp
-        stun.cpp
-)
-target_link_libraries(uconnect-rendezvous PRIVATE uconnect_rendezvous Threads::Threads)
-uconnect_bundle_runtime(uconnect-rendezvous)
+# The binary is the only part here that touches the network. The libraries
+# above are built for the tests too; this, only when the server is wanted.
+if (UCONNECT_BUILD_SERVER)
+    add_executable(uconnect-rendezvous
+            main.cpp
+            stun.hpp
+            stun.cpp
+    )
+    target_link_libraries(uconnect-rendezvous PRIVATE uconnect_rendezvous Threads::Threads)
+    uconnect_bundle_runtime(uconnect-rendezvous)
+endif()

@@ -15,9 +15,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
-SERVER="./build/server/uconnect-rendezvous$EXE"
-XFER="./build/examples/uconn-transfer$EXE"
-DEMO="./build/examples/uconn-demo$EXE"
+# CTest passes the binaries of the tree it is testing; run by hand, this
+# defaults to ./build.
+SERVER="${UCONNECT_SERVER:-./build/server/uconnect-rendezvous$EXE}"
+XFER="${UCONNECT_XFER:-./build/examples/uconn-transfer$EXE}"
+DEMO="${UCONNECT_DEMO:-./build/examples/uconn-demo$EXE}"
 BYTES=${BYTES:-1048576}
 DGRAMS=${DGRAMS:-500}
 FAIL=0

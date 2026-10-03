@@ -6,8 +6,10 @@ set -u
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
-SERVER="./build/server/uconnect-rendezvous$EXE"
-DEMO="./build/examples/uconn-demo$EXE"
+# CTest passes the binaries of the tree it is testing; run by hand, this
+# defaults to ./build.
+SERVER="${UCONNECT_SERVER:-./build/server/uconnect-rendezvous$EXE}"
+DEMO="${UCONNECT_DEMO:-./build/examples/uconn-demo$EXE}"
 UC_PORT=${UC_PORT:-14433}
 
 cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; }

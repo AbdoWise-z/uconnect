@@ -31,6 +31,7 @@ RendezvousConfig scrambled() {
     RendezvousConfig c;
     c.port                            = 5001;
     c.bind_host                       = "127.0.0.1";
+    c.threads                         = 3;
     c.max_connections                 = 123;
     c.max_connections_per_ip          = 7;
     c.idle_timeout                    = 61s;
@@ -189,6 +190,8 @@ TEST(config_rejects_what_it_cannot_read_and_says_where) {
         {"port: 44x\n", "line 1: 'port' must be a whole number, not '44x'"},
         {"port: -1\n", "must be a whole number"},
         {"port: 70000\n", "line 1: 'port' must be at most 65535"},
+        {"threads: 0\n", "line 1: 'threads' must be at least 1"},
+        {"threads: 1000\n", "line 1: 'threads' must be at most 256"},
         {"registry:\n  max_entries: 99999999999999999999999\n", "line 2: 'registry.max_entries' must be a whole number"},
         {"registry:\n  max_entries: 0\n", "'registry.max_entries' must be at least 1"},
         {"relay:\n  max_bytes: 32MB\n", "'relay.max_bytes' must be a size"},
@@ -251,7 +254,8 @@ TEST(server_flags_override_the_config_file_wherever_they_appear) {
     CHECK(!o.print_config);
 
     REQUIRE(parse_server_args({"--config", f.str(), "--stale", "90s", "--max-per-ip", "9",
-                               "--bind", "0.0.0.0", "--print-config"}, o, err));
+                               "--bind", "0.0.0.0", "--threads", "4", "--print-config"}, o, err));
+    CHECK_EQ(o.cfg.threads, 4u);
     CHECK(o.cfg.registry.stale_after == 90s);
     CHECK_EQ(o.cfg.registry.max_per_ip_per_topic, 9u);
     CHECK(o.cfg.bind_host == "0.0.0.0");

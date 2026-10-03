@@ -7,6 +7,7 @@
 // the same Rendezvous the real server binary runs.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -60,14 +61,21 @@ public:
         start();
     }
 
+    // Locked accessors: with threads > 1 the server's workers run outside mu_.
     server::RegistryStats stats() {
         std::lock_guard<std::mutex> lk(mu_);
-        return rv_->service().registry().stats(std::chrono::steady_clock::now());
+        return rv_->stats(std::chrono::steady_clock::now());
     }
 
     size_t connections() {
         std::lock_guard<std::mutex> lk(mu_);
-        return rv_->service().connections();
+        return rv_->control_connections();
+    }
+
+    // Every TCP connection the server holds, relay legs on its workers included.
+    size_t open_connections() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return rv_->open_connections();
     }
 
     void set_drop_filter(std::function<bool(std::span<const uint8_t>)> filter) {
@@ -1344,6 +1352,93 @@ TEST(datagrams_flooded_both_ways_still_arrive) {
     REQUIRE(sent_a > 1000 && sent_b > 1000);
     CHECK(p.count_b() * 2 >= sent_a.load());  // at least half arrives, each way
     CHECK(p.count_a() * 2 >= sent_b.load());
+}
+
+TEST(a_multithreaded_server_relays_every_byte_and_releases_its_legs) {
+    // threads > 1: each spliced TCP relay pair moves to a worker, and every
+    // thread reads the UDP socket. Several relayed pairs at once, so more than
+    // one worker carries traffic; every message byte is checked, in order.
+    constexpr int    kPairs = 3;
+    constexpr size_t kBytes = 1u << 20;  // each way, per pair
+    auto pat = [](size_t i) { return static_cast<uint8_t>((i * 31 + 7) & 0xFF); };
+
+    struct Flow {
+        std::atomic<size_t> got{0};
+        std::atomic<bool>   bad{false};
+    };
+    std::array<Flow, 2 * kPairs> flows;  // declared first: it outlives the nodes
+
+    server::RendezvousConfig rcfg;
+    rcfg.threads = 3;
+    LocalServer srv{rcfg};
+    {
+        std::vector<std::unique_ptr<DgramPair>> pairs;
+        for (int i = 0; i < kPairs; ++i) {
+            pairs.push_back(std::make_unique<DgramPair>(
+                srv, dgram_config(srv, true, DatagramFallback::Relay),
+                dgram_config(srv, true, DatagramFallback::Relay)));
+            DgramPair& p = *pairs.back();
+            for (int side = 0; side < 2; ++side) {
+                Flow&  f  = flows[static_cast<size_t>(2 * i + side)];
+                Topic* to = side == 0 ? p.b : p.a;
+                to->on_data([&f, pat](DevId, std::span<const uint8_t> d) {
+                    const size_t at = f.got.load();
+                    for (size_t k = 0; k < d.size(); ++k) {
+                        if (d[k] != pat(at + k)) f.bad = true;
+                    }
+                    f.got += d.size();
+                });
+            }
+            REQUIRE(p.connect());
+            REQUIRE(p.a->link(p.idb()).has_value() && p.a->link(p.idb())->relayed);
+        }
+
+        // Messages, both ways on every pair at once.
+        std::vector<std::thread> senders;
+        for (int i = 0; i < kPairs; ++i) {
+            for (int side = 0; side < 2; ++side) {
+                senders.emplace_back([&, i, side] {
+                    DgramPair&           p    = *pairs[static_cast<size_t>(i)];
+                    Topic*               from = side == 0 ? p.a : p.b;
+                    const DevId          to   = side == 0 ? p.idb() : p.ida();
+                    std::vector<uint8_t> chunk(32 * 1024);
+                    const auto deadline = std::chrono::steady_clock::now() + 20s;
+                    for (size_t sent = 0; sent < kBytes && std::chrono::steady_clock::now() < deadline;) {
+                        const size_t n = std::min(chunk.size(), kBytes - sent);
+                        for (size_t k = 0; k < n; ++k) chunk[k] = pat(sent + k);
+                        if (from->send(to, std::span(chunk).first(n))) sent += n;
+                        else std::this_thread::sleep_for(1ms);
+                    }
+                });
+            }
+        }
+        for (auto& t : senders) t.join();
+        CHECK(wait_until([&] {
+            return std::all_of(flows.begin(), flows.end(), [&](const Flow& f) { return f.got == kBytes; });
+        }, 20s));
+        for (const auto& f : flows) CHECK(!f.bad.load());
+
+        // Datagrams through the UDP relay, which every server thread reads.
+        for (auto& p : pairs) REQUIRE(p->a->open_datagrams(p->idb(), DatagramFallback::Relay));
+        for (auto& p : pairs) REQUIRE(p->settled(DatagramPath::Relayed));
+        for (int n = 0; n < 200; ++n) {
+            for (auto& p : pairs) {
+                p->a->send_datagram(p->idb(), bytes("a"));
+                p->b->send_datagram(p->ida(), bytes("b"));
+            }
+            if (n % 10 == 9) std::this_thread::sleep_for(2ms);
+        }
+        CHECK(wait_until([&] {
+            return std::all_of(pairs.begin(), pairs.end(), [](const auto& p) {
+                return p->count_a() >= 190 && p->count_b() >= 190;
+            });
+        }, 5s));
+        // The workers' charges reach the registry.
+        CHECK(srv.stats().relay_bytes >= 2 * kPairs * kBytes);
+    }
+    // Every node is gone: the workers must close their legs and give each
+    // address its connections back.
+    CHECK(wait_until([&] { return srv.open_connections() == 0; }, 10s));
 }
 
 TEST(datagrams_with_no_fallback_report_failure_and_refuse_to_send) {

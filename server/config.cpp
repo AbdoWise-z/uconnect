@@ -350,6 +350,7 @@ const std::vector<Field>& schema() {
         Field{"bind", Kind::Text, 0, 0, nullptr, nullptr,
               [](const RendezvousConfig& c) { return c.bind_host; },
               [](RendezvousConfig& c, std::string v) { c.bind_host = std::move(v); }},
+        UC_NUM("threads", Kind::Count, threads, 1, 256),
 
         UC_NUM("connections.max", Kind::Count, max_connections, 1, kMaxSize),
         UC_NUM("connections.max_per_ip", Kind::Count, max_connections_per_ip, 1, kMaxSize),
@@ -565,6 +566,7 @@ bool parse_server_args(const std::vector<std::string>& args, ServerOptions& out,
     const std::pair<const char*, const char*> valued[] = {
         {"--port", "port"},
         {"--bind", "bind"},
+        {"--threads", "threads"},
         {"--stale", "registry.stale_after"},
         {"--max-per-ip", "registry.max_per_ip_per_topic"},
     };

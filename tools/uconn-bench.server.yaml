@@ -7,8 +7,11 @@
 # An 8-node relayed mesh needs 28 relays per kind and 64+ connections from
 # 127.0.0.1, and a relay carries far more than 32 MiB in a five-second run.
 #
-# Nothing that shapes throughput is changed: the splice buffer, the server's
-# single thread and its socket handling are as shipped.
+# One thing that shapes throughput is changed: the server runs four threads,
+# so relayed traffic is not carried by one core. (--server-threads overrides
+# it.) The splice buffer and socket handling are as shipped.
+
+threads: 4
 
 connections:
   max_per_ip: 100000

@@ -41,6 +41,8 @@ void usage() {
         "                        The flags below override it, wherever they appear\n"
         "  --print-config        print the configuration in force and exit\n"
         "  --port <n>            TCP and UDP port to bind (default 4433)\n"
+        "  --threads <n>         threads carrying traffic (default 1); more spread\n"
+        "                        relayed traffic across cores\n"
         "  --bind <addr>         bind UDP to a specific address (default: all\n"
         "                        interfaces); TCP always listens on all of them\n"
         "  --stale <secs>        freshness window (default 45)\n"
@@ -166,9 +168,10 @@ int main(int argc, char** argv) {
     }
 
     std::printf("uconnect-rendezvous listening on TCP+UDP %u\n", rv.port());
-    std::printf("  stale %llds  quota %zu/ip/topic  relay %s\n",
+    std::printf("  stale %llds  quota %zu/ip/topic  relay %s  threads %zu\n",
                 static_cast<long long>(cfg.registry.stale_after.count()),
-                cfg.registry.max_per_ip_per_topic, cfg.registry.relay_enabled ? "on" : "off");
+                cfg.registry.max_per_ip_per_topic, cfg.registry.relay_enabled ? "on" : "off",
+                cfg.threads);
     std::fflush(stdout);
 
     auto last_report = std::chrono::steady_clock::now();
@@ -177,12 +180,12 @@ int main(int argc, char** argv) {
 
         auto now = std::chrono::steady_clock::now();
         if (!quiet && now - last_report >= 30s) {
-            auto st = rv.service().registry().stats(now);
+            auto st = rv.stats(now);  // locked: workers may be running
             std::printf(
                 "[stats] conns=%zu topics=%llu(listed %llu) records=%llu(fresh %llu) "
                 "reg=%llu lookup=%llu connect=%llu relays=%llu(open %llu, %llu bytes) "
                 "rej{quota=%llu}\n",
-                rv.service().connections(),
+                rv.control_connections(),
                 static_cast<unsigned long long>(st.topics_total),
                 static_cast<unsigned long long>(st.topics_listed),
                 static_cast<unsigned long long>(st.entries_total),

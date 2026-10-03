@@ -3,8 +3,8 @@
 #   uconnect-rendezvous --config rendezvous.yaml
 #
 # Keep only the keys you change; the rest keep these defaults. Flags on the
-# command line (--port, --bind, --stale, --max-per-ip, --no-relay) override
-# this file. --print-config shows what is finally in force.
+# command line (--port, --bind, --threads, --stale, --max-per-ip, --no-relay)
+# override this file. --print-config shows what is finally in force.
 #
 # Durations: seconds, or with a unit: 90s, 2m, 1h.
 # Sizes: bytes, or with a unit: 4096, 256KiB, 32MiB, 1GiB.
@@ -15,6 +15,7 @@
 
 port: 4433          # TCP and UDP; 0 picks a free one
 bind: ""            # UDP address to bind; empty for all. TCP listens on all.
+threads: 1          # threads carrying traffic; more spreads relayed traffic across cores
 
 connections:
   max: 20000                  # control connections and relay legs, all told

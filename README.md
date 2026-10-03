@@ -999,25 +999,31 @@ costs one conditional request a minute and needs nothing open.
 ```sh
 uconnect-rendezvous --port 4433 \
     --bind 0.0.0.0 \
+    --threads 4 \
     --stale 45 \
     --max-per-ip 16 \
     --no-relay \
     --quiet
+uconnect-rendezvous --config rendezvous.yaml   # every limit, from a file
+uconnect-rendezvous --config rendezvous.yaml --print-config   # what is in force, then exit
 uconnect-rendezvous --nat-check     # report what this host's NAT does, then exit
 ```
 
 `--port` is TCP and UDP alike. `--bind` pins the UDP socket to one address; TCP
-always listens on every interface. `--stale` is how long a record may go
-unrefreshed before `LOOKUP` flags it. `--no-relay` refuses relay allocations, so
-pairs that cannot punch fail instead of costing you bandwidth.
+always listens on every interface. `--threads` is how many threads carry
+traffic: beyond the first, each takes a share of the spliced TCP relays, and all
+of them read UDP, so relayed traffic is not bound to one core. `--stale` is how
+long a record may go unrefreshed before `LOOKUP` flags it. `--no-relay` refuses
+relay allocations, so pairs that cannot punch fail instead of costing you
+bandwidth.
 
-Everything else lives in `RegistryConfig`, `ControlConfig` and
-`RendezvousConfig` in `server/registry.hpp`, `server/control_service.hpp` and
-`server/rendezvous.hpp` — quotas, relay limits and budgets, byte budgets,
-connection limits, timeouts. Tune those against real numbers rather than by
-guessing: unless `--quiet` is set the server prints a `[stats]` line every 30
-seconds, and the same figures are available remotely from `uconn-demo --stats`,
-`uconn-observe`, or the dashboard.
+Everything else -- quotas, relay limits and budgets, rate limits, connection
+limits, timeouts -- is set in a YAML file given with `--config`;
+`server/rendezvous.example.yaml` lists every key at its default. Flags override
+the file. Tune those against real numbers rather than by guessing: unless
+`--quiet` is set the server prints a `[stats]` line every 30 seconds, and the
+same figures are available remotely from `uconn-demo --stats`, `uconn-observe`,
+or the dashboard.
 
 To change the deployed flags, edit `ExecStart` in
 `deploy/uconnect-rendezvous.service` and re-run the installer. The watcher does
@@ -1090,26 +1096,30 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-re
 Modes are `tcp` and `udp` (punched directly) and `tcp-relay` and `udp-relay`
 (through the server). `tools/uconn-bench.server.yaml` lifts the server's
 per-address quotas, which loopback would otherwise hit, since every node comes
-from 127.0.0.1. TCP is measured flat out. Datagrams are measured twice: flooded,
-and then paced up a ladder of rates to find the highest at which at least 99%
-arrive.
+from 127.0.0.1, and runs the server on four threads (`--server-threads`
+overrides that). TCP is measured flat out. Datagrams are measured twice:
+flooded, and then paced up a ladder of rates to find the highest at which at
+least 99% arrive.
 
 Medians of three runs on an i7-11800H (8 cores/16 threads, Windows, MinGW
-Release), 2026-10-03. Totals are across all links; a link is one direction
-between two nodes.
+Release), 2026-10-04, server on four threads. Totals are across all links; a
+link is one direction between two nodes. Every datagram figure here had at
+least 99.5% arriving, sent as fast as the library would take them.
 
-| Nodes (links) | TCP | TCP relayed | UDP, ≥99% arriving | UDP relayed, ≥99% arriving |
+| Nodes (links) | TCP | TCP relayed | UDP | UDP relayed |
 |---|---|---|---|---|
-| 2 (2)  | 155 MiB/s | 161 MiB/s | 67 MiB/s (32 000/s per link) | 67 MiB/s (32 000/s per link) |
-| 4 (12) | 320 MiB/s | 175 MiB/s | 101 MiB/s (8 000/s) | 50 MiB/s (4 000/s) |
-| 6 (30) | 343 MiB/s | 146 MiB/s | 126 MiB/s (4 000/s) | 32 MiB/s (1 000/s) |
-| 8 (56) | 439 MiB/s | 108 MiB/s | 116 MiB/s (2 000/s) | 29 MiB/s (500/s) |
+| 2 (2)  | 196 MiB/s | 184 MiB/s | 63 MiB/s | 43 MiB/s |
+| 4 (12) | 346 MiB/s | 316 MiB/s | 82 MiB/s | 64 MiB/s |
+| 6 (30) | 469 MiB/s | 403 MiB/s | 103 MiB/s | 80 MiB/s |
+| 8 (56) | 567 MiB/s | 252 MiB/s | 118 MiB/s | 84 MiB/s |
 
 Everything shares one machine, so these are the library's ceilings, not a
-network's. Relayed totals fall as nodes are added because one server thread
-carries every relayed byte. Flooded datagrams fare far worse than paced ones
-(8–65 MiB/s with 7–22% arriving): a node sending datagrams in a tight loop
-holds the lock its own receive loop needs to drain its socket.
+network's -- and at eight nodes the nodes' loops and senders and the server's
+threads together outnumber its sixteen hardware threads, which is why relayed
+TCP falls back there. Datagrams are sender-bound: an application thread and
+the node's loop share one lock, which the loop takes first so that it always
+drains its socket. On one server thread, relayed TCP stays at 111–160 MiB/s
+and relayed UDP at 37–53 MiB/s, with up to 82% lost under load.
 
 ---
 

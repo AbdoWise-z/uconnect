@@ -73,6 +73,7 @@ struct Options {
     double            ladder_seconds = 1.5;  // each paced datagram step
     size_t            msg_size = 64 * 1024;
     std::string       server_config;
+    int               server_threads = 0;  // 0: as the config says
     std::string       csv;
     bool              verbose = false;
 };
@@ -399,6 +400,7 @@ void usage() {
         "\n"
         "  --server-config <yaml>  the in-process server's limits; without it the\n"
         "                          shipped defaults, which cap relayed runs\n"
+        "  --server-threads <n>    the server's threads, overriding the config\n"
         "  --nodes <list>          node counts (default 2,4,6,8)\n"
         "  --modes <list>          tcp, tcp-relay, udp, udp-relay (default all)\n"
         "  --seconds <s>           measured window per run (default 5)\n"
@@ -424,6 +426,8 @@ bool parse(int argc, char** argv, Options& o) {
             return false;
         } else if (a == "--server-config") {
             o.server_config = v;
+        } else if (a == "--server-threads") {
+            o.server_threads = std::atoi(v);
         } else if (a == "--csv") {
             o.csv = v;
         } else if (a == "--seconds") {
@@ -484,11 +488,12 @@ int main(int argc, char** argv) {
     } else {
         std::fprintf(stderr, "note: no --server-config; relayed runs meet the default limits\n");
     }
+    if (o.server_threads > 0) scfg.threads = static_cast<size_t>(o.server_threads);
 
     std::printf("uconn-bench: %.1fs window after %.1fs warm-up; TCP messages %zu B, datagrams %zu B\n",
                 o.seconds, o.warmup, o.msg_size, Topic::max_datagram());
-    std::printf("server limits: %s\n\n",
-                o.server_config.empty() ? "(defaults)" : o.server_config.c_str());
+    std::printf("server limits: %s, %zu thread(s)\n\n",
+                o.server_config.empty() ? "(defaults)" : o.server_config.c_str(), scfg.threads);
     std::printf("%-10s %5s %6s %11s %10s %10s %11s %7s %9s\n", "mode", "nodes", "links",
                 "total MiB/s", "per link", "per node", "units/s", "arrived", "setup");
 

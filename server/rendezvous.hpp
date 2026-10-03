@@ -10,12 +10,22 @@
 //   anything   -> a node's control connection, handed to ControlService for
 //   else          as long as it stays open.
 //
-// Single-threaded: poll_once() does one round of waiting and work. The binary
-// loops on it; tests drive it from a thread of their own.
+// poll_once() does one round of waiting and work; the binary loops on it, and
+// tests drive it from a thread of their own. With threads > 1 the server also
+// runs workers beside that loop: once a relay pair is spliced it moves to a
+// worker, which carries it alone from then on, and every thread -- the loop
+// and the workers -- reads the one UDP socket. The registry and control
+// service are shared, under a lock held only for the bookkeeping, never
+// across a socket call.
 
+#include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "control_service.hpp"
@@ -47,6 +57,12 @@ struct RendezvousConfig {
     // Bytes a splice holds for a slow receiver before it stops reading from
     // the sender -- backpressure, not buffering without bound.
     size_t splice_buffer = 256 * 1024;
+
+    // Threads carrying traffic: 1 is poll_once()'s loop alone; each one more
+    // is a worker beside it. Relayed traffic is what they share -- TCP relay
+    // pairs are spread across the workers, and all threads read UDP -- so
+    // beyond the cores the relays can use, more only adds switching.
+    size_t threads = 1;
 };
 
 class Rendezvous {
@@ -56,7 +72,8 @@ public:
     Rendezvous(const Rendezvous&)            = delete;
     Rendezvous& operator=(const Rendezvous&) = delete;
 
-    // Bind the listener and the UDP socket. False, with error(), on failure.
+    // Bind the listener and the UDP socket, and start the workers. False, with
+    // error(), on failure.
     bool        open();
     uint16_t    port() const { return port_; }
     std::string error() const { return err_; }
@@ -64,8 +81,14 @@ public:
     // Wait up to `timeout` for activity, then deal with all of it.
     void poll_once(std::chrono::milliseconds timeout);
 
+    // Unlocked, for a single-threaded server between poll_once() calls --
+    // what the tests do. With workers running, use the two below.
     ControlService& service() { return service_; }
-    size_t          open_connections() const { return conns_.size(); }
+    RegistryStats   stats(Instant now);
+    size_t          control_connections();
+
+    // Every TCP connection, the workers' included.
+    size_t open_connections() const;
 
     // Test hook: every incoming control message and UDP datagram is offered
     // to this first; returning true drops it, as a lossy path would.
@@ -90,16 +113,25 @@ private:
         bool                       dead = false;
     };
 
+    using ConnMap = std::unordered_map<ConnKey, Conn>;
+    struct Worker;
+
     void accept_all(Instant now);
     void read_from(Conn&, Instant now);
     void on_frame(Conn&, std::span<const uint8_t> msg, Instant now);
     void on_relay_join(Conn&, std::span<const uint8_t> msg, Instant now);
-    void splice_read(Conn&, Instant now);
+    void splice_read(Conn&, ConnMap&, Instant now);
     void flush(Conn&);
     void deliver(const Framed&);
     void kill(Conn&);
     void reap(Instant now);
     void read_udp(Instant now);
+
+    // Shared with the workers.
+    bool charge(wire::RelayId, size_t bytes, Instant now);  // relay_charge, locked
+    void release(const Conn&);  // a closed connection leaves its address's count
+    void hand_off();            // spliced pairs from conns_ to the workers
+    void worker_loop(Worker&);
 
     RendezvousConfig cfg_;
     Registry         registry_;
@@ -109,12 +141,19 @@ private:
     uint16_t         port_ = 0;
     std::string      err_;
 
-    std::unordered_map<ConnKey, Conn>                     conns_;
+    ConnMap                                                        conns_;  // the loop's own
     std::unordered_map<std::array<uint8_t, 16>, size_t, ArrayHash> per_ip_;
     // A relay leg waiting for its partner, by relay id and side.
     std::unordered_map<wire::RelayId, ConnKey> waiting_[2];
     ConnKey next_key_ = 1;
     Instant last_tick_{};
+
+    std::mutex service_mu_;  // registry_ and service_
+    std::mutex ip_mu_;       // per_ip_
+    std::vector<std::pair<ConnKey, ConnKey>> spliced_;  // pairs to hand off this round
+    std::vector<std::unique_ptr<Worker>>     workers_;
+    size_t                                   next_worker_ = 0;
+    std::atomic<bool>                        stop_{false};
 };
 
 }  // namespace uconnect::server

@@ -129,6 +129,39 @@ TEST(tcp_a_closed_peer_is_reported_as_the_end_of_the_connection) {
     CHECK(!got.has_value());
 }
 
+TEST(tcp_sending_to_a_reset_connection_fails_without_killing_the_process) {
+    // #74. A write to a connection the peer has reset raises SIGPIPE on POSIX,
+    // and its default action ends the process. Linux has MSG_NOSIGNAL for
+    // that; macOS and the BSDs need SO_NOSIGPIPE on the socket instead. Both
+    // ends are tried -- the dialled and the accepted socket are set up apart.
+    for (bool from_accepted : {false, true}) {
+        TcpSocket listener;
+        REQUIRE(listener.open(0));
+        REQUIRE(listener.listen());
+        TcpSocket client;
+        REQUIRE(client.open(0));
+        REQUIRE(client.connect(loopback(listener.local_port())));
+        auto server_side = wait_accept(listener);
+        REQUIRE(server_side.has_value());
+        REQUIRE(wait_connected(client));
+
+        TcpSocket& sender = from_accepted ? *server_side : client;
+        TcpSocket& gone   = from_accepted ? client : *server_side;
+        gone.abort();  // a reset, as a peer whose host restarted sends
+
+        // The first write may still be accepted; one after the reset arrives
+        // must fail -- and this process must still be here to see it.
+        const std::vector<uint8_t> data(4096, 0x33);
+        std::optional<size_t>      sent = 0;
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (sent && std::chrono::steady_clock::now() < deadline) {
+            sent = sender.send(data);
+            std::this_thread::sleep_for(10ms);
+        }
+        CHECK(!sent.has_value());
+    }
+}
+
 TEST(tcp_a_listener_and_an_outgoing_connection_share_one_port) {
     // The node's listener and its rendezvous connection live on the same
     // port. If the OS refused the second bind, the address the server sees

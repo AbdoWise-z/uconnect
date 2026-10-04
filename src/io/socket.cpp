@@ -436,6 +436,18 @@ void set_port_sharing(RawSocket s) {
 #endif
 }
 
+// A write to a connection the peer has reset raises SIGPIPE, whose default
+// action ends the process. send() passes MSG_NOSIGNAL where it exists; where it
+// does not -- macOS and the BSDs -- the socket itself must be told instead.
+void suppress_sigpipe(RawSocket s) {
+#if !defined(_WIN32) && !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int on = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)s;
+#endif
+}
+
 uint16_t bound_port(RawSocket s) {
     sockaddr_storage b{};
     socklen_type     len = sizeof(b);
@@ -452,6 +464,7 @@ TcpSocket::~TcpSocket() { close(); }
 TcpSocket::TcpSocket(NativeSocket accepted, bool v6)
     : fd_(accepted), v6_(v6), state_(State::Connected) {
     set_nonblocking(raw(fd_));
+    suppress_sigpipe(raw(fd_));
     set_connected_options();
     local_port_ = bound_port(raw(fd_));
 }
@@ -501,6 +514,7 @@ bool TcpSocket::open(uint16_t port, bool v6) {
     }
     set_port_sharing(s);
     set_nonblocking(s);
+    suppress_sigpipe(s);
 
     sockaddr_storage ss{};
     socklen_type     len;

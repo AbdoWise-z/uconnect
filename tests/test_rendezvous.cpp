@@ -324,6 +324,52 @@ TEST(rendezvous_a_spliced_pair_silent_both_ways_is_closed) {
     }
 }
 
+TEST(rendezvous_a_relay_survivor_gets_everything_its_partner_sent_before_closing) {
+    // #72. When one leg of a splice closes, the other is owed what the server
+    // still holds for it. A survivor that was itself sending -- readable --
+    // used to be killed on its next read, and that tail was lost: often the
+    // departing node's Close, so its goodbye looked like a timeout.
+    for (size_t threads : {size_t{1}, size_t{2}}) {
+        RendezvousConfig cfg;
+        cfg.threads       = threads;
+        cfg.splice_buffer = 16u << 20;  // room for all of la's stream at once
+        Server s{cfg};
+        Client a{s}, b{s};
+        auto   ra = register_in(a, topic_of(1));
+        auto   rb = register_in(b, topic_of(1));
+        a.send(ctl::message(MsgType::RelayAlloc, 4,
+                            ctl::RelayAlloc{ra.dev_id, rb.dev_id, ctl::RelayKind::Tcp}));
+        auto grant = decode<ctl::RelayAllocOk>(a.expect(MsgType::RelayAllocOk),
+            [](wire::Reader& r) { return ctl::RelayAllocOk::decode(r); });
+        auto offer = decode<ctl::RelayOffer>(b.expect(MsgType::RelayOffer),
+            [](wire::Reader& r) { return ctl::RelayOffer::decode(r); });
+        REQUIRE(grant.has_value());
+        REQUIRE(offer.has_value());
+        Client la{s}, lb{s};
+        la.send(ctl::message(MsgType::RelayJoin, 0, ctl::RelayJoin{grant->relay_id, grant->token}));
+        lb.send(ctl::message(MsgType::RelayJoin, 0, ctl::RelayJoin{offer->relay_id, offer->token}));
+        REQUIRE(la.expect(MsgType::RelayJoinOk).has_value());
+        REQUIRE(lb.expect(MsgType::RelayJoinOk).has_value());
+
+        // la sends a stream and closes cleanly. lb reads nothing yet, so the
+        // server is left holding most of it for lb when la's leg goes.
+        const size_t total = 4u << 20;
+        std::thread  writer([&] {
+            std::vector<uint8_t> chunk(64 * 1024, 0x61);
+            for (size_t sent = 0; sent < total; sent += chunk.size()) la.send_raw(chunk);
+            la.close();
+        });
+        writer.join();
+        std::this_thread::sleep_for(300ms);  // the server reads la's end and drops its leg
+
+        // Then lb says something -- readable now -- and only afterwards reads.
+        const std::vector<uint8_t> chatter(16, 0x62);
+        lb.send_raw(chatter);
+        std::this_thread::sleep_for(300ms);
+        CHECK_EQ(lb.read_raw(total, 10s).size(), total);
+    }
+}
+
 TEST(rendezvous_a_relay_join_with_the_wrong_token_is_refused) {
     Server s;
     Client a{s}, b{s};

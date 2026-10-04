@@ -97,11 +97,14 @@ void Rendezvous::poll_once(std::chrono::milliseconds timeout) {
         io::PollItem it;
         it.fd = c.sock.native();
         // A splice stops reading while its partner still holds a full
-        // buffer: that is how a slow receiver slows the sender down.
-        it.want_read = true;
+        // buffer: that is how a slow receiver slows the sender down. One
+        // that has finished sending has nothing more to read.
+        it.want_read = !c.read_done;
         if (c.mode == Mode::Splice) {
             auto p = conns_.find(c.partner);
-            if (p != conns_.end() && p->second.out.size() >= cfg_.splice_buffer) it.want_read = false;
+            if (p != conns_.end() && !p->second.dead && p->second.out.size() >= cfg_.splice_buffer) {
+                it.want_read = false;
+            }
         }
         it.want_write = !c.out.empty();
         items.push_back(it);
@@ -300,7 +303,17 @@ void Rendezvous::on_relay_join(Conn& c, std::span<const uint8_t> msg, Instant no
 void Rendezvous::splice_read(Conn& c, ConnMap& conns, Instant now) {
     auto pit = conns.find(c.partner);
     if (pit == conns.end() || pit->second.dead) {
-        kill(c);
+        // The survivor of a splice is owed what is still held for it --
+        // often the departing node's last records, its Close among them.
+        // Killed here while it was readable, it lost them (#72). It goes once
+        // they are written; reaping sees to that. What it still sends has
+        // nowhere to go, but is read and dropped all the same: a socket closed
+        // with unread input is reset, and the reset discards the very tail it
+        // was waiting to deliver.
+        std::vector<uint8_t> sink(kReadChunk);
+        auto                 got = c.sock.recv(sink);
+        if (!got) c.read_done = true;  // finished sending, or failed: flush() will tell
+        if (c.out.empty()) kill(c);
         return;
     }
     Conn&  p    = pit->second;
@@ -479,7 +492,9 @@ void Rendezvous::worker_loop(Worker& w) {
             io::PollItem it;
             it.fd        = c.sock.native();
             auto p       = w.conns.find(c.partner);
-            it.want_read = !(p != w.conns.end() && p->second.out.size() >= cfg_.splice_buffer);
+            it.want_read = !c.read_done &&  // as in poll_once
+                           !(p != w.conns.end() && !p->second.dead &&
+                             p->second.out.size() >= cfg_.splice_buffer);
             it.want_write = !c.out.empty();
             items.push_back(it);
             keys.push_back(key);

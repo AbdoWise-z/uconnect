@@ -115,6 +115,7 @@ private:
         ConnKey                    partner = 0;
         Instant                    opened{};
         Instant                    last_rx{};
+        bool                       read_done = false;  // a splice survivor that stopped sending
         bool                       dead = false;
     };
 

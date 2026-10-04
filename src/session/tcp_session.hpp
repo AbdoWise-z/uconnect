@@ -128,6 +128,12 @@ public:
     // Tell the peer why, then end. Nothing more goes out after the Close.
     void close(uint16_t reason, Instant now);
 
+    // Send a keepalive now rather than when one falls due. If the far end has
+    // lost this connection -- its host restarted -- the host answers the
+    // segment with a reset, so a dead session is found out in a round trip
+    // instead of an idle timeout. Nothing if not established.
+    void keepalive(Instant now);
+
     // Bytes to write to the socket, in order. Empties the queue.
     std::vector<uint8_t>        take_output();
     bool                        has_output() const { return !out_.empty(); }

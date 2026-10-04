@@ -277,6 +277,25 @@ TEST(tcp_session_keepalives_hold_it_open_and_silence_ends_it) {
     CHECK(p.b.state() == TcpSession::State::Closed);
 }
 
+TEST(tcp_session_a_keepalive_can_be_sent_on_demand_once_established) {
+    // #75: the node asks a session whose peer may have lost it, rather than
+    // waiting for the next keepalive to fall due.
+    auto p = session_pair();
+    CHECK(!p.b.has_output());
+    p.b.keepalive(t0());                     // still handshaking: nothing to send
+    CHECK(!p.b.has_output());
+    pump(p);
+    REQUIRE(p.b.state() == TcpSession::State::Established);
+    (void)drain(p.a);
+
+    p.b.keepalive(t0() + 1s);
+    CHECK(p.b.has_output());
+    pump(p, t0() + 1s);
+    CHECK(drain(p.a).empty());               // the session's own; nothing reaches the layer above
+    CHECK(p.a.last_received() == t0() + 1s);
+    CHECK(p.a.state() == TcpSession::State::Established);
+}
+
 TEST(tcp_session_a_handshake_that_never_finishes_times_out) {
     auto p = session_pair();
     p.a.take_output();  // message 1 lost in a dead connection

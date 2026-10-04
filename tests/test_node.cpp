@@ -139,6 +139,9 @@ public:
     // One accepted on a listener of our own.
     explicit RawConn(io::TcpSocket accepted) : sock_(std::move(accepted)) {}
 
+    // Reset the connection, as a host does for one it no longer knows.
+    void abort() { sock_.abort(); }
+
     bool connected() { return sock_.state() == io::TcpSocket::State::Connected; }
 
     void send_raw(std::span<const uint8_t> bytes) {
@@ -1098,6 +1101,59 @@ TEST(a_session_that_ends_with_data_still_queued_can_be_reconnected_at_once) {
         while (auto x = r.listener.accept()) r.dials.push_back(std::make_unique<RawConn>(std::move(*x)));
         return r.dials.size() > dials_before;
     }, 3s));
+}
+
+TEST(a_peer_that_lost_its_session_is_reconnected_on_its_introduction) {
+    // #75. A peer whose host restarted on the same address introduces itself
+    // again while our old session with it is still up. That introduction was
+    // ignored while the session looked live, and adopted but never driven
+    // while one was held at all -- so the peer was reachable again only after
+    // our idle timeout. Live: the session is asked, and when the peer's host
+    // resets it, the introduction is taken up. Quiet past every keepalive the
+    // peer owes us: the session is over at once.
+    for (bool quiet : {false, true}) {
+        LocalServer srv;
+        Node        nb{config_for(srv)};
+        nb.run_in_background();
+        Topic* pb = join_in_half(nb, /*low=*/false);
+        REQUIRE(pb != nullptr);
+        Topic&        b     = *pb;
+        const TopicId topic = b.id();
+        ScriptedPeer  r{srv, topic, *b.self(), /*want_smaller=*/true};  // r initiates
+        REQUIRE(r.ok());
+        REQUIRE(b.resolve(r.id).has_value());
+
+        // A first session, on the node's dial to r.
+        b.connect(r.id);
+        RawConn* old = r.first_dial();
+        REQUIRE(old != nullptr);
+        std::vector<uint8_t> in;
+        REQUIRE(read_until(*old, in, [](auto& v) { return session::TcpSession::peek_hello(v).has_value(); }));
+        auto s1 = session::TcpSession::initiate({}, topic, 0, nullptr, r.id, *b.self(),
+                                                *session::TcpSession::peek_hello(in),
+                                                std::chrono::steady_clock::now());
+        REQUIRE(handshake_over(*old, s1, [&] { return b.state(r.id) == PeerState::Connected; }));
+        const auto first = b.channel_binding(r.id);
+
+        // r "restarts": it forgets that session and introduces itself anew.
+        if (quiet) std::this_thread::sleep_for(31s);  // past kLiveSession, inside the idle timeout
+        session::AttemptNonce again{};
+        again.fill(0xC7);
+        r.introduce(topic, *b.self(), again);
+        if (!quiet) {
+            std::this_thread::sleep_for(300ms);  // the introduction lands on a live session
+            old->abort();                        // what r's host answers the node's keepalive with
+        }
+
+        // r dials the node under its new attempt, and must get a new session.
+        RawConn conn{Endpoint{IpAddr::v4(127, 0, 0, 1), nb.local_port()}};
+        REQUIRE(conn.connected());
+        auto s2 = session::TcpSession::initiate({}, topic, 0, nullptr, r.id, *b.self(), again,
+                                                std::chrono::steady_clock::now());
+        CHECK(handshake_over(conn, s2, [&] {
+            return b.state(r.id) == PeerState::Connected && b.channel_binding(r.id) != first;
+        }, 6s));
+    }
 }
 
 TEST(a_silent_inbound_connection_does_not_linger_forever) {

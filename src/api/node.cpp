@@ -411,6 +411,11 @@ struct Peer {
     Instant retry_at{};
     int     retries = 0;
 
+    // An introduction from the peer that arrived while a session with it was
+    // still up; adopted if that session ends soon after. See on_relayed().
+    std::optional<AttemptNonce> waiting_intro;
+    Instant                     waiting_intro_at{};
+
     // The session, and the connection it runs on.
     std::optional<TcpSession> sess;
     io::TcpSocket             sock;
@@ -1170,13 +1175,26 @@ void Node::Impl::on_relayed(const wire::Relayed& rel, Instant now) {
     peer.dev_id = rel.from_dev;
     peer.cands  = cands;
 
-    // A live session is never given up for an introduction: the claim that it
-    // is the same peer proves nothing, and a working connection is worth more
-    // than a new one. A session gone quiet -- the peer restarted -- may be.
-    if (peer.sess) {
-        const bool live = peer.sess->state() == TcpSession::State::Established &&
-                          now - peer.sess->last_received() < kLiveSession;
-        if (live || peer.sess->state() == TcpSession::State::Handshaking) return;
+    if (peer.sess && peer.sess->state() == TcpSession::State::Handshaking) return;
+
+    // An introduction from a peer we hold a session with. Only that peer's own
+    // control connection can send one, and a node introduces itself only to a
+    // peer it has no session with -- so the peer has lost ours, its host most
+    // likely restarted on the same address, or this crossed the session being
+    // made. A live session is still never given up on that account: a
+    // working connection is worth more than a new one. But it is asked: a
+    // keepalive sent now draws a reset from a host that no longer knows the
+    // connection, so a dead session ends in a round trip, not an idle timeout.
+    // One quiet past every keepalive the peer owes us is over already. Either
+    // way the introduction is kept, and taken up when the session ends (#75):
+    // dropped, it left the peer nothing to answer until its attempt ran out.
+    if (peer.sess && peer.sess->state() == TcpSession::State::Established) {
+        peer.waiting_intro    = attempt;
+        peer.waiting_intro_at = now;
+        if (now - peer.sess->last_received() >= kLiveSession) peer.sess->on_eof(now);
+        else peer.sess->keepalive(now);
+        drive_peer(*ti, topic, peer, now);
+        return;
     }
 
     // Both sides may have introduced themselves at once, each with its own
@@ -1451,6 +1469,7 @@ void Node::Impl::start_session(PendingConn& pc, Instant now) {
                                           peer.dev_id, pc.attempt, now);
     peer.sock    = std::move(pc.sock);
     peer.relayed = pc.kind == PendingConn::Kind::RelayLeg;
+    peer.waiting_intro.reset();  // this session is what it asked for
     peer.out.clear();
     peer.closing = false;
     peer.link    = LinkInfo{};
@@ -1588,7 +1607,14 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     set_peer_state(ti, peer, PeerState::Probing);
                 } else {
                     set_peer_state(ti, peer, was_up ? PeerState::Closed : PeerState::Failed);
+                    // An introduction that came while this session was up,
+                    // and is not yet older than the peer would keep trying.
+                    if (peer.waiting_intro &&
+                        now - peer.waiting_intro_at < cfg.punch_timeout + kRelayWindow) {
+                        adopt_attempt(ti, tid, peer, *peer.waiting_intro, now);
+                    }
                 }
+                peer.waiting_intro.reset();
                 break;
             }
         }

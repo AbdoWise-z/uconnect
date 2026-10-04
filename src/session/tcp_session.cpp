@@ -312,6 +312,12 @@ void TcpSession::close(uint16_t reason, Instant now) {
     events_.push_back(std::move(e));
 }
 
+void TcpSession::keepalive(Instant now) {
+    if (state_ != State::Established) return;
+    seal(kKeepalive, {});
+    last_sent_ = now;
+}
+
 void TcpSession::fail(CloseCause cause, Instant now) {
     (void)now;
     if (state_ == State::Closed) return;

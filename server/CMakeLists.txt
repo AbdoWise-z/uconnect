@@ -24,5 +24,8 @@ if (UCONNECT_BUILD_SERVER)
             stun.cpp
     )
     target_link_libraries(uconnect-rendezvous PRIVATE uconnect_rendezvous Threads::Threads)
+    if (UCONNECT_STATIC_SERVER)
+        target_link_options(uconnect-rendezvous PRIVATE -static)
+    endif()
     uconnect_bundle_runtime(uconnect-rendezvous)
 endif()

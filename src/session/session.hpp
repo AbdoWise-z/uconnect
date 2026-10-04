@@ -132,7 +132,7 @@ public:
     void on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, Instant now);
     void on_timeout(Instant now);
 
-    // Returns the packet number used, or nullopt if closed.
+    // Returns the packet number used, or nullopt if closed or payload is empty.
     std::optional<uint64_t> send(std::span<const uint8_t> payload, Instant now);
 
     // Send from now on to `path`. The counters carry on: the keys are the same.
@@ -168,6 +168,7 @@ public:
     Instant last_received() const { return last_recv_; }
 
 private:
+    std::optional<uint64_t> send_packet(std::span<const uint8_t>, Instant now);
     void queue_keepalive(Instant now);
     void queue_close(uint16_t reason);
     void close_with_cause(Instant now, CloseCause, uint16_t peer_reason);

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "sanitize.hpp"
+#include "nickname.hpp"
 #include "terminal.hpp"
 #include "uconnect/uconnect.hpp"
 
@@ -105,7 +106,7 @@ struct Roster {
 
     void set_nick(const DevId& d, const std::string& n) {
         std::lock_guard<std::mutex> lk(mu);
-        by_id[to_hex(d)].nick = n;
+        by_id[to_hex(d)].nick = chat::sanitize_for_terminal(n);
     }
 
     void set_state(const DevId& d, PeerState s) {
@@ -224,6 +225,7 @@ int main(int argc, char** argv) {
     const auto&      C    = term.colors();
     const bool       ansi = term.has_ansi();
     Roster           roster;
+    chat::Nickname   shared_nick{nick};
     std::atomic<bool> stop{false};
 
     auto say = [&](const std::string& s) { term.print(s); };
@@ -272,7 +274,7 @@ int main(int argc, char** argv) {
                     // Announce ourselves. This is application-layer identity;
                     // the transport has already proven topic membership.
                     if (roster.mark_greeted(dev)) {
-                        auto hello = encode(MsgType::Hello, nick);
+                        auto hello = encode(MsgType::Hello, shared_nick.get());
                         topic.send(dev, hello);
                     }
                     term.printf("%s* %s connected%s", C.green,
@@ -416,7 +418,7 @@ int main(int argc, char** argv) {
                 if (list.empty()) { sys("no other peers registered"); continue; }
                 sys(std::to_string(list.size()) + " registered in topic:");
                 for (const auto& p : list) {
-                    std::string nm(p.meta.begin(), p.meta.end());
+                    auto nm = chat::sanitize_for_terminal(std::string(p.meta.begin(), p.meta.end()));
                     sys("  " + short_id(p.dev_id) + "  " + (nm.empty() ? "?" : nm) +
                         "  " + to_string(topic.state(p.dev_id)) +
                         (p.stale ? "  (stale)" : "") + "  age=" +
@@ -433,6 +435,7 @@ int main(int argc, char** argv) {
             else if (cmd == "/nick") {
                 if (arg.empty() || arg.size() > 32) { sys("usage: /nick <name>"); continue; }
                 nick = arg;
+                shared_nick.set(nick);
                 term.set_prompt("[" + nick + "] ");
                 std::vector<uint8_t> m(nick.begin(), nick.end());
                 topic.publish(m, unlisted);  // republish metadata

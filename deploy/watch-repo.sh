@@ -99,6 +99,9 @@ deploy_web() {
     # straight past the repair.
     if [ ! -x "$VENV/bin/python" ] || [ ! -x "$VENV/bin/pip" ]; then
         log "web: creating virtualenv"
+        # This hash describes dependencies installed in the old environment.
+        # Invalidate it before repair, including repairs that fail halfway.
+        rm -f "$WORKDIR/web-req.sha"
         rm -rf "$VENV"
         if ! python3 -m venv "$VENV" > "$WORKDIR/web-venv.log" 2>&1; then
             log "web: WARN python3 -m venv failed -- skipping the dashboard"

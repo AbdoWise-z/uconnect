@@ -14,7 +14,9 @@ static void car25519(gf o) {
         o[i] += (1LL << 16);
         c = o[i] >> 16;
         o[(i + 1) * (i < 15)] += c - 1 + 37 * (c - 1) * (i == 15);
-        o[i] -= c << 16;
+        /* c can be negative. Multiplication is defined: carry limbs stay
+           far below 2^47, so scaling the carry by 2^16 fits in int64_t. */
+        o[i] -= c * 65536;
     }
 }
 

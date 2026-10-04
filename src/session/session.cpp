@@ -193,6 +193,11 @@ std::optional<size_t> Session::open_packet(uint64_t counter, std::span<const uin
 }
 
 std::optional<uint64_t> Session::send(std::span<const uint8_t> payload, Instant now) {
+    if (payload.empty()) return std::nullopt;
+    return send_packet(payload, now);
+}
+
+std::optional<uint64_t> Session::send_packet(std::span<const uint8_t> payload, Instant now) {
     if (state_ != SessionState::Established) return std::nullopt;
 
     advance_send_keys(send_counter_);
@@ -217,7 +222,7 @@ std::optional<uint64_t> Session::send(std::span<const uint8_t> payload, Instant 
 }
 
 void Session::queue_keepalive(Instant now) {
-    send({}, now);  // an empty payload; the peer treats it as a keepalive
+    send_packet({}, now);  // an empty payload; the peer treats it as a keepalive
 }
 
 namespace {

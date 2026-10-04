@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD 11)
 
 option(UCONNECT_BUILD_TESTS  "Build the test suite"   ON)
 option(UCONNECT_BUILD_SERVER "Build the rendezvous server" ON)
+option(UCONNECT_STATIC_SERVER "Statically link the rendezvous executable (Linux)" OFF)
 
 # std::thread needs an explicit link on most Unix toolchains. It happens to work
 # without one on MinGW and on glibc 2.34+, where pthread was folded into libc --

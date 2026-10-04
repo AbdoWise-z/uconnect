@@ -67,6 +67,7 @@ using session::TcpSession;
 
 constexpr auto kDiscoveryInterval = 5s;   // auto-connect LOOKUP cadence
 constexpr auto kRedial            = 500ms;
+constexpr auto kDialTimeout       = 2s;
 constexpr auto kRelayBackupDelay  = 2s;   // the non-designated side waits this long for an offer
 constexpr auto kRelayWindow       = 20s;  // after punching gives up, time allowed for a relay
 constexpr auto kInboundIdentify   = 10s;  // an unidentified connection must speak by then
@@ -308,6 +309,7 @@ std::optional<TopicCreds> TopicCreds::parse(std::string_view uri) {
     if (auto hash = uri.find('#'); hash != std::string_view::npos) {
         id_hex  = uri.substr(0, hash);
         key_hex = uri.substr(hash + 1);
+        if (key_hex.empty()) return std::nullopt;
     }
 
     TopicCreds c;
@@ -396,6 +398,7 @@ struct Peer {
     DevId                  dev_id{};
     std::vector<Candidate> cands;
     PeerState              state = PeerState::Unknown;
+    Instant                remembered{};
 
     // The introduction in progress, if any.
     std::optional<AttemptNonce> attempt;
@@ -616,6 +619,7 @@ struct Node::Impl {
 
     // peers
     void begin_connect(Topic::Impl&, const TopicId&, const DevId&, Instant now);
+    void trim_peer_cache(Topic::Impl&, Instant now);
     void adopt_attempt(Topic::Impl&, const TopicId&, Peer&, const AttemptNonce&, Instant now);
     void dial_all(const TopicId&, Peer&, Instant now);
     void request_relay(Topic::Impl&, const TopicId&, Peer&);
@@ -767,7 +771,17 @@ void Node::Impl::tick(Instant now) {
     for (int i = 0; i < 64; ++i) {
         auto s = listener.accept();
         if (!s) break;
+        const auto remote = s->remote();
+        if (!remote) continue;
+        size_t inbound = 0, same_ip = 0;
+        for (const auto& p : pending) {
+            if (p->dead || p->kind != PendingConn::Kind::Inbound) continue;
+            ++inbound;
+            if (p->target.ip == remote->ip) ++same_ip;
+        }
+        if (inbound >= cfg.max_pending_inbound || same_ip >= cfg.max_pending_per_ip) continue;
         auto pc     = std::make_unique<PendingConn>();
+        pc->target  = *remote;
         pc->kind    = PendingConn::Kind::Inbound;
         pc->sock    = std::move(*s);
         pc->started = now;
@@ -827,6 +841,7 @@ void Node::Impl::tick(Instant now) {
             drive_peer(ti, tid, peer, now);
             if (peer.dgram) drive_dgram(ti, tid, peer, now);
         }
+        trim_peer_cache(ti, now);
     }
 
     // Our UDP mapping, for as long as a channel is still gathering it.
@@ -1119,8 +1134,10 @@ void Node::Impl::on_control_message(std::span<const uint8_t> msg, Instant now) {
                     auto& peer  = ti->peers[e.dev_id];
                     peer.dev_id = e.dev_id;
                     peer.cands  = e.cands;
+                    peer.remembered = now;
                     if (!e.stale) begin_connect(*ti, tid, e.dev_id, now);
                 }
+                trim_peer_cache(*ti, now);
             }
         } else if (req.dgram_relay_for) {
             auto  ok = ctl::RelayAllocOk::decode(r);
@@ -1258,6 +1275,10 @@ void Node::Impl::dial_all(const TopicId& tid, Peer& peer, Instant now) {
         // srflx means we share a machine, which is exactly local testing.
         if (c.kind == Candidate::Kind::Host && c.ep.ip.is_loopback()) continue;
         if (c.ep.port == 0) continue;
+        if (std::any_of(pending.begin(), pending.end(), [&](const auto& p) {
+            return !p->dead && p->kind == PendingConn::Kind::Dial &&
+                   p->attempt == *peer.attempt && p->target == c.ep;
+        })) continue;
         auto pc     = std::make_unique<PendingConn>();
         pc->kind    = PendingConn::Kind::Dial;
         pc->started = now;
@@ -1322,14 +1343,6 @@ void Node::Impl::join_relay(const TopicId& tid, const DevId& dev, const AttemptN
 // Connections that no session owns yet
 // ---------------------------------------------------------------------------
 void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
-    // A dial or relay leg that has not connected yet.
-    const auto st = pc.sock.state();
-    if (st == io::TcpSocket::State::Failed) {
-        pc.dead = true;
-        return;
-    }
-    if (st == io::TcpSocket::State::Connecting) return;
-
     // Stale: the attempt it belonged to is over, or it never said who it is.
     if (pc.known && !attempts.count(pc.attempt)) {
         pc.dead = true;
@@ -1339,6 +1352,16 @@ void Node::Impl::drive_pending(PendingConn& pc, Instant now) {
         pc.dead = true;
         return;
     }
+
+    // Cancellation and deadlines apply even while the OS is still connecting.
+    const auto st = pc.sock.state();
+    if (st == io::TcpSocket::State::Failed ||
+        (pc.kind == PendingConn::Kind::Dial && now - pc.started >= kDialTimeout) ||
+        (pc.kind == PendingConn::Kind::RelayLeg && now - pc.started >= kControlTimeout)) {
+        pc.dead = true;
+        return;
+    }
+    if (st == io::TcpSocket::State::Connecting) return;
 
     // Read what has arrived.
     std::vector<uint8_t> buf(4096);
@@ -2085,6 +2108,26 @@ Topic::~Topic() = default;
 const TopicId& Topic::id() const { return impl_->creds.id; }
 bool           Topic::is_authenticated() const { return impl_->keyed; }
 
+size_t Topic::remembered_peers() const {
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
+    return impl_->peers.size();
+}
+
+void Node::Impl::trim_peer_cache(Topic::Impl& ti, Instant now) {
+    if (ti.peers.size() <= cfg.max_cached_peers) return;
+    std::vector<std::pair<Instant, DevId>> idle;
+    for (const auto& [dev, peer] : ti.peers) {
+        if (!peer.sess && !peer.attempt && peer.retry_at == Instant{})
+            idle.emplace_back(peer.remembered, dev);
+    }
+
+    if (idle.size() <= cfg.max_cached_peers) return;
+    std::sort(idle.begin(), idle.end());
+    for (size_t i = 0; i < idle.size() - cfg.max_cached_peers; ++i)
+        ti.peers.erase(idle[i].second);
+    (void)now;
+}
+
 bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
     auto&                        n = *impl_->node;
     std::unique_lock<LoopFirstMutex> lk(n.mu);
@@ -2111,7 +2154,17 @@ bool Topic::publish(std::span<const uint8_t> meta, bool unlisted) {
         wire::Reader r{it->second.reply};
         if (wire::Header::decode(r, ctl::kVersion)) ok = ctl::RegisterOk::decode(r);
     }
-    if (it != n.requests.end()) n.requests.erase(it);
+    if (it != n.requests.end()) {
+        if (!finished && !it->second.done) {
+            // The server may already have registered us. Let the loop process
+            // a late success (or reset the connection on its bounded deadline)
+            // so unpublish/leave can still remove the record it created.
+            it->second.loop_owned = true;
+            it->second.deadline = n.now() + kControlTimeout;
+        } else {
+            n.requests.erase(it);
+        }
+    }
     if (!ok) return false;
 
     impl_->self           = ok->dev_id;
@@ -2171,8 +2224,10 @@ std::optional<std::vector<PeerInfo>> Topic::try_peers(uint8_t max, bool want_met
         auto& peer  = impl_->peers[e.dev_id];  // remember where to dial
         peer.dev_id = e.dev_id;
         peer.cands  = e.cands;
+        peer.remembered = n.now();
         out.push_back(PeerInfo{e.dev_id, std::chrono::seconds(e.age_secs), e.stale, e.meta});
     }
+    n.trim_peer_cache(*impl_, n.now());
     return out;
 }
 
@@ -2198,6 +2253,8 @@ std::optional<PeerInfo> Topic::resolve(const DevId& dev, std::chrono::millisecon
                 auto& peer  = impl_->peers[ok->entry.dev_id];
                 peer.dev_id = ok->entry.dev_id;
                 peer.cands  = ok->entry.cands;
+                peer.remembered = n.now();
+                n.trim_peer_cache(*impl_, n.now());
             }
             out = PeerInfo{ok->entry.dev_id, std::chrono::seconds(ok->entry.age_secs),
                            ok->entry.stale, ok->entry.meta};
@@ -2351,7 +2408,7 @@ DatagramPath Topic::datagram_path(const DevId& dev) const {
 bool Topic::send_datagram(const DevId& dev, std::span<const uint8_t> payload) {
     auto&                       n = *impl_->node;
     std::lock_guard<LoopFirstMutex> lk(n.mu);
-    if (payload.size() > max_datagram()) return false;
+    if (payload.empty() || payload.size() > max_datagram()) return false;
     auto it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.dgram || !it->second.sess) return false;
     Peer&  peer = it->second;
@@ -2667,6 +2724,11 @@ bool Node::server_connected() const {
 size_t Node::pending_requests() const {
     std::lock_guard<LoopFirstMutex> lk(impl_->mu);
     return impl_->requests.size();
+}
+
+size_t Node::pending_connections() const {
+    std::lock_guard<LoopFirstMutex> lk(impl_->mu);
+    return impl_->pending.size();
 }
 
 }  // namespace uconnect

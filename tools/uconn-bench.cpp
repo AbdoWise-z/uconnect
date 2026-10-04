@@ -28,6 +28,7 @@
 // node's own loop needs to drain its socket.
 
 #include <algorithm>
+#include "csv.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -553,7 +554,7 @@ int main(int argc, char** argv) {
                              static_cast<unsigned long long>(c.rx_units),
                              static_cast<unsigned long long>(c.tx_bytes),
                              static_cast<unsigned long long>(c.tx_units), mib_per_s(c.rx_bytes, c.window),
-                             c.delivered(), r.setup, note.c_str());
+                             c.delivered(), r.setup, uconnect::tools::csv_field(note).c_str());
             };
             for (const auto& r : results) {
                 row(r, "flood", 0, r.flood, r.error);

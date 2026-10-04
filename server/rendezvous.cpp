@@ -235,7 +235,7 @@ void Rendezvous::on_relay_join(Conn& c, std::span<const uint8_t> msg, Instant no
     std::optional<int> side;
     if (j) {
         std::lock_guard<std::mutex> lk(service_mu_);
-        side = registry_.relay_side(j->relay_id, j->token);
+        side = registry_.relay_side(j->relay_id, j->token, ctl::RelayKind::Tcp);
     }
     if (!side) {
         kill(c);  // wrong id or token: knowing the id alone admits nobody

@@ -335,6 +335,7 @@ UCONNECT_API void uconnect_topic_close_datagrams(uconnect_node*, uconnect_topic_
 UCONNECT_API uconnect_datagram_path uconnect_topic_datagram_path(const uconnect_node*,
                                                                  uconnect_topic_id,
                                                                  uconnect_dev_id);
+// len must be 1..uconnect_max_datagram(); an empty payload returns false on every path.
 UCONNECT_API bool uconnect_topic_send_datagram(uconnect_node*, uconnect_topic_id,
                                                uconnect_dev_id, const uint8_t* data, size_t len);
 

@@ -103,12 +103,10 @@ socklen_type to_sockaddr(const Endpoint& ep, bool socket_is_v6, sockaddr_storage
 
 bool init_networking() {
 #if defined(_WIN32)
-    static bool done = false;
-    static bool ok   = false;
-    if (done) return ok;
-    WSADATA wsa;
-    ok   = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
-    done = true;
+    static const bool ok = [] {
+        WSADATA wsa{};
+        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
     return ok;
 #else
     return true;

@@ -238,7 +238,7 @@ public:
     void close_datagrams(const DevId&);
     DatagramPath datagram_path(const DevId&) const;
 
-    // Unreliable and unordered, up to max_datagram() bytes -- small enough to
+    // Unreliable and unordered, 1..max_datagram() bytes -- small enough to
     // cross any path, relay included, without IP fragmentation. False if there
     // is no usable path (still Opening, Failed, or no channel) or the datagram
     // is too large, or the shared TCP output queue is full when using the TCP
@@ -272,6 +272,8 @@ public:
     // observer and nothing else: anyone on path, including the rendezvous
     // server, can MITM it undetectably. Check this before trusting a peer.
     bool is_authenticated() const;
+    // Diagnostic: active peers plus cached discovery results.
+    size_t remembered_peers() const;
 
     // Short Authentication String for a connected peer on an open topic.
     // Compare out of band; matching strings prove there is no MITM.
@@ -315,6 +317,9 @@ public:
         std::chrono::seconds keepalive{20};
 
         size_t max_total_peers = 64;
+        size_t max_pending_inbound = 128;
+        size_t max_pending_per_ip = 16;
+        size_t max_cached_peers = 256; // per topic, excluding sessions/attempts
 
         // How long to punch before falling back to the relay.
         std::chrono::seconds punch_timeout{8};
@@ -401,6 +406,7 @@ public:
     // Requests to the rendezvous server still awaiting a reply. Diagnostic:
     // on a healthy node this stays small no matter how long it runs.
     size_t pending_requests() const;
+    size_t pending_connections() const;
 
 private:
     friend class Topic;

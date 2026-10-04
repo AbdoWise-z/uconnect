@@ -27,12 +27,13 @@ COPY tests/ tests/
 COPY examples/ examples/
 COPY scripts/ scripts/
 
-# Static link so the runtime image needs no libc at all. Alpine/musl makes this
+# Static link the server so the runtime image needs no libc. Tests still link
+# the shared C API normally. Alpine/musl makes static server linkage
 # straightforward, unlike the MinGW toolchain where bare -static fails.
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DUCONNECT_BUILD_TESTS=ON \
-        -DCMAKE_EXE_LINKER_FLAGS="-static" \
+        -DUCONNECT_STATIC_SERVER=ON \
  && cmake --build build \
  && ./build/tests/uconnect_tests \
  && strip build/server/uconnect-rendezvous

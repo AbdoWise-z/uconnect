@@ -420,6 +420,21 @@ TEST(rendezvous_waiting_relay_bounds_early_input) {
     }
 }
 
+TEST(issue76_udp_relay_tokens_cannot_join_a_tcp_splice) {
+    Server server;
+    Client a{server}, b{server};
+    auto ra = register_in(a, topic_of(1));
+    auto rb = register_in(b, topic_of(1));
+    a.send(ctl::message(MsgType::RelayAlloc, 4,
+                        ctl::RelayAlloc{ra.dev_id, rb.dev_id, ctl::RelayKind::Udp}));
+    auto grant = decode<ctl::RelayAllocOk>(a.expect(MsgType::RelayAllocOk),
+        [](wire::Reader& r) { return ctl::RelayAllocOk::decode(r); });
+    REQUIRE(grant);
+    Client leg{server};
+    leg.send(ctl::message(MsgType::RelayJoin, 0, ctl::RelayJoin{grant->relay_id, grant->token}));
+    CHECK(leg.closed_within(500ms));
+}
+
 TEST(rendezvous_waiting_relay_preserves_bounded_raw_input) {
     RendezvousConfig cfg;
     cfg.splice_buffer = 4096;

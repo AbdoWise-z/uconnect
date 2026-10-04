@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <optional>
+#include <vector>
 
 #include "socket.hpp"
 #include "uconnect/types.hpp"

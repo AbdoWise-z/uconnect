@@ -9,6 +9,7 @@ add_executable(uconnect_tests
     test_chat.cpp
     test_io.cpp
     test_control.cpp
+    test_service.cpp
     test_registry.cpp
     test_rendezvous.cpp
     test_tcp_session.cpp
@@ -33,6 +34,19 @@ if (WIN32)
         VERBATIM)
 endif()
 add_test(NAME uconnect_tests COMMAND uconnect_tests)
+
+add_executable(uconnect_listing_bench EXCLUDE_FROM_ALL registry_listing_bench.cpp)
+target_link_libraries(uconnect_listing_bench PRIVATE uconnect_store)
+uconnect_bundle_runtime(uconnect_listing_bench)
+
+if (MINGW)
+    add_executable(uconnect_network_init network_init.cpp)
+    target_link_libraries(uconnect_network_init PRIVATE uconnect_io Threads::Threads)
+    target_link_options(uconnect_network_init PRIVATE "-Wl,--wrap,__imp_WSAStartup")
+    uconnect_bundle_runtime(uconnect_network_init)
+    add_test(NAME uconnect_network_init COMMAND uconnect_network_init)
+    set_tests_properties(uconnect_network_init PROPERTIES TIMEOUT 10)
+endif()
 
 # uconn-observe must report a server it cannot reach as a failure, not as an
 # empty directory. Runs the real binary; needs no server, so it is not e2e.
@@ -119,12 +133,31 @@ endif()
 # Needs a Python 3 interpreter rather than bash, and the server executable.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (UCONNECT_BUILD_SERVER AND Python3_Interpreter_FOUND)
+    add_test(NAME uconnect_chat_metadata
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/chat_metadata.py
+                     $<TARGET_FILE:uconnect-rendezvous> $<TARGET_FILE:uconn-chat>)
+    set_tests_properties(uconnect_chat_metadata PROPERTIES TIMEOUT 45)
     add_test(NAME uconnect_python_e2e
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/e2e_python.py)
     set_tests_properties(uconnect_python_e2e PROPERTIES TIMEOUT 90 LABELS "e2e"
                          ENVIRONMENT "UCONNECT_SERVER=$<TARGET_FILE:uconnect-rendezvous>;UCONNECT_C_LIB=$<TARGET_FILE:uconnect_c>")
 elseif (UCONNECT_BUILD_SERVER)
     message(STATUS "No Python 3 found: Python end-to-end test not registered")
+endif()
+
+if (Python3_Interpreter_FOUND)
+    add_test(NAME uconnect_web_observer
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/web/test_observer.py)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import flask"
+                    RESULT_VARIABLE _flask_available OUTPUT_QUIET ERROR_QUIET)
+    if (_flask_available EQUAL 0)
+        add_test(NAME uconnect_web_health
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/web/test_health.py)
+    endif()
+    if (UNIX AND UCONNECT_BASH)
+        add_test(NAME uconnect_deploy_web_venv
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/deploy_web_venv.py)
+    endif()
 endif()
 
 # A megabyte of messages over both paths a peer can take: directly punched,

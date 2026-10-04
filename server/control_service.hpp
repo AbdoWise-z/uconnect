@@ -28,6 +28,7 @@ struct ControlConfig {
     // UDP (WhoAmI, relay binds, relayed datagrams), per source IP.
     size_t udp_bytes_per_sec = 4 * 1024 * 1024;
     size_t udp_burst_bytes   = 8 * 1024 * 1024;
+    size_t max_udp_sources   = 16384;
 };
 
 // Framed bytes, ready to write to a connection.
@@ -69,6 +70,7 @@ public:
     void tick(Instant now);
 
     size_t          connections() const { return conns_.size(); }
+    size_t          udp_sources() const { return udp_buckets_.size(); }
     Registry&       registry() { return reg_; }
     const Registry& registry() const { return reg_; }
 

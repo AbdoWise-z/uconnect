@@ -263,6 +263,15 @@ bool refused(Node::Config cfg) {
 
 }  // namespace
 
+TEST(issue62_empty_key_fragment_is_not_an_open_invite) {
+    const auto open = TopicCreds::generate_open().to_uri();
+    REQUIRE(TopicCreds::parse(open));
+    CHECK(!TopicCreds::parse(open)->is_keyed());
+    CHECK(!TopicCreds::parse(open + "#"));
+    CHECK(!TopicCreds::parse(open + "#00"));
+    CHECK(TopicCreds::parse(TopicCreds::generate_keyed().to_uri())->is_keyed());
+}
+
 TEST(node_refuses_a_rekey_shift_outside_its_safe_range) {
     // #27. A key generation must span more than the 64-packet replay window,
     // i.e. a shift of at least 7; at 64 or more the shift is undefined
@@ -574,6 +583,52 @@ TEST(a_node_registers_again_after_the_server_restarts) {
         auto found = o.peers(30, false, 500ms);
         return self && found.size() == 1 && found[0].dev_id == *self;
     }, 10s));
+}
+
+TEST(issue77_timed_out_publish_reconciles_a_late_registration) {
+    for (bool republish : {false, true}) {
+        io::TcpSocket listener;
+        REQUIRE(listener.open(0));
+        REQUIRE(listener.listen());
+        Node node{"127.0.0.1:" + std::to_string(listener.local_port())};
+        node.run_in_background();
+        std::optional<io::TcpSocket> accepted;
+        REQUIRE(wait_until([&] { accepted = listener.accept(); return accepted.has_value(); }, 2s));
+        RawConn conn{std::move(*accepted)};
+        server::Registry registry;
+        server::ControlService service{registry};
+        service.on_open(1, {IpAddr::v4(127, 0, 0, 1), node.local_port()}, std::chrono::steady_clock::now());
+        auto& topic = node.join(TopicCreds::generate_open());
+        auto publish = std::async(std::launch::async, [&] { return topic.publish(); });
+        auto request = conn.expect(wire::MsgType::Register);
+        REQUIRE(request);
+        auto held = service.on_message(1, *request, std::chrono::steady_clock::now());
+        REQUIRE(registry.size() == 1);
+        REQUIRE(!held.out.empty());
+        CHECK(!publish.get());
+        topic.unpublish();
+        std::future<bool> retry;
+        server::ControlService::Result newer;
+        if (republish) {
+            retry = std::async(std::launch::async, [&] { return topic.publish(); });
+            auto req = conn.expect(wire::MsgType::Register);
+            REQUIRE(req);
+            newer = service.on_message(1, *req, std::chrono::steady_clock::now());
+        }
+        conn.send_raw(held.out[0].bytes);
+        if (republish) {
+            conn.send_raw(newer.out[0].bytes);
+            CHECK(retry.get());
+            CHECK(!conn.expect(wire::MsgType::Unregister, 200ms));
+            CHECK_EQ(registry.size(), 1u);
+            topic.unpublish();
+        }
+        auto cleanup = conn.expect(wire::MsgType::Unregister);
+        REQUIRE(cleanup);
+        service.on_message(1, *cleanup, std::chrono::steady_clock::now());
+        CHECK_EQ(registry.size(), 0u);
+        CHECK(node.server_connected());
+    }
 }
 
 TEST(cancelled_reregistration_is_unregistered_when_its_reply_arrives) {
@@ -1167,6 +1222,87 @@ TEST(a_silent_inbound_connection_does_not_linger_forever) {
     CHECK(idle.closed_within(12s));
 }
 
+TEST(issue64_unidentified_inbound_connections_are_bounded) {
+    LocalServer srv;
+    auto cfg = config_for(srv);
+    cfg.max_pending_inbound = 5;
+    cfg.max_pending_per_ip = 3;
+    Node node{cfg};
+    node.run_in_background();
+    std::vector<std::unique_ptr<RawConn>> sockets;
+    for (int i = 0; i < 8; ++i)
+        sockets.push_back(std::make_unique<RawConn>(Endpoint{IpAddr::v4(127, 0, 0, 1), node.local_port()}));
+    CHECK(sockets.back()->closed_within(1s));
+    CHECK(node.pending_connections() <= 3u);
+    sockets.clear();
+    CHECK(wait_until([&] { return node.pending_connections() == 0; }, 2s));
+}
+
+TEST(issue63_cancelled_pending_dials_are_released_promptly) {
+    io::TcpSocket control_listener, stalled_listener;
+    REQUIRE(control_listener.open(0));
+    REQUIRE(control_listener.listen());
+    REQUIRE(stalled_listener.open(0));
+    REQUIRE(stalled_listener.listen(1));
+    const Endpoint stalled{IpAddr::v4(127, 0, 0, 1), stalled_listener.local_port()};
+    // Fill the accept backlog without ever accepting: further connects stay
+    // in SYN-SENT until the OS timeout, independent of external networking.
+    std::vector<io::TcpSocket> fillers(16);
+    for (auto& filler : fillers) { REQUIRE(filler.open(0)); REQUIRE(filler.connect(stalled)); }
+    Node node{"127.0.0.1:" + std::to_string(control_listener.local_port())};
+    node.run_in_background();
+    std::optional<io::TcpSocket> accepted;
+    REQUIRE(wait_until([&] { accepted = control_listener.accept(); return accepted.has_value(); }, 2s));
+    RawConn control{std::move(*accepted)};
+    auto& topic = node.join(TopicCreds::generate_open());
+    auto publishing = std::async(std::launch::async, [&] { return topic.publish(); });
+    auto message = control.expect(wire::MsgType::Register);
+    REQUIRE(message);
+    wire::Reader reader{*message};
+    auto header = wire::Header::decode(reader, ctl::kVersion);
+    REQUIRE(header);
+    DevId self{}, remote{};
+    remote.fill(42);
+    control.send_raw(ctl::frame(ctl::message(wire::MsgType::RegisterOk, header->txn_id,
+                                           ctl::RegisterOk{self, stalled, 1})));
+    REQUIRE(publishing.get());
+    auto lookup = std::async(std::launch::async, [&] { return topic.peers(); });
+    message = control.expect(wire::MsgType::Lookup);
+    REQUIRE(message);
+    wire::Reader lookup_reader{*message};
+    header = wire::Header::decode(lookup_reader, ctl::kVersion);
+    ctl::LookupOk reply;
+    reply.id = topic.id();
+    reply.total = 1;
+    wire::PeerEntry peer;
+    peer.dev_id = remote;
+    peer.cands.push_back({Candidate::Kind::Srflx, stalled});
+    reply.entries.push_back(peer);
+    control.send_raw(ctl::frame(ctl::message(wire::MsgType::LookupOk, header->txn_id, reply)));
+    REQUIRE(lookup.get().size() == 1);
+    topic.connect(remote);
+    REQUIRE(wait_until([&] { return node.pending_connections() > 0; }, 1s));
+    topic.disconnect(remote);
+    CHECK(wait_until([&] { return node.pending_connections() == 0; }, 500ms));
+}
+
+TEST(issue73_discovery_churn_keeps_a_bounded_peer_cache) {
+    LocalServer srv;
+    auto cfg = config_for(srv);
+    cfg.max_cached_peers = 8;
+    Node node{cfg};
+    node.run_in_background();
+    auto& topic = node.join(TopicCreds::generate_open());
+    for (int i = 0; i < 20; ++i) {
+        RawConn remote{srv.endpoint()};
+        const auto id = remote.register_in(topic.id());
+        REQUIRE(id);
+        if (i % 2) REQUIRE(topic.resolve(*id));
+        else REQUIRE(!topic.peers().empty());
+    }
+    CHECK(topic.remembered_peers() <= cfg.max_cached_peers);
+}
+
 TEST(datagram_offers_reject_invalid_schedules_and_malformed_bodies) {
     LocalServer srv;
     std::atomic<int> markers{0};
@@ -1287,6 +1423,7 @@ TEST(datagrams_punch_a_direct_udp_path_and_flow_both_ways) {
 
     REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::None));
     REQUIRE(p.settled(DatagramPath::Direct));
+    CHECK(!p.a->send_datagram(p.idb(), {}));
 
     // Unreliable, so send a few and ask for most.
     for (int i = 0; i < 20; ++i) {
@@ -1366,6 +1503,7 @@ TEST(datagrams_fall_back_over_tcp_when_udp_cannot_be_punched) {
     REQUIRE(p.connect());
     REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
     REQUIRE(p.settled(DatagramPath::Tcp));
+    CHECK(!p.a->send_datagram(p.idb(), {}));
 
     CHECK(p.a->send_datagram(p.idb(), bytes("over tcp")));
     CHECK(p.b->send_datagram(p.ida(), bytes("and back")));
@@ -1421,6 +1559,7 @@ TEST(datagrams_fall_back_to_the_udp_relay_when_asked_to) {
 
     REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Relay));
     REQUIRE(p.settled(DatagramPath::Relayed));
+    CHECK(!p.a->send_datagram(p.idb(), {}));
     CHECK(srv.stats().relays_allocated == tcp_relays + 1);  // one binding, both sides
 
     for (int i = 0; i < 10; ++i) {

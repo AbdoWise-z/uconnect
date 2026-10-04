@@ -8,7 +8,11 @@ namespace {
 
 template <typename T>
 Framed reply(ConnKey to, MsgType type, uint32_t txn, const T& body, uint8_t flags = 0) {
-    return Framed{to, ctl::frame(ctl::message(type, txn, body, flags))};
+    auto message = ctl::message(type, txn, body, flags);
+    if (message.empty())
+        message = ctl::message(MsgType::Error, txn,
+                               wire::Error{ErrorCode::BadRequest, "reply exceeds frame limit"});
+    return Framed{to, ctl::frame(message)};
 }
 
 Framed reply_empty(ConnKey to, MsgType type, uint32_t txn) {
@@ -137,6 +141,16 @@ ControlService::Result ControlService::on_message(ConnKey key, std::span<const u
             ok.mode    = res.mode;
             ok.total   = res.total;
             ok.entries = std::move(res.entries);
+            // A sample is bounded by bytes as well as entry count. Preserve
+            // total, metadata and fresh-first ordering while trimming its tail.
+            size_t bytes = wire::Header::kSize + kTopicIdLen + 1 + 2 + 1;
+            size_t count = 0;
+            for (const auto& entry : ok.entries) {
+                if (bytes + entry.encoded_size() > ctl::kMaxFrame) break;
+                bytes += entry.encoded_size();
+                ++count;
+            }
+            ok.entries.resize(count);
             out.out.push_back(reply(key, MsgType::LookupOk, txn, ok));
             return out;
         }
@@ -226,7 +240,12 @@ ControlService::Result ControlService::on_message(ConnKey key, std::span<const u
 std::vector<UdpOut> ControlService::on_udp(const Endpoint& from, std::span<const uint8_t> dgram,
                                            Instant now) {
     std::vector<UdpOut> out;
-    if (!take(udp_buckets_[from.ip.bytes], dgram.size(), cfg_.udp_bytes_per_sec,
+    auto bucket = udp_buckets_.find(from.ip.bytes);
+    if (bucket == udp_buckets_.end()) {
+        if (udp_buckets_.size() >= cfg_.max_udp_sources) return out;
+        bucket = udp_buckets_.try_emplace(from.ip.bytes).first;
+    }
+    if (!take(bucket->second, dgram.size(), cfg_.udp_bytes_per_sec,
               cfg_.udp_burst_bytes, now)) {
         return out;  // over budget: silence, never an error to an unvalidated address
     }

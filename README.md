@@ -189,7 +189,7 @@ datagram channel:
 topic.open_datagrams(dev, DatagramFallback::Relay);   // asynchronous
 topic.on_datagram_path([](DevId, DatagramPath p) { /* Opening -> Direct ... */ });
 
-topic.send_datagram(dev, bytes);   // up to Topic::max_datagram() = 1100 bytes
+topic.send_datagram(dev, bytes);   // 1..Topic::max_datagram() = 1100 bytes; empty is rejected
 topic.on_datagram([](DevId dev, std::span<const uint8_t> bytes) { /* ... */ });
 topic.close_datagrams(dev);
 ```

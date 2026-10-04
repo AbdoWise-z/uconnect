@@ -120,14 +120,17 @@ Registry::RegisterResult Registry::register_entry(const wire::ctl::Register& msg
     e.host_cands = msg.host_cands;
     e.meta       = msg.meta;
     e.owner      = owner;
-    e.last_seen  = now;
+    mark_fresh(e, now);
     e.key_epoch  = msg.key_epoch;
     e.mode       = msg.mode;
 
     auto& topic = topics_[msg.id];
     // Hiding is sticky and topic-wide: the two mistakes are not symmetric, and
     // a topic wrongly exposed cannot be taken back.
-    if (msg.unlisted) topic.listed = false;
+    if (msg.unlisted) {
+        topic.listed = false;
+        listing_.erase(topic.order);
+    }
 
     out.peers_in_topic = static_cast<uint16_t>(std::min<size_t>(topic.members.size(), 0xFFFF));
     ++stats_.registers;
@@ -138,7 +141,7 @@ ErrorCode Registry::refresh(const DevId& dev, ConnKey owner, Instant now) {
     auto it = by_dev_.find(dev);
     if (it == by_dev_.end()) return ErrorCode::NotFound;
     if (it->second.owner != owner) return ErrorCode::BadAuth;
-    it->second.last_seen = now;
+    mark_fresh(it->second, now);
     return ErrorCode::None;
 }
 
@@ -148,7 +151,7 @@ ErrorCode Registry::update(const wire::ctl::Update& msg, ConnKey owner, Instant 
     if (it->second.owner != owner) return ErrorCode::BadAuth;
     it->second.host_cands = msg.host_cands;
     it->second.meta       = msg.meta;
-    it->second.last_seen  = now;
+    mark_fresh(it->second, now);
     return ErrorCode::None;
 }
 
@@ -188,6 +191,7 @@ size_t Registry::drop_owner(ConnKey owner) {
 void Registry::erase_entry(const DevId& dev) {
     auto it = by_dev_.find(dev);
     if (it == by_dev_.end()) return;
+    forget_fresh(it->second);
     const auto ik = ip_key(it->second.bound_addr);
 
     if (auto tit = topics_.find(it->second.topic_id); tit != topics_.end()) {
@@ -216,6 +220,31 @@ void Registry::erase_entry(const DevId& dev) {
 // ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
+void Registry::forget_fresh(const Entry& entry) {
+    if (fresh_order_.erase({entry.last_seen, entry.dev_id})) {
+        --topics_.at(entry.topic_id).fresh;
+        --stats_.entries_fresh;
+    }
+}
+
+void Registry::mark_fresh(Entry& entry, Instant now) {
+    forget_fresh(entry);
+    entry.last_seen = now;
+    fresh_order_.emplace(std::make_pair(now, entry.dev_id), entry.topic_id);
+    ++topics_.at(entry.topic_id).fresh;
+    ++stats_.entries_fresh;
+}
+
+void Registry::expire_fresh(Instant now) const {
+    while (!fresh_order_.empty()) {
+        auto first = fresh_order_.begin();
+        if (now - first->first.first < cfg_.stale_after) break;
+        --topics_.at(first->second).fresh;
+        --stats_.entries_fresh;
+        fresh_order_.erase(first);
+    }
+}
+
 wire::PeerEntry Registry::to_entry(const Entry& e, bool want_meta, Instant now) const {
     wire::PeerEntry p;
     p.dev_id       = e.dev_id;
@@ -286,6 +315,7 @@ std::optional<std::pair<TopicId, wire::PeerEntry>> Registry::resolve(const DevId
 }
 
 Registry::TopicsResult Registry::list_topics(uint32_t cursor, uint8_t limit, Instant now) {
+    expire_fresh(now);
     TopicsResult out;
     if (limit == 0) limit = 100;
     auto it = listing_.lower_bound(cursor);
@@ -296,12 +326,7 @@ Registry::TopicsResult Registry::list_topics(uint32_t cursor, uint8_t limit, Ins
         s.id    = it->second;
         s.mode  = tit->second.mode;
         s.peers = static_cast<uint32_t>(tit->second.members.size());
-        uint32_t fresh = 0;
-        for (const auto& m : tit->second.members) {
-            auto e = by_dev_.find(m);
-            if (e != by_dev_.end() && is_fresh(e->second, now)) ++fresh;
-        }
-        s.fresh_peers = fresh;
+        s.fresh_peers = tit->second.fresh;
         out.topics.push_back(s);
     }
     // The cursor is a position in creation order, not an index, so it stays
@@ -412,9 +437,10 @@ Registry::RelayGrant Registry::relay_alloc(const DevId& from, const DevId& peer,
 }
 
 std::optional<int> Registry::relay_side(wire::RelayId id,
-                                        const wire::ctl::RelayToken& token) const {
+                                        const wire::ctl::RelayToken& token,
+                                        std::optional<wire::ctl::RelayKind> kind) const {
     auto it = relays_.find(id);
-    if (it == relays_.end()) return std::nullopt;
+    if (it == relays_.end() || (kind && it->second.kind != *kind)) return std::nullopt;
     for (int side = 0; side < 2; ++side) {
         if (crypto::ct_equal(it->second.token[side], token)) return side;
     }
@@ -475,6 +501,7 @@ void Registry::release_relay(std::unordered_map<wire::RelayId, Relay>::iterator 
 // Maintenance
 // ---------------------------------------------------------------------------
 void Registry::sweep(Instant now) {
+    expire_fresh(now);
     for (auto it = relays_.begin(); it != relays_.end();) {
         if (now - it->second.last_seen >= cfg_.relay_expiry) {
             auto dead = it++;
@@ -486,17 +513,11 @@ void Registry::sweep(Instant now) {
 }
 
 RegistryStats Registry::stats(Instant now) const {
+    expire_fresh(now);
     RegistryStats s = stats_;
     s.topics_total  = topics_.size();
     s.entries_total = by_dev_.size();
-    for (const auto& [id, t] : topics_) {
-        (void)id;
-        if (t.listed) ++s.topics_listed;
-    }
-    for (const auto& [id, e] : by_dev_) {
-        (void)id;
-        if (is_fresh(e, now)) ++s.entries_fresh;
-    }
+    s.topics_listed = listing_.size();
     s.relays_open = relays_.size();
     return s;
 }

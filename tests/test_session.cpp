@@ -124,6 +124,15 @@ TEST(replay_window_handles_a_large_forward_jump) {
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
+TEST(issue60_empty_application_datagrams_are_rejected) {
+    auto p = establish();
+    CHECK(!p.a.send({}, t0()));
+    CHECK(!p.a.poll_transmit());
+    CHECK(p.a.send(bytes("still works"), t0()));
+    deliver(p.a, p.b, ep(5, 5000), t0());
+    CHECK(drain_data(p.b) == std::vector<std::string>{"still works"});
+}
+
 TEST(data_flows_in_both_directions) {
     auto p = establish();
 

@@ -3,11 +3,40 @@
 // else, or it mangles the very text it exists to show.
 
 #include <string>
+#include <atomic>
+#include <thread>
+#include "../examples/chat/nickname.hpp"
+#include "../tools/csv.hpp"
 
 #include "../examples/chat/sanitize.hpp"
 #include "testing.hpp"
 
 using chat::sanitize_for_terminal;
+
+TEST(issue76_csv_notes_preserve_field_boundaries) {
+    using uconnect::tools::csv_field;
+    CHECK(csv_field("plain") == "plain");
+    CHECK(csv_field("error, detail") == "\"error, detail\"");
+    CHECK(csv_field("say \"hello\"") == "\"say \"\"hello\"\"\"");
+    CHECK(csv_field("line\r\nnext") == "\"line\r\nnext\"");
+}
+
+TEST(issue66_nickname_snapshots_are_consistent_during_changes) {
+    const std::string a(32, 'a'), b(32, 'b');
+    chat::Nickname nick{a};
+    std::atomic<bool> start{false}, consistent{true};
+    std::thread reader([&] {
+        while (!start.load()) {}
+        for (int i = 0; i < 100000; ++i) {
+            auto snapshot = nick.get();
+            if (snapshot != a && snapshot != b) consistent = false;
+        }
+    });
+    start = true;
+    for (int i = 0; i < 100000; ++i) nick.set(i % 2 ? a : b);
+    reader.join();
+    CHECK(consistent.load());
+}
 
 TEST(chat_sanitizer_strips_c0_controls_and_del_but_keeps_tab) {
     CHECK(sanitize_for_terminal("a\x1b[2Jb") == "a[2Jb");   // ESC dropped

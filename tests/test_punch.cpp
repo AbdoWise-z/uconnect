@@ -6,6 +6,8 @@
 // That is the whole argument for keeping this layer sans-IO.
 
 #include <utility>
+#include <algorithm>
+#include <memory>
 
 #include "netsim.hpp"
 #include "punch.hpp"
@@ -15,6 +17,21 @@ using namespace uconnect;
 using namespace uconnect::path;
 using namespace netsim;
 using namespace std::chrono_literals;
+
+TEST(issue76_destroyed_punch_session_wipes_its_probe_key) {
+    // Inspect the backing byte storage after destruction, not a dead object.
+    alignas(PunchSession) std::array<unsigned char, sizeof(PunchSession)> storage{};
+    crypto::SymKey key;
+    key.fill(0xA7);
+    auto* punch = std::construct_at(reinterpret_cast<PunchSession*>(storage.data()),
+        PunchConfig{}, DevId{}, std::vector<Candidate>{}, LocalView{}, &key, 1);
+    auto found = std::search(storage.begin(), storage.end(), key.begin(), key.end());
+    REQUIRE(found != storage.end());
+    const auto offset = std::distance(storage.begin(), found);
+    std::destroy_at(punch);
+    CHECK(std::all_of(storage.begin() + offset, storage.begin() + offset + key.size(),
+                      [](unsigned char byte) { return byte == 0; }));
+}
 
 namespace {
 

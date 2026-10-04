@@ -103,7 +103,9 @@ def healthz():
     """Liveness of this dashboard, and separately of the server it watches."""
     build = deployment_info()
     try:
-        observer.overview(members=False)
+        _, stale, error = observer.overview(members=False)
+        if stale or error:
+            raise ObserverError(error or "rendezvous data is stale")
         return jsonify({"ok": True, "server": SERVER, "rendezvous": "reachable",
                         "commit": build.get("short")})
     except ObserverError as exc:

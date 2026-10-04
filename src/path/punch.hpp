@@ -101,6 +101,12 @@ public:
                  LocalView local, const crypto::SymKey* probe_key,
                  uint64_t jitter_seed = 0);
 
+    ~PunchSession() { crypto::secure_zero(probe_key_); }
+    PunchSession(const PunchSession&) = default;
+    PunchSession& operator=(const PunchSession&) = default;
+    PunchSession(PunchSession&&) noexcept = default;
+    PunchSession& operator=(PunchSession&&) noexcept = default;
+
     void begin(Instant now);
 
     // Feed every datagram whose first byte classifies as MsgClass::Probe. An

@@ -109,6 +109,29 @@ TEST(registry_a_topics_mode_is_set_by_whoever_created_it) {
     CHECK(l.topics[0].mode == TopicMode::Keyed);
 }
 
+TEST(issue24_listing_fresh_counts_follow_refresh_update_expiry_and_removal) {
+    auto r = make();
+    auto a = r.register_entry(reg(topic_of(1)), ep(7, 4000), 1, t0());
+    auto b = r.register_entry(reg(topic_of(1)), ep(8, 4000), 2, t0() + 10s);
+    REQUIRE(a.code == ErrorCode::None && b.code == ErrorCode::None);
+    CHECK_EQ(r.list_topics(0, 10, t0() + 44s).topics[0].fresh_peers, 2u);
+    CHECK_EQ(r.list_topics(0, 10, t0() + 45s).topics[0].fresh_peers, 1u);
+    r.refresh(a.dev_id, 1, t0() + 46s);
+    CHECK_EQ(r.list_topics(0, 10, t0() + 55s).topics[0].fresh_peers, 1u);
+    wire::ctl::Update update;
+    update.dev_id = b.dev_id;
+    r.update(update, 2, t0() + 56s);
+    CHECK_EQ(r.stats(t0() + 56s).entries_fresh, 2u);
+    r.unregister(a.dev_id, 1);
+    CHECK_EQ(r.list_topics(0, 10, t0() + 56s).topics[0].fresh_peers, 1u);
+    r.register_entry(reg(topic_of(1)), ep(8, 4000), 2, t0() + 60s);
+    CHECK_EQ(r.list_topics(0, 10, t0() + 101s).topics[0].fresh_peers, 1u);
+    CHECK_EQ(r.list_topics(0, 10, t0() + 105s).topics[0].fresh_peers, 0u);
+    r.drop_owner(2);
+    CHECK(r.list_topics(0, 10, t0() + 106s).topics.empty());
+    CHECK_EQ(r.stats(t0() + 106s).entries_fresh, 0u);
+}
+
 TEST(registry_the_listing_cursor_survives_topics_disappearing) {
     // #24: the cursor used to be an index, so a topic vanishing before it
     // shifted every page after -- skipping or repeating topics.

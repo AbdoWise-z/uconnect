@@ -140,7 +140,8 @@ public:
 
     // Which side (0 or 1) a token is for, or nullopt if the id or token is
     // wrong -- knowing the relay id alone admits nobody.
-    std::optional<int> relay_side(wire::RelayId, const wire::ctl::RelayToken&) const;
+    std::optional<int> relay_side(wire::RelayId, const wire::ctl::RelayToken&,
+                                 std::optional<wire::ctl::RelayKind> kind = std::nullopt) const;
 
     // TCP relay: count spliced bytes against the binding's budget. False once
     // it is spent; the runtime then closes the splice.
@@ -203,6 +204,7 @@ private:
         std::unordered_map<DevId, size_t, ArrayHash>  pos;
         std::unordered_map<IpKey, size_t, IpKeyHash> per_ip;
         uint32_t           order = 0;       // position in the listing, stable for its life
+        mutable uint32_t   fresh = 0;
     };
 
     struct Relay {
@@ -220,6 +222,9 @@ private:
     };
 
     void erase_entry(const DevId&);
+    void forget_fresh(const Entry&);
+    void mark_fresh(Entry&, Instant now);
+    void expire_fresh(Instant now) const;
     wire::PeerEntry to_entry(const Entry&, bool want_meta, Instant now) const;
     bool            is_fresh(const Entry& e, Instant now) const {
         return now - e.last_seen < cfg_.stale_after;
@@ -240,6 +245,10 @@ private:
     // repeats, so a cursor stays valid when topics before it disappear.
     std::map<uint32_t, TopicId> listing_;
     uint32_t                    next_order_ = 1;
+
+    // One entry per currently counted member, replaced on refresh. Expiry
+    // work is paid once per stale member, never once per directory request.
+    mutable std::map<std::pair<Instant, DevId>, TopicId> fresh_order_;
 
     std::unordered_map<wire::RelayId, Relay>        relays_;
     std::unordered_map<IpKey, size_t, IpKeyHash>    relays_per_ip_;

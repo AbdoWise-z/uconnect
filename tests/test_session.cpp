@@ -516,6 +516,7 @@ TEST(a_peer_that_jumps_too_many_generations_is_not_followed) {
     // what stops a far-future counter from walking the ratchet arbitrarily.
     SessionConfig cfg          = tiny_generations();
     cfg.max_generations_ahead  = 2;
+    cfg.max_generations_far    = 4;  // a long jump may reach this far, and no further
     auto p = establish(cfg);
 
     std::vector<uint8_t> far;
@@ -548,6 +549,53 @@ TEST(a_generation_jump_within_the_cap_is_followed) {
     auto got = drain_data(p.b);
     REQUIRE(got.size() == 1);
     CHECK(got[0] == "m5");
+}
+
+TEST(a_burst_of_loss_longer_than_two_generations_is_recovered) {
+    // #69. At the smallest schedule a node accepts, 7, a generation is 128
+    // packets. Losing a few hundred in a row -- a quarter second at 1000/s --
+    // left every later packet more than two generations ahead, and every one
+    // was dropped unread until the idle timeout closed the channel.
+    SessionConfig cfg;
+    cfg.rekey_shift = 7;
+    auto p          = establish(cfg);
+    for (int i = 0; i < 400; ++i) {         // lost: three generations and then some
+        REQUIRE(p.a.send(bytes("lost"), t0() + 1s).has_value());
+        REQUIRE(p.a.poll_transmit().has_value());
+    }
+    std::vector<std::string> sent;
+    for (int i = 0; i < 5; ++i) {
+        sent.push_back("back-" + std::to_string(i));
+        REQUIRE(p.a.send(bytes(sent.back()), t0() + 1s).has_value());
+    }
+    REQUIRE(deliver(p.a, p.b, ep(5, 5000), t0() + 1s) > 0);
+    CHECK(drain_data(p.b) == sent);
+}
+
+TEST(a_long_generation_jump_is_tried_sparingly) {
+    // A jump past the cheap window costs a key derivation per generation
+    // before anything is verified, so it is attempted at most once per
+    // far_jump_interval: forged counters can spend that budget, not the CPU.
+    SessionConfig cfg = tiny_generations();
+    auto          p   = establish(cfg);
+    for (int i = 0; i < 40; ++i) {           // ten generations, lost
+        REQUIRE(p.a.send(bytes("lost"), t0() + 1s).has_value());
+        REQUIRE(p.a.poll_transmit().has_value());
+    }
+    REQUIRE(p.a.send(bytes("real"), t0() + 1s).has_value());
+    auto real = p.a.poll_transmit();
+    REQUIRE(real.has_value());
+
+    auto forged = real->data;
+    forged.back() ^= 0x01;                   // same counter, bad tag
+    p.b.on_datagram(ep(5, 5000), forged, t0() + 1s);
+    p.b.on_datagram(ep(5, 5000), real->data, t0() + 1s);
+    CHECK(drain_data(p.b).empty());          // the attempt was spent on the forgery
+
+    p.b.on_datagram(ep(5, 5000), real->data, t0() + 1s + cfg.far_jump_interval);
+    auto got = drain_data(p.b);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0] == "real");
 }
 
 TEST(a_forged_far_future_counter_cannot_derail_the_key_schedule) {

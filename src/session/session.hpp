@@ -52,9 +52,9 @@ struct SessionConfig {
     // to be kept.
     uint8_t rekey_shift = 16;
 
-    // How far ahead a received counter may jump before the packet is dropped
-    // unread. A legitimate jump of one generation means 2^rekey_shift
-    // consecutive packets lost.
+    // How far ahead a received counter may jump and still be tried at once. A
+    // legitimate jump of one generation means 2^rekey_shift consecutive
+    // packets lost.
     //
     // The cap exists because key selection necessarily happens BEFORE the AEAD
     // can verify anything -- a key is needed to attempt decryption at all -- so
@@ -62,6 +62,15 @@ struct SessionConfig {
     // unbounded, a packet claiming counter 2^60 would walk the ratchet 2^44
     // times.
     uint64_t max_generations_ahead = 2;
+
+    // A longer jump is still tried, but at most once per far_jump_interval and
+    // never beyond max_generations_far. Without it a loss of a few generations
+    // -- a few hundred packets at the smallest schedule -- stranded the
+    // receiver for good: every later packet was further ahead still. With it,
+    // the first packet after the gap resyncs, while forged counters can spend
+    // only that budget, not the CPU.
+    uint64_t max_generations_far = 4096;
+    Duration far_jump_interval{std::chrono::milliseconds(250)};
 };
 
 struct Outgoing {
@@ -187,7 +196,7 @@ private:
     // discarded key that real traffic still needed.
     std::optional<size_t> open_packet(uint64_t counter, std::span<const uint8_t> ad,
                                       std::span<const uint8_t> ciphertext,
-                                      std::span<uint8_t> out);
+                                      std::span<uint8_t> out, Instant now);
 
     SessionConfig cfg_;
     DevId         peer_{};
@@ -206,6 +215,7 @@ private:
     uint64_t            send_gen_ = 0;
     uint64_t            recv_gen_ = 0;
     ReplayWindow        replay_;
+    Instant             next_far_jump_{};  // when a jump past max_generations_ahead may next be tried
 
     uint64_t send_counter_ = 0;
     uint64_t received_     = 0;

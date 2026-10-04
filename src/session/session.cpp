@@ -85,7 +85,7 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
         // Key generation, AEAD and replay window, in that order, inside
         // open_packet. Forged or corrupt: drop, say nothing.
         auto n = open_packet(m->counter, std::span<const uint8_t>(&ad, 1),
-                             m->ciphertext, plain);
+                             m->ciphertext, plain, now);
         if (!n) return;
 
         plain.resize(*n);
@@ -108,7 +108,7 @@ void Session::on_datagram(const Endpoint& from, std::span<const uint8_t> dgram, 
     // feeds the replay window and adopts a new generation -- nothing before the
     // AEAD verifies, or a forged counter could poison the window or discard a
     // key that real traffic still needs. Forged or corrupt: drop, say nothing.
-    auto n = open_packet(t->counter, {}, t->ciphertext, plain);
+    auto n = open_packet(t->counter, {}, t->ciphertext, plain, now);
     if (!n) return;
 
     ++received_;
@@ -140,7 +140,7 @@ void Session::advance_send_keys(uint64_t counter) {
 
 std::optional<size_t> Session::open_packet(uint64_t counter, std::span<const uint8_t> ad,
                                            std::span<const uint8_t> ciphertext,
-                                           std::span<uint8_t> out) {
+                                           std::span<uint8_t> out, Instant now) {
     const uint64_t g = generation(counter);
 
     // --- select, without touching any state ------------------------------
@@ -153,15 +153,23 @@ std::optional<size_t> Session::open_packet(uint64_t counter, std::span<const uin
     } else if (recv_gen_ > 0 && g + 1 == recv_gen_) {
         // A straggler from just before the last boundary.
         use = &recv_cs_prev_;
-    } else if (g > recv_gen_ && g - recv_gen_ <= cfg_.max_generations_ahead) {
+    } else if (g > recv_gen_ && (g - recv_gen_ <= cfg_.max_generations_ahead ||
+                                 (g - recv_gen_ <= cfg_.max_generations_far && now >= next_far_jump_))) {
+        // A long jump -- a burst of loss spanning generations -- is tried as
+        // well, or the receiver would never catch up: every later packet is
+        // further ahead still (#69). But sparingly, and the attempt is spent
+        // whether or not the packet verifies, so forged counters cost a
+        // bounded handful of derivations a second, not whatever they ask.
+        if (g - recv_gen_ > cfg_.max_generations_ahead) next_far_jump_ = now + cfg_.far_jump_interval;
         derived = recv_cs_;
         for (uint64_t i = recv_gen_; i < g; ++i) derived.rekey();
         use    = &derived;
         jumped = true;
     } else {
-        // Older than any key still held, or further ahead than a real peer
-        // could legitimately be. The bound is the point: `g` came from an
-        // unauthenticated header and decides how much work we do.
+        // Older than any key still held, further ahead than a real peer could
+        // legitimately be, or a long jump before its next turn. The bound is
+        // the point: `g` came from an unauthenticated header and decides how
+        // much work we do.
         return std::nullopt;
     }
 

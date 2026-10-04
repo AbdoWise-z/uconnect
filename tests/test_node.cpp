@@ -1047,6 +1047,59 @@ TEST(a_responder_follows_the_initiators_attempt_when_introductions_cross) {
     }
 }
 
+TEST(a_session_that_ends_with_data_still_queued_can_be_reconnected_at_once) {
+    // #68. A session that ends while our send queue is full -- the peer
+    // stopped reading, then went away -- used to linger until the kernel gave
+    // up on the socket, which is minutes. Meanwhile connect() did nothing and
+    // every new connection to the peer was dropped as a duplicate.
+    LocalServer srv;
+    Node        na{config_for(srv)};
+    na.run_in_background();
+    Topic* pa = join_in_half(na, /*low=*/true);
+    REQUIRE(pa != nullptr);
+    Topic&        a     = *pa;
+    const TopicId topic = a.id();
+    ScriptedPeer  r{srv, topic, *a.self(), /*want_smaller=*/false};
+    REQUIRE(r.ok());
+    REQUIRE(a.resolve(r.id).has_value());
+
+    a.connect(r.id);
+    RawConn* conn = r.first_dial();
+    REQUIRE(conn != nullptr);
+    std::vector<uint8_t> in;
+    REQUIRE(read_until(*conn, in, [](auto& b) { return session::TcpSession::peek_attempt(b).has_value(); }));
+    auto s = session::TcpSession::respond({}, topic, 0, nullptr, r.id, *a.self(),
+                                          *session::TcpSession::peek_attempt(in),
+                                          std::chrono::steady_clock::now());
+    s.on_bytes(in, std::chrono::steady_clock::now());
+    REQUIRE(handshake_over(*conn, s, [&] { return a.state(r.id) == PeerState::Connected; }));
+
+    // The peer stops reading. Fill everything between us until send() refuses.
+    std::vector<uint8_t> chunk(Topic::max_message(), 0x5A);
+    size_t queued = 0;
+    while (queued < 64 && a.send(r.id, chunk)) ++queued;
+    REQUIRE(queued < 64);
+
+    // Then it says goodbye, and the node has bytes it can never deliver.
+    s.close(wire::close_reason::kGoingAway, std::chrono::steady_clock::now());
+    conn->send_raw(s.take_output());
+    REQUIRE(wait_until([&] { return a.state(r.id) == PeerState::Closed; }, 3s));
+
+    // Reconnecting must start at once: a new attempt, and a new dial to r.
+    const size_t dials_before = r.dials.size();
+    a.connect(r.id);
+    CHECK(wait_until([&] {
+        // On loopback the new dial can connect, and the handshake start,
+        // between two looks.
+        const auto st = a.state(r.id);
+        return st == PeerState::Probing || st == PeerState::Handshaking;
+    }, 2s));
+    CHECK(wait_until([&] {
+        while (auto x = r.listener.accept()) r.dials.push_back(std::make_unique<RawConn>(std::move(*x)));
+        return r.dials.size() > dials_before;
+    }, 3s));
+}
+
 TEST(a_silent_inbound_connection_does_not_linger_forever) {
     LocalServer srv;
     Node        na{config_for(srv)};

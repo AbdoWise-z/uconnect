@@ -1561,7 +1561,6 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
                     std::fprintf(stderr, "[uconnect] session closed %s: %s\n",
                                  to_hex(peer.dev_id).substr(0, 8).c_str(), to_string(why));
                 }
-                peer.closing = true;  // flush a Close record, if one was queued
                 if (peer.dgram) dgram_drop(ti, peer);  // its keys went with the session
                 if (was_up && ti.on_peer_closed) {
                     deferred.push_back([cb = ti.on_peer_closed, dev = peer.dev_id, why] { cb(dev, why); });
@@ -1599,11 +1598,18 @@ void Node::Impl::drive_peer(Topic::Impl& ti, const TopicId& tid, Peer& peer, Ins
     peer.out.insert(peer.out.end(), bytes.begin(), bytes.end());
     flush_peer(peer);
 
-    if (peer.sess->state() == TcpSession::State::Closed && (peer.out.empty() || !peer.sock.is_open())) {
-        peer.sock.close();
+    // A session that has ended can deliver nothing more: the peer reads no
+    // record after a Close, a timed-out peer is gone, and a failed handshake
+    // was never a channel at all. Whatever is still queued goes with it, at
+    // once. Waiting for the queue to drain held the socket -- and so the peer,
+    // which no connection could reach while a session was still set -- until
+    // the kernel gave up retransmitting, minutes after the peer vanished (#68).
+    // Our own Close is not in the way: only disconnect_peer() sends one, and
+    // it writes and closes the socket itself.
+    if (peer.sess->state() == TcpSession::State::Closed) {
+        peer.sock.abort();
         peer.sess.reset();
         peer.out.clear();
-        peer.closing = false;
     }
 }
 

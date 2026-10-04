@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 __all__ = [
@@ -46,6 +47,15 @@ def ago(seconds: float | None) -> str:
 
 class ObserverError(RuntimeError):
     pass
+
+
+class _Flight:
+    """One lookup in progress, and what it came to, for those waiting on it."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: tuple[dict, bool, str | None] | None = None
+        self.error: ObserverError | None = None
 
 
 def _default_binary() -> str:
@@ -78,6 +88,9 @@ class Observer:
     outage it caused.
     """
 
+    # Per-topic answers held at most, least recently asked going first.
+    TOPIC_CACHE = 256
+
     def __init__(
         self,
         server: str,
@@ -93,8 +106,11 @@ class Observer:
         self.limit = limit
 
         self._lock = threading.Lock()
-        # key -> (monotonic time, wall time, data) of the last good answer
-        self._cache: dict[str, tuple[float, float, Any]] = {}
+        # key -> (monotonic time, wall time, data) of the last good answer,
+        # least recently used first
+        self._cache: OrderedDict[str, tuple[float, float, Any]] = OrderedDict()
+        # key -> the one lookup in progress for it, which later askers join
+        self._inflight: dict[str, _Flight] = {}
 
     # --- process plumbing --------------------------------------------------
     def _run(self, args: list[str]) -> dict:
@@ -154,9 +170,35 @@ class Observer:
         now = time.monotonic()
         with self._lock:
             hit = self._cache.get(key)
+            if hit:
+                self._cache.move_to_end(key)
             if hit and now - hit[0] < self.ttl:
                 return {**hit[2], "fetched_at": hit[1]}, False, None
+            # One lookup per key at a time: simultaneous misses wait for the
+            # one already running instead of each starting uconn-observe (#34).
+            flight = self._inflight.get(key)
+            leader = flight is None
+            if leader:
+                flight = self._inflight[key] = _Flight()
 
+        if not leader:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.result
+
+        try:
+            flight.result = self._fetch(key, args, now)
+            return flight.result
+        except ObserverError as exc:
+            flight.error = exc
+            raise
+        finally:
+            with self._lock:
+                del self._inflight[key]
+            flight.done.set()
+
+    def _fetch(self, key: str, args: list[str], now: float) -> tuple[dict, bool, str | None]:
         try:
             data = self._run(args)
         except ObserverError as exc:
@@ -169,6 +211,14 @@ class Observer:
         wall = time.time()
         with self._lock:
             self._cache[key] = (now, wall, data)
+            self._cache.move_to_end(key)
+            # Any 32-hex id is a valid request, so per-topic answers are held
+            # only for the most recently asked: unbounded, random ids grew the
+            # cache until the service ran out of memory (#34). The overviews
+            # are two keys at most, and never pushed out by topics.
+            topics = [k for k in self._cache if k.startswith("topic:")]
+            for old in topics[: max(0, len(topics) - self.TOPIC_CACHE)]:
+                del self._cache[old]
         return {**data, "fetched_at": wall}, False, None
 
     # --- public API --------------------------------------------------------

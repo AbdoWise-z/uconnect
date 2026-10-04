@@ -166,6 +166,68 @@ def test_rejects_bad_topic_ids():
             check(True, f"rejected {bad[:18]!r}")
 
 
+def test_topic_cache_is_bounded():
+    # #34. Any 32-hex id is a valid request, so arbitrary ids must not grow
+    # the cache without bound.
+    print("bounds the per-topic cache")
+    o = Observer("x:1", binary="unused", ttl=60.0)
+    o._run = lambda args: json.loads(SAMPLE)
+    o.overview()
+    cap = getattr(Observer, "TOPIC_CACHE", 256)
+    for i in range(cap + 300):
+        o.topic(f"{i:032x}")
+    topics = [k for k in o._cache if k.startswith("topic:")]
+    check(len(topics) <= cap, f"{len(topics)} topic entries kept, at most {cap}")
+    check(f"topic:{cap + 299:032x}" in o._cache, "the newest is kept")
+    check(f"topic:{0:032x}" not in o._cache, "the oldest went first")
+    check("overview:True" in o._cache, "the overview is never evicted for topics")
+
+
+def test_concurrent_misses_run_once():
+    # #34. Simultaneous requests for one uncached key each ran the binary.
+    print("runs one lookup for simultaneous misses on one key")
+    import threading
+    o = Observer("x:1", binary="unused", ttl=60.0)
+    runs = []
+
+    def slow_run(args):
+        runs.append(args)
+        time.sleep(0.3)
+        return json.loads(SAMPLE)
+
+    o._run = slow_run
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(o.topic("e" * 32))) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(len(runs) == 1, f"eight requests ran the binary once (ran {len(runs)})")
+    check(len(results) == 8 and all(not stale for _, stale, _ in results), "all eight got the answer")
+
+    # A failure reaches every waiter too, rather than leaving them hanging.
+    def failing_run(args):
+        runs.append(args)
+        time.sleep(0.3)
+        raise ObserverError("boom")
+
+    o._run = failing_run
+    errors = []
+
+    def ask():
+        try:
+            o.topic("f" * 32)
+        except ObserverError as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=ask) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(len(errors) == 4 and all("boom" in e for e in errors), "all four waiters saw the failure")
+
+
 def test_missing_binary_is_explained():
     print("explains a missing binary")
     o = Observer("x:1", binary="/nonexistent/uconn-observe")
@@ -323,6 +385,8 @@ if __name__ == "__main__":
         test_serves_stale_on_failure,
         test_first_failure_raises,
         test_rejects_bad_topic_ids,
+        test_topic_cache_is_bounded,
+        test_concurrent_misses_run_once,
         test_missing_binary_is_explained,
         test_unrunnable_binary_is_explained,
         test_garbage_output_is_explained,

@@ -53,6 +53,11 @@ struct RendezvousConfig {
     std::chrono::seconds first_frame_timeout{10};
     // A relay leg waits this long for its partner.
     std::chrono::seconds relay_join_timeout{20};
+    // A spliced relay pair that carries nothing either way this long is
+    // closed. Its nodes send a keepalive every 20s, so only a pair whose ends
+    // have both vanished without closing -- power lost, NAT mapping gone --
+    // goes this quiet; nothing else would ever end it.
+    std::chrono::seconds relay_idle_timeout{90};
 
     // Bytes a splice holds for a slow receiver before it stops reading from
     // the sender -- backpressure, not buffering without bound.
@@ -125,6 +130,7 @@ private:
     void deliver(const Framed&);
     void kill(Conn&);
     void reap(Instant now);
+    bool splice_idle(const Conn&, const ConnMap&, Instant now) const;
     void read_udp(Instant now);
 
     // Shared with the workers.

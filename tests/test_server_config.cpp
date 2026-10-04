@@ -47,6 +47,7 @@ RendezvousConfig scrambled() {
     c.registry.max_relays_per_ip      = 99;
     c.registry.relay_max_bytes        = 3ull << 30;
     c.relay_join_timeout              = 4s;
+    c.relay_idle_timeout              = 8s;
     c.splice_buffer                   = 4097;
     c.control.rate_bytes_per_sec      = 1;
     c.control.rate_burst_bytes        = 64 * 1024;

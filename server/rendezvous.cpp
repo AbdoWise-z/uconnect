@@ -362,13 +362,23 @@ void Rendezvous::release(const Conn& c) {
     }
 }
 
+// A splice that has carried nothing either way for relay_idle_timeout. Its
+// nodes keep it busy with keepalives, so both have vanished without closing --
+// and with no traffic to fail a charge, nothing else would ever end it.
+bool Rendezvous::splice_idle(const Conn& c, const ConnMap& conns, Instant now) const {
+    if (c.mode != Mode::Splice || now - c.last_rx <= cfg_.relay_idle_timeout) return false;
+    auto p = conns.find(c.partner);
+    return p == conns.end() || now - p->second.last_rx > cfg_.relay_idle_timeout;
+}
+
 void Rendezvous::reap(Instant now) {
     for (auto& [key, c] : conns_) {
         (void)key;
         if (c.dead) continue;
         if ((c.mode == Mode::New && now - c.opened > cfg_.first_frame_timeout) ||
             (c.mode == Mode::Control && now - c.last_rx > cfg_.idle_timeout) ||
-            (c.mode == Mode::RelayWaiting && now - c.opened > cfg_.relay_join_timeout)) {
+            (c.mode == Mode::RelayWaiting && now - c.opened > cfg_.relay_join_timeout) ||
+            splice_idle(c, conns_, now)) {
             kill(c);
         }
     }
@@ -487,6 +497,11 @@ void Rendezvous::worker_loop(Worker& w) {
         for (auto& [key, c] : w.conns) {
             (void)key;
             if (!c.dead && !c.out.empty()) flush(c);
+        }
+
+        for (auto& [key, c] : w.conns) {
+            (void)key;
+            if (!c.dead && splice_idle(c, w.conns, now)) kill(c);
         }
 
         // As reap() does for splices: a dead leg's survivor drains, then goes.

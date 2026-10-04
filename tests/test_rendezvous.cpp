@@ -284,6 +284,46 @@ TEST(rendezvous_a_tcp_relay_splices_two_joined_connections) {
     CHECK(lb.closed_within(2s));
 }
 
+TEST(rendezvous_a_spliced_pair_silent_both_ways_is_closed) {
+    // #71. Nothing else ends a splice whose two nodes vanished without closing
+    // -- it held its legs and their connection slots forever. A pair that
+    // carries anything, either way, stays; on the loop and on a worker alike.
+    for (size_t threads : {size_t{1}, size_t{2}}) {
+        RendezvousConfig cfg;
+        cfg.relay_idle_timeout = 1s;
+        cfg.threads            = threads;
+        Server s{cfg};
+        Client a{s}, b{s};
+        auto   ra = register_in(a, topic_of(1));
+        auto   rb = register_in(b, topic_of(1));
+        a.send(ctl::message(MsgType::RelayAlloc, 4,
+                            ctl::RelayAlloc{ra.dev_id, rb.dev_id, ctl::RelayKind::Tcp}));
+        auto grant = decode<ctl::RelayAllocOk>(a.expect(MsgType::RelayAllocOk),
+            [](wire::Reader& r) { return ctl::RelayAllocOk::decode(r); });
+        auto offer = decode<ctl::RelayOffer>(b.expect(MsgType::RelayOffer),
+            [](wire::Reader& r) { return ctl::RelayOffer::decode(r); });
+        REQUIRE(grant.has_value());
+        REQUIRE(offer.has_value());
+        Client la{s}, lb{s};
+        la.send(ctl::message(MsgType::RelayJoin, 0, ctl::RelayJoin{grant->relay_id, grant->token}));
+        lb.send(ctl::message(MsgType::RelayJoin, 0, ctl::RelayJoin{offer->relay_id, offer->token}));
+        REQUIRE(la.expect(MsgType::RelayJoinOk).has_value());
+        REQUIRE(lb.expect(MsgType::RelayJoinOk).has_value());
+
+        // Traffic one way only, for well past the timeout: the pair stays.
+        const std::string tick = "tick";
+        for (int i = 0; i < 8; ++i) {
+            la.send_raw(std::span(reinterpret_cast<const uint8_t*>(tick.data()), tick.size()));
+            CHECK(lb.read_raw(tick.size(), 1s) == tick);
+            std::this_thread::sleep_for(300ms);
+        }
+
+        // Then nothing either way: both legs go.
+        CHECK(la.closed_within(4s));
+        CHECK(lb.closed_within(4s));
+    }
+}
+
 TEST(rendezvous_a_relay_join_with_the_wrong_token_is_refused) {
     Server s;
     Client a{s}, b{s};

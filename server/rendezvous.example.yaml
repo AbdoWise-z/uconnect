@@ -37,6 +37,7 @@ relay:
   max_per_ip: 8               # bindings one source address may hold
   max_bytes: 32MiB            # carried per binding, both ways, before it is cut
   join_timeout: 20s           # one relay leg waits this long for the other
+  idle_timeout: 90s           # a spliced pair silent both ways this long is closed
   splice_buffer: 256KiB       # held for a slow receiver before the sender is paused
 
 rate_limits:

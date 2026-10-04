@@ -371,6 +371,7 @@ const std::vector<Field>& schema() {
         UC_NUM("relay.max_bytes", Kind::Bytes, registry.relay_max_bytes, kKiB,
                uint64_t{0xFFFFFFFF} * kKiB),
         UC_SECS("relay.join_timeout", relay_join_timeout),
+        UC_SECS("relay.idle_timeout", relay_idle_timeout),
         // Smaller only throttles every relay to a crawl; zero would stall them.
         UC_NUM("relay.splice_buffer", Kind::Bytes, splice_buffer, kKiB, kMaxSize),
 

@@ -36,7 +36,7 @@ topic.send_datagram(dev, frame);
 [Running your own server](#running-your-own-server) ·
 [Auto-deploying from GitHub](#auto-deploying-from-github) ·
 [Customising](#customising) ·
-[Public servers](#public-servers) · [Status](#status)
+[Public servers](#public-servers) · [Status](#status) · [License](#license)
 
 ---
 
@@ -1173,3 +1173,9 @@ Not yet implemented:
 - **Verification on real NATs.** The punch logic is exercised by the simulator
   and loopback; TCP simultaneous open across real consumer NATs, and
   `SO_REUSEPORT` port sharing on Linux, have not yet been tested in the field.
+
+## License
+
+uconnect is released under the [MIT License](LICENSE). The X25519 and
+Poly1305 code in `third_party/` is public domain (TweetNaCl and
+poly1305-donna; see each header).

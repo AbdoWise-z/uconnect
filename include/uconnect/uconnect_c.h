@@ -320,6 +320,10 @@ UCONNECT_API uconnect_peer_state uconnect_topic_state(const uconnect_node*, ucon
 // False if there is no live session.
 UCONNECT_API bool                uconnect_topic_link(const uconnect_node*, uconnect_topic_id,
                                                      uconnect_dev_id, uconnect_link_info* out);
+// Where the peer's direct connection comes from (see Topic::peer_address).
+// False when there is no live direct session (none, or relayed).
+UCONNECT_API bool uconnect_topic_peer_address(const uconnect_node*, uconnect_topic_id,
+                                              uconnect_dev_id, uconnect_endpoint* out);
 
 // --- messages --------------------------------------------------------------
 UCONNECT_API bool   uconnect_topic_send(uconnect_node*, uconnect_topic_id, uconnect_dev_id,

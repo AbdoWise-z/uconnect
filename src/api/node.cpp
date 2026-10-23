@@ -2353,6 +2353,16 @@ std::optional<LinkInfo> Topic::link(const DevId& dev) const {
     return li;
 }
 
+std::optional<Endpoint> Topic::peer_address(const DevId& dev) const {
+    std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
+    auto                        it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.sess || it->second.relayed ||
+        it->second.sess->state() != TcpSession::State::Established) {
+        return std::nullopt;
+    }
+    return it->second.sock.remote();
+}
+
 bool Topic::send(const DevId& dev, std::span<const uint8_t> payload) {
     auto&                       n = *impl_->node;
     std::lock_guard<LoopFirstMutex> lk(n.mu);

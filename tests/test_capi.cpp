@@ -268,6 +268,16 @@ TEST(capi_two_nodes_exchange_messages_by_callback_and_by_event_queue) {
     CHECK_EQ(li.messages_sent, 1u);
     CHECK_EQ(li.messages_received, 1u);
 
+    // A direct session reports where the peer's connection comes from: on
+    // this one machine, a loopback or local address with a port.
+    uconnect_endpoint where;
+    if (!li.relayed) {
+        REQUIRE(uconnect_topic_peer_address(a.get(), t, idb, &where));
+        CHECK(where.family == 4 || where.family == 6);
+        CHECK(where.port != 0);
+    }
+    CHECK(!uconnect_topic_peer_address(a.get(), t, ida, &where));  // ourselves: no session
+
     // A NULL pointer with a length is refused, not dereferenced.
     CHECK(!uconnect_topic_send(a.get(), t, idb, nullptr, 5));
 }

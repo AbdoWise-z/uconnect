@@ -216,6 +216,14 @@ public:
     // Diagnostics for one connected peer. Nullopt if there is no live session.
     std::optional<LinkInfo> link(const DevId&) const;
 
+    // The address this device sees the peer at over its direct connection (the
+    // TCP socket's remote end). Nullopt when there is no live session or the
+    // session runs through the server's relay, where the peer's own address is
+    // not known. Unlike a peer's self-reported candidates, this is where its
+    // packets actually come from, so it can inform local policy such as
+    // trusting devices on the same network.
+    std::optional<Endpoint> peer_address(const DevId&) const;
+
     // --- messages ----------------------------------------------------------
     // Reliable and ordered: each message arrives whole, once, in the order
     // sent, as one on_data call. Up to max_message() bytes. False if the peer

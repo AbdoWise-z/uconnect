@@ -749,6 +749,19 @@ bool uconnect_topic_link(const uconnect_node* n, uconnect_topic_id id, uconnect_
     });
 }
 
+bool uconnect_topic_peer_address(const uconnect_node* n, uconnect_topic_id id,
+                                 uconnect_dev_id dev, uconnect_endpoint* out) {
+    return with_topic(n, id, false, [&](Topic& t) {
+        if (!out) return false;
+        auto ep = t.peer_address(to_cpp(dev));
+        if (!ep) return false;
+        out->family = static_cast<uint8_t>(ep->ip.family);
+        std::memcpy(out->addr, ep->ip.bytes.data(), sizeof out->addr);
+        out->port = ep->port;
+        return true;
+    });
+}
+
 // --- messages --------------------------------------------------------------
 bool uconnect_topic_send(uconnect_node* n, uconnect_topic_id id, uconnect_dev_id dev,
                          const uint8_t* data, size_t len) {

@@ -370,6 +370,7 @@ struct Dgram {
     uint32_t                          epoch    = 0;
     DatagramFallback                  fallback = DatagramFallback::Tcp;
     DatagramPath                      path     = DatagramPath::Opening;
+    bool                              over_tcp = false;  // send_datagrams_over_tcp(): ours go over TCP
     crypto::SymKey                    probe_key{};
     uint32_t                          conn_id = 0;
     Instant                           opened{};
@@ -1878,6 +1879,9 @@ void Node::Impl::dgram_set_path(Topic::Impl& ti, Peer& peer, DatagramPath p) {
     if (peer.dgram) {
         if (peer.dgram->path == p) return;
         peer.dgram->path = p;
+        // Sending over TCP by choice: a UDP path coming and going does not
+        // change where ours go.
+        if (peer.dgram->over_tcp && (p == DatagramPath::Direct || p == DatagramPath::Relayed)) return;
     }
     if (cfg.verbose) {
         std::fprintf(stderr, "[uconnect] datagrams %s: %s\n",
@@ -2412,7 +2416,25 @@ DatagramPath Topic::datagram_path(const DevId& dev) const {
     std::lock_guard<LoopFirstMutex> lk(impl_->node->mu);
     auto                        it = impl_->peers.find(dev);
     if (it == impl_->peers.end() || !it->second.dgram) return DatagramPath::None;
-    return it->second.dgram->path;
+    const Dgram& d = *it->second.dgram;
+    if (d.over_tcp && (d.path == DatagramPath::Direct || d.path == DatagramPath::Relayed)) return DatagramPath::Tcp;
+    return d.path;
+}
+
+bool Topic::send_datagrams_over_tcp(const DevId& dev) {
+    auto&                       n = *impl_->node;
+    std::lock_guard<LoopFirstMutex> lk(n.mu);
+    auto it = impl_->peers.find(dev);
+    if (it == impl_->peers.end() || !it->second.dgram || !it->second.sess) return false;
+    Peer&  peer = it->second;
+    Dgram& d    = *peer.dgram;
+    if (d.path == DatagramPath::Failed || d.path == DatagramPath::None) return false;
+    if (d.over_tcp) return true;
+    d.over_tcp = true;
+    if (d.path != DatagramPath::Tcp && impl_->on_datagram_path) {
+        n.deferred.push_back([cb = impl_->on_datagram_path, dev] { cb(dev, DatagramPath::Tcp); });
+    }
+    return true;
 }
 
 bool Topic::send_datagram(const DevId& dev, std::span<const uint8_t> payload) {
@@ -2426,6 +2448,10 @@ bool Topic::send_datagram(const DevId& dev, std::span<const uint8_t> payload) {
     switch (d.path) {
         case DatagramPath::Direct:
         case DatagramPath::Relayed:
+            if (d.over_tcp) {
+                if (!n.send_record(peer, kDgramOverTcp, payload)) return false;
+                break;
+            }
             if (!d.sess || !d.sess->send(payload, n.now())) return false;
             n.flush_dgram(peer);  // straight out, not on the next loop tick
             break;

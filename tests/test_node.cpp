@@ -1442,6 +1442,28 @@ TEST(datagrams_punch_a_direct_udp_path_and_flow_both_ways) {
     CHECK(p.paths_b.back() == DatagramPath::Direct);
 }
 
+TEST(datagrams_can_be_sent_over_tcp_while_udp_works) {
+    LocalServer srv;
+    DgramPair   p{srv, config_for(srv), config_for(srv)};
+    REQUIRE(p.connect());
+    CHECK(!p.a->send_datagrams_over_tcp(p.idb()));  // no channel yet
+    REQUIRE(p.a->open_datagrams(p.idb(), DatagramFallback::Tcp));
+    REQUIRE(p.settled(DatagramPath::Direct));
+
+    // A's side moves to TCP; B keeps sending over UDP.
+    REQUIRE(p.a->send_datagrams_over_tcp(p.idb()));
+    CHECK(p.a->datagram_path(p.idb()) == DatagramPath::Tcp);
+    CHECK(p.b->datagram_path(p.ida()) == DatagramPath::Direct);
+    for (int i = 0; i < 20; ++i) {
+        CHECK(p.a->send_datagram(p.idb(), bytes("ping")));
+        CHECK(p.b->send_datagram(p.ida(), bytes("pong")));
+        std::this_thread::sleep_for(5ms);
+    }
+    // Over TCP every one arrives.
+    CHECK(wait_until([&] { return p.count_b() == 20 && p.count_a() >= 15; }, 3s));
+    CHECK(p.a->datagram_path(p.idb()) == DatagramPath::Tcp);
+}
+
 TEST(datagrams_negotiate_different_rekey_settings_before_traffic) {
     LocalServer srv;
     auto ca = dgram_config(srv, true, DatagramFallback::Relay);

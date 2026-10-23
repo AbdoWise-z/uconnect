@@ -342,6 +342,10 @@ UCONNECT_API uconnect_datagram_path uconnect_topic_datagram_path(const uconnect_
 // len must be 1..uconnect_max_datagram(); an empty payload returns false on every path.
 UCONNECT_API bool uconnect_topic_send_datagram(uconnect_node*, uconnect_topic_id,
                                                uconnect_dev_id, const uint8_t* data, size_t len);
+// Our datagrams to this peer go over the TCP connection from now on, even
+// though UDP works (see Topic::send_datagrams_over_tcp). False if no channel.
+UCONNECT_API bool uconnect_topic_send_datagrams_over_tcp(uconnect_node*, uconnect_topic_id,
+                                                         uconnect_dev_id);
 
 // --- callbacks -------------------------------------------------------------
 // Invoked on the node's loop thread; do not block. `data` is valid only for

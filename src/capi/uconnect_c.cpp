@@ -807,6 +807,11 @@ bool uconnect_topic_send_datagram(uconnect_node* n, uconnect_topic_id id, uconne
     });
 }
 
+bool uconnect_topic_send_datagrams_over_tcp(uconnect_node* n, uconnect_topic_id id,
+                                            uconnect_dev_id dev) {
+    return with_topic(n, id, false, [&](Topic& t) { return t.send_datagrams_over_tcp(to_cpp(dev)); });
+}
+
 // --- callbacks -------------------------------------------------------------
 void uconnect_topic_on_peer(uconnect_node* n, uconnect_topic_id id, uconnect_peer_fn fn,
                             void* user) {

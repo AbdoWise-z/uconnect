@@ -253,6 +253,14 @@ public:
     // fallback (retry after it drains); true means sent, not delivered.
     bool send_datagram(const DevId&, std::span<const uint8_t>);
 
+    // From now on, send this peer's datagrams over the TCP connection even
+    // though a UDP path works: for a path that loses too much (a mobile
+    // uplink policing UDP), where late beats lost. Our sending side only;
+    // the peer accepts them whatever its own path, and keeps its own. Lasts
+    // for this channel (a new open_datagrams() starts on UDP again);
+    // datagram_path() then reports Tcp. False if there is no open channel.
+    bool send_datagrams_over_tcp(const DevId&);
+
     static constexpr size_t max_datagram() { return 1100; }
 
     // --- events (invoked on the node's loop thread; do not block) ----------

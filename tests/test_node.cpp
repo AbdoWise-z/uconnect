@@ -1211,6 +1211,50 @@ TEST(a_peer_that_lost_its_session_is_reconnected_on_its_introduction) {
     }
 }
 
+TEST(a_peer_session_keeps_alive_at_the_configured_interval) {
+    // The node's keepalive interval applies to its sessions with peers, not
+    // only to its control connection: a phone behind a carrier NAT sets a
+    // short one so a quiet session is not forgotten by the NAT.
+    LocalServer srv;
+    auto        cfg = config_for(srv);
+    cfg.keepalive   = 1s;
+    Node nb{cfg};
+    nb.run_in_background();
+    Topic* pb = join_in_half(nb, /*low=*/false);
+    REQUIRE(pb != nullptr);
+    Topic&        b     = *pb;
+    const TopicId topic = b.id();
+    ScriptedPeer  r{srv, topic, *b.self(), /*want_smaller=*/true};
+    REQUIRE(r.ok());
+    REQUIRE(b.resolve(r.id).has_value());
+    b.connect(r.id);
+    RawConn* conn = r.first_dial();
+    REQUIRE(conn != nullptr);
+    std::vector<uint8_t> in;
+    REQUIRE(read_until(*conn, in, [](auto& v) { return session::TcpSession::peek_hello(v).has_value(); }));
+    auto s = session::TcpSession::initiate({}, topic, 0, nullptr, r.id, *b.self(),
+                                           *session::TcpSession::peek_hello(in),
+                                           std::chrono::steady_clock::now());
+    REQUIRE(handshake_over(*conn, s, [&] { return b.state(r.id) == PeerState::Connected; }));
+
+    // Say nothing. After the first moments (whatever the node says on its own
+    // after connecting), records keep arriving about once a second: the
+    // node's keepalives. At the 20 s default none would within this window.
+    auto pump = [&] {
+        if (auto got = conn->read_some(); got && !got->empty()) s.on_bytes(*got, std::chrono::steady_clock::now());
+    };
+    wait_until([&] { pump(); return false; }, 1500ms);
+    const auto quiet_from = s.last_received();
+    size_t heard = 0;
+    wait_until([&] {
+        const auto before = s.last_received();
+        pump();
+        if (s.last_received() != before && s.last_received() > quiet_from) ++heard;
+        return heard >= 2;
+    }, 3500ms);
+    CHECK(heard >= 2);
+}
+
 TEST(a_silent_inbound_connection_does_not_linger_forever) {
     LocalServer srv;
     Node        na{config_for(srv)};

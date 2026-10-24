@@ -539,7 +539,13 @@ struct Node::Impl {
     bool on_loop_thread() const { return loop_thread_id == std::this_thread::get_id(); }
     uint32_t alloc_txn() { return next_txn++; }
 
-    session::TcpSessionConfig session_cfg() const { return {}; }
+    // Peer sessions keep alive at the node's interval, like the control
+    // connection: the same NATs sit on both paths.
+    session::TcpSessionConfig session_cfg() const {
+        session::TcpSessionConfig c;
+        c.keepalive = cfg.keepalive;
+        return c;
+    }
 
     // Queue a control message; returns its txn.
     template <typename T>

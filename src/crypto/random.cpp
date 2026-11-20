@@ -18,7 +18,21 @@
 // not exist on macOS or the BSDs, while getentropy is present on all of them --
 // macOS 10.12+, glibc 2.25+, OpenBSD, FreeBSD. One path for every POSIX target
 // beats a second branch that only ever gets compiled on someone else's machine.
+//
+// The one exception is Apple's other platforms. The iOS, tvOS and watchOS SDKs
+// ship no <sys/random.h> and do not declare getentropy at all, so there the
+// bytes come from CCRandomGenerateBytes: part of libSystem (nothing extra to
+// link), with no per-call size cap. macOS stays on getentropy.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && !TARGET_OS_OSX
+#define UCONNECT_RANDOM_COMMONCRYPTO 1
+#include <CommonCrypto/CommonCryptoError.h>
+#include <CommonCrypto/CommonRandom.h>
+#else
 #include <sys/random.h>
+#endif
 #endif
 
 namespace uconnect::crypto {
@@ -34,6 +48,11 @@ void random_bytes(std::span<uint8_t> out) {
         // here would silently compromise every key the process generates, so a
         // hard failure is the only correct behaviour.
         throw std::runtime_error("BCryptGenRandom failed; refusing to produce weak keys");
+    }
+#elif defined(UCONNECT_RANDOM_COMMONCRYPTO)
+    if (CCRandomGenerateBytes(out.data(), out.size()) != kCCSuccess) {
+        // Same reasoning as the Windows branch.
+        throw std::runtime_error("CCRandomGenerateBytes failed; refusing to produce weak keys");
     }
 #else
     // getentropy is all-or-nothing but caps a single call at 256 bytes, so the

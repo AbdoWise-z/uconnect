@@ -681,9 +681,9 @@ slot, the ChaCha20 key, the BLAKE2s output — so a 512-bit input is compressed 
 256 bits regardless, and the security of a chain is bounded by its narrowest
 link. A longer key buys nothing but characters to copy.
 
-Randomness comes from `BCryptGenRandom` on Windows and `getentropy` elsewhere,
-never `std::random_device`. On MinGW — the toolchain CLion ships —
-`std::random_device` has historically been a deterministic Mersenne Twister that
+Randomness comes from `BCryptGenRandom` on Windows, `CCRandomGenerateBytes` on
+iOS and `getentropy` elsewhere, never `std::random_device`. On MinGW — the
+toolchain CLion ships — `std::random_device` has historically been a deterministic Mersenne Twister that
 returns the same sequence on every run, with no error and no warning. A CSPRNG
 failure throws rather than returning weak bytes: there is no safe way to
 continue, and a silent fallback would compromise every key the process
@@ -777,7 +777,10 @@ Clang and GCC both work; macOS needs the Xcode command line tools
 Platform requirements are narrow by design. Randomness comes from `getentropy`,
 which needs **macOS 10.12+** or **glibc 2.25+** — chosen over Linux's
 `getrandom` precisely so there is one POSIX path rather than a second branch
-that only ever compiles on someone else's machine. Sockets are plain BSD sockets
+that only ever compiles on someone else's machine. iOS is the exception: its SDK
+does not declare `getentropy`, so there the bytes come from
+`CCRandomGenerateBytes`, and the build needs a deployment target of iOS 15 or
+later for the C++ standard library. Sockets are plain BSD sockets
 waited on with `poll` (`WSAPoll` on Windows, where `select` stops at 64
 sockets), not `epoll` or `kqueue`, so the same code serves every platform.
 Apple Silicon needs nothing special: the vendored X25519 and Poly1305 are

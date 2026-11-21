@@ -1176,13 +1176,13 @@ and relayed UDP at 37–53 MiB/s, with up to 82% lost under load.
 
 | Rendezvous | Dashboard | Notes |
 |---|---|---|
-| `129.152.22.201:4433` (TCP + UDP) | http://129.152.22.201:8080 | Oracle Cloud, Ubuntu. Redeployed from `master` on every commit. |
+| `80.225.91.88:4433` (TCP + UDP) | http://80.225.91.88:8080 | Oracle Cloud, Ubuntu. Redeployed from `master` on every commit. |
 
 Try it without running anything yourself:
 
 ```sh
-./build/examples/uconn-demo --server 129.152.22.201:4433 --stats
-./build/examples/uconn-demo --server 129.152.22.201:4433 --create
+./build/examples/uconn-demo --server 80.225.91.88:4433 --stats
+./build/examples/uconn-demo --server 80.225.91.88:4433 --create
 ```
 
 It is a **best-effort public instance**, not a service: it holds no state worth

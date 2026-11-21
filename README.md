@@ -786,6 +786,51 @@ sockets), not `epoll` or `kqueue`, so the same code serves every platform.
 Apple Silicon needs nothing special: the vendored X25519 and Poly1305 are
 portable C with no intrinsics and no endianness assumptions.
 
+## Inside an application
+
+An application pulls the library in with `FetchContent` or `add_subdirectory`
+and links `uconnect` (C++) or ships `uconnect_c` (the C API, a shared library).
+These options trim the build to what it needs:
+
+| Option | Default | What it builds |
+|---|---|---|
+| `UCONNECT_BUILD_TESTS` | on | the test suite |
+| `UCONNECT_BUILD_SERVER` | on | `uconnect-rendezvous` |
+| `UCONNECT_BUILD_EXAMPLES` | on; off for iOS and Android | `uconn-demo`, `uconn-chat`, `uconn-transfer` |
+| `UCONNECT_BUILD_TOOLS` | on; off for iOS and Android | `uconn-observe`, `uconn-bench` |
+| `UCONNECT_CAPI_FRAMEWORK` | off; on for iOS | `uconnect_c` as `uconnect_c.framework` |
+
+`cmake --install build` lays out `uconnect_c` and `uconnect_c.h`, which is all
+an FFI caller needs.
+
+**iOS.** An app may carry its own dynamic code only as a framework, so there
+`uconnect_c` is one, with the header inside it.
+`sh scripts/build-xcframework.sh` builds it for devices and for the simulator
+and folds both into `build-ios/uconnect_c.xcframework`; add that to the app
+target with *Embed & Sign*.
+
+## IPv6-only networks
+
+Many mobile carriers give a phone an IPv6 address and nothing else, and reach
+the IPv4 internet through a NAT64 gateway. From such a network an IPv4 address
+has no route: neither the server's, nor the ones in a peer's candidate list.
+
+The io layer handles that below everything else. When `resolve()` finds no
+IPv4 route, it asks the network for its NAT64 prefix (the lookup of
+`ipv4only.arpa`, RFC 7050) and from then on its sockets send a packet for a
+public IPv4 address to the gateway's address for it, and report a packet from
+the gateway as coming from the IPv4 address it stands for. The layers above
+keep naming every host by the address the server and its peers know it by, so
+candidates, sessions and same-NAT detection are untouched. A server with an
+IPv6 address of its own is reached at it directly, and so is a peer.
+
+What that covers: a node on an IPv6-only network with NAT64 reaching an
+IPv4-only server and IPv4-only peers, by name or by literal address. Not
+covered: prefixes shorter than /96, a network that changes while a node runs
+(the prefix is learned when the node starts), and an IPv6-only network with no
+gateway, from which an IPv4-only server cannot be reached by anything. Android
+needs none of this: it gives apps an IPv4 route of its own on such networks.
+
 ## Running the built binaries
 
 They need no environment at all — run them from any shell, or double-click them.

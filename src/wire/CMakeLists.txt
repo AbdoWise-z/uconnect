@@ -6,6 +6,6 @@ add_library(uconnect_wire STATIC
     types.cpp
 )
 target_include_directories(uconnect_wire
-    PUBLIC  ${CMAKE_SOURCE_DIR}/include
+    PUBLIC  ${PROJECT_SOURCE_DIR}/include
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
 )

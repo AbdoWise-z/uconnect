@@ -262,6 +262,119 @@ TEST(link_local_addresses_are_recognised_in_both_families) {
     CHECK(IpAddr::v4(169, 254, 3, 4).is_private());
 }
 
+// --- IPv6-only networks (NAT64) ---------------------------------------------
+
+namespace {
+
+IpAddr v6(std::array<uint8_t, 16> bytes) {
+    IpAddr ip;
+    ip.family = IpAddr::Family::V6;
+    ip.bytes  = bytes;
+    return ip;
+}
+
+// 64:ff9b::/96, the well-known prefix, and one a network might choose.
+const Nat64Prefix kWellKnown{{0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0}};
+const Nat64Prefix kNetworkOwn{{0x20, 0x01, 0x0D, 0xB8, 0, 0x64, 0, 0, 0, 0, 0, 0}};
+
+// Leaves the process with no prefix set whatever a test did.
+struct PrefixGuard {
+    explicit PrefixGuard(std::optional<Nat64Prefix> p) { set_nat64_prefix(p); }
+    ~PrefixGuard() { set_nat64_prefix(std::nullopt); }
+};
+
+}  // namespace
+
+TEST(nat64_prefix_is_read_from_the_networks_answer_for_ipv4only_arpa) {
+    // 64:ff9b::192.0.0.170 and a network's own prefix with 192.0.0.171.
+    auto a = nat64_prefix_from(v6({0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 170}));
+    REQUIRE(a.has_value());
+    CHECK(*a == kWellKnown);
+    auto b = nat64_prefix_from(
+        v6({0x20, 0x01, 0x0D, 0xB8, 0, 0x64, 0, 0, 0, 0, 0, 0, 192, 0, 0, 171}));
+    REQUIRE(b.has_value());
+    CHECK(*b == kNetworkOwn);
+
+    // Anything else is not an answer to that question: an ordinary address, a
+    // prefix shorter than /96 (the IPv4 address is then not at the end), IPv4.
+    CHECK(!nat64_prefix_from(v6({0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})));
+    CHECK(!nat64_prefix_from(
+        v6({0x20, 0x01, 0x0D, 0xB8, 192, 0, 0, 170, 0, 0, 0, 0, 0, 0, 0, 0})));
+    CHECK(!nat64_prefix_from(IpAddr::v4(192, 0, 0, 170)));
+}
+
+TEST(nat64_translates_public_ipv4_addresses_on_the_way_out_and_back) {
+    // With no prefix, nothing is touched.
+    CHECK(nat64_outbound(IpAddr::v4(8, 8, 8, 8)) == IpAddr::v4(8, 8, 8, 8));
+
+    PrefixGuard guard(kWellKnown);
+    REQUIRE(nat64_prefix().has_value());
+    const auto translated = v6({0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8});
+    CHECK(nat64_outbound(IpAddr::v4(8, 8, 8, 8)) == translated);
+    CHECK(nat64_inbound(translated) == IpAddr::v4(8, 8, 8, 8));
+
+    // No gateway routes these, and this host may reach them itself.
+    CHECK(nat64_outbound(IpAddr::v4(127, 0, 0, 1)) == IpAddr::v4(127, 0, 0, 1));
+    CHECK(nat64_outbound(IpAddr::v4(192, 168, 1, 20)) == IpAddr::v4(192, 168, 1, 20));
+    CHECK(nat64_outbound(IpAddr::v4(10, 0, 0, 7)) == IpAddr::v4(10, 0, 0, 7));
+    CHECK(nat64_outbound(IpAddr::v4(169, 254, 1, 1)) == IpAddr::v4(169, 254, 1, 1));
+
+    // A real IPv6 address is one in both directions.
+    const auto real = v6({0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5});
+    CHECK(nat64_outbound(real) == real);
+    CHECK(nat64_inbound(real) == real);
+}
+
+TEST(nat64_a_set_prefix_leaves_loopback_traffic_alone) {
+    // The sockets consult the prefix for every packet; a node's own loopback
+    // and LAN traffic has to keep working with one set.
+    PrefixGuard guard(kWellKnown);
+    UdpSocket a, b;
+    REQUIRE(a.open(0));
+    REQUIRE(b.open(0));
+    const uint8_t hello[] = {'h', 'i'};
+    REQUIRE(a.send_to(loopback(b.local_port()), hello));
+    REQUIRE(b.wait_readable(2s));
+    std::array<uint8_t, 16> buf{};
+    auto got = b.recv_from(buf);
+    REQUIRE(got.has_value());
+    CHECK(got->len == 2u);
+    CHECK(got->from == loopback(a.local_port()));
+}
+
+TEST(resolving_picks_the_address_this_network_can_reach) {
+    const Endpoint four{IpAddr::v4(80, 225, 91, 88), 4433};
+    const Endpoint six{v6({0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9}), 4433};
+    const Endpoint dns64{v6({0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0, 80, 225, 91, 88}), 4433};
+
+    // An ordinary network: IPv4 when there is any, as before.
+    CHECK(choose_endpoint(std::vector{six, four}, true, std::nullopt) == four);
+    CHECK(choose_endpoint(std::vector{four}, true, std::nullopt) == four);
+    CHECK(choose_endpoint(std::vector{six}, true, std::nullopt) == six);
+
+    // IPv6-only behind a NAT64. A name: DNS64 hands back the gateway's address
+    // for it, which is named by the IPv4 address it stands for. A literal
+    // IPv4 address: kept, the sockets translate it.
+    CHECK(choose_endpoint(std::vector{dns64}, false, kWellKnown) == four);
+    CHECK(choose_endpoint(std::vector{four, dns64}, false, kWellKnown) == four);
+    CHECK(choose_endpoint(std::vector{four}, false, kWellKnown) == four);
+    // A server with an IPv6 address of its own is reached at it.
+    CHECK(choose_endpoint(std::vector{four, six}, false, kWellKnown) == six);
+
+    // IPv6-only with no gateway: IPv6 if the server has it, and otherwise the
+    // unreachable IPv4 address, for the caller to fail on.
+    CHECK(choose_endpoint(std::vector{four, six}, false, std::nullopt) == six);
+    CHECK(choose_endpoint(std::vector{four}, false, std::nullopt) == four);
+    CHECK(!choose_endpoint(std::vector<Endpoint>{}, true, std::nullopt).has_value());
+}
+
+TEST(resolving_a_loopback_address_sets_no_nat64_prefix) {
+    auto ep = resolve("127.0.0.1:4433");
+    REQUIRE(ep.has_value());
+    CHECK(*ep == loopback(4433));
+    CHECK(!nat64_prefix().has_value());
+}
+
 TEST(host_candidates_never_include_loopback_or_link_local) {
     // A link-local address cannot be dialed without a scope id a candidate
     // does not carry. Advertising one also got every registration reset on a

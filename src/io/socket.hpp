@@ -20,7 +20,57 @@ using NativeSocket = long long;
 inline constexpr NativeSocket kInvalidSocket = -1;
 
 // Resolve "host:port" to an endpoint. Returns nullopt on failure.
+//
+// It also learns how this network reaches IPv4, because the answer decides
+// which address is usable. With an IPv4 route, an IPv4 answer is preferred, as
+// before. Without one -- an IPv6-only network, as many mobile carriers run --
+// it looks for the network's NAT64 prefix (below) and, having found it, keeps
+// naming IPv4 hosts by their IPv4 address: the sockets translate on the way
+// out and back. An answer that is itself such a translated address (DNS64
+// makes them) comes back as the IPv4 address it stands for.
 std::optional<Endpoint> resolve(const std::string& host_port);
+
+// --- IPv6-only networks ------------------------------------------------------
+// On an IPv6-only network there is no route to an IPv4 address, but the
+// network usually runs a NAT64 gateway: a packet to <prefix>::<ipv4> comes out
+// of it as IPv4 to that address. Everything above this layer keeps speaking
+// of the IPv4 address -- it is what the server, and every peer, knows the host
+// by -- and the sockets here swap it for the translated one as a packet
+// leaves, and back as one arrives. So a candidate list full of IPv4 addresses
+// stays usable from such a network, and a session from the gateway matches the
+// IPv4 endpoint it was opened to.
+//
+// Only /96 prefixes are handled (RFC 6052 allows shorter ones; networks do
+// not use them), the well-known 64:ff9b::/96 among them.
+struct Nat64Prefix {
+    std::array<uint8_t, 12> bytes{};
+    friend bool operator==(const Nat64Prefix&, const Nat64Prefix&) = default;
+};
+
+// The prefix in use, if this network is IPv6-only behind a NAT64. Set by
+// resolve(); an embedder that knows better, or a test, sets it directly.
+std::optional<Nat64Prefix> nat64_prefix();
+void                       set_nat64_prefix(std::optional<Nat64Prefix>);
+
+// The prefix a network announces through the name ipv4only.arpa (RFC 7050):
+// its IPv6 answer is one of that name's two fixed IPv4 addresses, translated.
+// nullopt for an address that is not one of them at the end.
+std::optional<Nat64Prefix> nat64_prefix_from(const IpAddr& ipv4only_arpa_answer);
+
+// The address a dual-stack socket really sends to for `to`, and the address a
+// packet from `from` is reported as coming from. Identity unless a prefix is
+// set; loopback, link-local and private IPv4 addresses are never translated,
+// since no gateway routes them.
+IpAddr nat64_outbound(const IpAddr& to);
+IpAddr nat64_inbound(const IpAddr& from);
+
+// What resolve() makes of a name's answers once it knows the network; split
+// out so the choice can be tested without one.
+//   answers     every address the name resolved to, in the resolver's order
+//   v4_route    whether this host can route to IPv4 at all
+//   prefix      the NAT64 prefix found, when there is no IPv4 route
+std::optional<Endpoint> choose_endpoint(std::span<const Endpoint> answers, bool v4_route,
+                                        const std::optional<Nat64Prefix>& prefix);
 
 std::string to_string(const Endpoint&);
 std::string to_string(const IpAddr&);

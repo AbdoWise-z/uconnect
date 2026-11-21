@@ -1,6 +1,7 @@
 #include "socket.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstring>
 #include <thread>
@@ -43,6 +44,14 @@ using socklen_type = socklen_t;
 namespace uconnect::io {
 namespace {
 
+// The NAT64 prefix in use, or null. Read for every packet, changed perhaps
+// once in a process's life: a pointer swapped atomically, to a value that is
+// never freed, keeps the readers free of a lock.
+std::atomic<const Nat64Prefix*> g_nat64{nullptr};
+
+// The two addresses ipv4only.arpa always has (RFC 7050).
+constexpr uint8_t kIpv4OnlyArpa[2][4] = {{192, 0, 0, 170}, {192, 0, 0, 171}};
+
 // Convert a sockaddr to our Endpoint. IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
 // are unwrapped to plain v4, so a dual-stack socket does not report every v4
 // peer as a v6 one -- which would break same-NAT detection and candidate
@@ -66,6 +75,8 @@ std::optional<Endpoint> from_sockaddr(const sockaddr_storage& ss) {
         } else {
             ep.ip.family = IpAddr::Family::V6;
             std::memcpy(ep.ip.bytes.data(), b, 16);
+            // From the NAT64 gateway: the IPv4 host it speaks for.
+            ep.ip = nat64_inbound(ep.ip);
         }
         ep.port = ntohs(a->sin6_port);
         return ep;
@@ -74,9 +85,12 @@ std::optional<Endpoint> from_sockaddr(const sockaddr_storage& ss) {
 }
 
 // Build a sockaddr for sending. When the socket is dual-stack v6, a v4 target
-// must be encoded as an IPv4-mapped v6 address.
-socklen_type to_sockaddr(const Endpoint& ep, bool socket_is_v6, sockaddr_storage& out) {
+// must be encoded as an IPv4-mapped v6 address -- or, on an IPv6-only network,
+// as the address its NAT64 gateway answers for it.
+socklen_type to_sockaddr(const Endpoint& target, bool socket_is_v6, sockaddr_storage& out) {
     std::memset(&out, 0, sizeof(out));
+    Endpoint ep = target;
+    if (socket_is_v6) ep.ip = nat64_outbound(ep.ip);
     if (ep.ip.family == IpAddr::Family::V4 && !socket_is_v6) {
         auto* a = reinterpret_cast<sockaddr_in*>(&out);
         a->sin_family = AF_INET;
@@ -99,7 +113,129 @@ socklen_type to_sockaddr(const Endpoint& ep, bool socket_is_v6, sockaddr_storage
     return sizeof(sockaddr_in6);
 }
 
+// Whether this host has a route to an IPv4 address. Connecting a UDP socket
+// sends nothing: it only asks the routing table, which on an IPv6-only network
+// has no answer.
+bool has_v4_route(const Endpoint& to) {
+    auto s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == UC_INVALID) return false;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(to.port ? to.port : uint16_t{9});
+    std::memcpy(&a.sin_addr, to.ip.bytes.data(), 4);
+    const bool ok = ::connect(s, reinterpret_cast<const sockaddr*>(&a), sizeof(a)) == 0;
+    UC_CLOSE(s);
+    return ok;
+}
+
+// Every address `host` resolves to, as endpoints on `port`.
+std::vector<Endpoint> lookup(const std::string& host, const std::string& port, int family) {
+    addrinfo hints{};
+    hints.ai_family   = family;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    std::vector<Endpoint> out;
+    addrinfo*             res = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) return out;
+    for (auto* p = res; p; p = p->ai_next) {
+        sockaddr_storage ss{};
+        std::memcpy(&ss, p->ai_addr,
+                    std::min(static_cast<size_t>(p->ai_addrlen), sizeof(ss)));
+        if (auto ep = from_sockaddr(ss)) out.push_back(*ep);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+// Ask the network for its NAT64 prefix (RFC 7050). Only worth a DNS query --
+// which can take seconds to fail -- when this host has an IPv6 address to
+// reach a gateway from at all.
+std::optional<Nat64Prefix> discover_nat64() {
+    bool has_v6 = false;
+    for (const auto& ip : local_addresses()) {
+        if (ip.family == IpAddr::Family::V6) has_v6 = true;
+    }
+    if (!has_v6) return std::nullopt;
+    // from_sockaddr would hand a translated answer back as IPv4 if a prefix
+    // were already set, so the answers are read with none.
+    const auto* held    = g_nat64.exchange(nullptr);
+    const auto  answers = lookup("ipv4only.arpa", "0", AF_INET6);
+    g_nat64.store(held);
+    for (const auto& ep : answers) {
+        if (auto prefix = nat64_prefix_from(ep.ip)) return prefix;
+    }
+    return std::nullopt;
+}
+
 }  // namespace
+
+std::optional<Nat64Prefix> nat64_prefix() {
+    const auto* p = g_nat64.load();
+    return p ? std::optional<Nat64Prefix>(*p) : std::nullopt;
+}
+
+void set_nat64_prefix(std::optional<Nat64Prefix> prefix) {
+    if (prefix == nat64_prefix()) return;
+    // The old value is left allocated on purpose: a reader may still hold it.
+    g_nat64.store(prefix ? new Nat64Prefix(*prefix) : nullptr);
+}
+
+std::optional<Nat64Prefix> nat64_prefix_from(const IpAddr& answer) {
+    if (answer.family != IpAddr::Family::V6) return std::nullopt;
+    for (const auto& known : kIpv4OnlyArpa) {
+        if (std::memcmp(answer.bytes.data() + 12, known, 4) != 0) continue;
+        Nat64Prefix prefix;
+        std::memcpy(prefix.bytes.data(), answer.bytes.data(), 12);
+        return prefix;
+    }
+    return std::nullopt;
+}
+
+IpAddr nat64_outbound(const IpAddr& to) {
+    const auto* prefix = g_nat64.load();
+    if (!prefix || to.family != IpAddr::Family::V4) return to;
+    if (to.is_loopback() || to.is_private()) return to;
+    IpAddr out;
+    out.family = IpAddr::Family::V6;
+    std::memcpy(out.bytes.data(), prefix->bytes.data(), 12);
+    std::memcpy(out.bytes.data() + 12, to.bytes.data(), 4);
+    return out;
+}
+
+IpAddr nat64_inbound(const IpAddr& from) {
+    const auto* prefix = g_nat64.load();
+    if (!prefix || from.family != IpAddr::Family::V6) return from;
+    if (std::memcmp(from.bytes.data(), prefix->bytes.data(), 12) != 0) return from;
+    return IpAddr::v4(from.bytes[12], from.bytes[13], from.bytes[14], from.bytes[15]);
+}
+
+std::optional<Endpoint> choose_endpoint(std::span<const Endpoint> answers, bool v4_route,
+                                        const std::optional<Nat64Prefix>& prefix) {
+    std::optional<Endpoint> v4, v6;
+    for (const auto& ep : answers) {
+        if (ep.ip.family == IpAddr::Family::V4 && !v4) v4 = ep;
+        if (ep.ip.family == IpAddr::Family::V6 && !v6) v6 = ep;
+    }
+    // Prefer IPv4 when both are offered and it can be reached: the rendezvous
+    // protocol works either way, but a v4 srflx is comparable with the v4
+    // candidates most peers have.
+    if (v4 && v4_route) return v4;
+    if (v6) {
+        // DNS64 answers a v4-only name with the gateway's address for it. Name
+        // the host by the IPv4 address instead: that is what its packets will
+        // be reported as coming from.
+        if (prefix && std::memcmp(v6->ip.bytes.data(), prefix->bytes.data(), 12) == 0) {
+            return Endpoint{IpAddr::v4(v6->ip.bytes[12], v6->ip.bytes[13], v6->ip.bytes[14],
+                                       v6->ip.bytes[15]),
+                            v6->port};
+        }
+        return v6;
+    }
+    // IPv4 only. Without a route it is reachable through the gateway if there
+    // is one, and not at all otherwise -- which the caller finds out as it
+    // would have before.
+    return v4;
+}
 
 bool init_networking() {
 #if defined(_WIN32)
@@ -148,26 +284,28 @@ std::optional<Endpoint> resolve(const std::string& host_port) {
         port = host_port.substr(colon + 1);
     }
 
-    addrinfo hints{};
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
+    // Read with no prefix set, so a translated answer is seen as it is.
+    const auto* held    = g_nat64.exchange(nullptr);
+    const auto  answers = lookup(host, port, AF_UNSPEC);
+    g_nat64.store(held);
+    if (answers.empty()) return std::nullopt;
 
-    addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) return std::nullopt;
-
-    // Prefer IPv4 when both are offered: the rendezvous protocol works either
-    // way, but a v4 srflx is comparable with the v4 candidates most peers have.
-    std::optional<Endpoint> v4, v6;
-    for (auto* p = res; p; p = p->ai_next) {
-        sockaddr_storage ss{};
-        std::memcpy(&ss, p->ai_addr, static_cast<size_t>(p->ai_addrlen));
-        auto ep = from_sockaddr(ss);
-        if (!ep) continue;
-        if (ep->ip.family == IpAddr::Family::V4 && !v4) v4 = ep;
-        if (ep->ip.family == IpAddr::Family::V6 && !v6) v6 = ep;
+    // Is IPv4 reachable from here? Asked of the answer itself when it has an
+    // IPv4 address (a loopback or LAN server is reachable with no default
+    // route), and otherwise of an address that stands for the internet.
+    Endpoint probe{IpAddr::v4(192, 0, 2, 1), 9};
+    for (const auto& ep : answers) {
+        if (ep.ip.family == IpAddr::Family::V4) {
+            probe = ep;
+            break;
+        }
     }
-    freeaddrinfo(res);
-    return v4 ? v4 : v6;
+    const bool v4_route = has_v4_route(probe);
+    // The network may have changed since the last call, so the prefix is
+    // learned afresh each time, and dropped when IPv4 is back.
+    const auto prefix = v4_route ? std::nullopt : discover_nat64();
+    set_nat64_prefix(prefix);
+    return choose_endpoint(answers, v4_route, prefix);
 }
 
 std::vector<IpAddr> local_addresses() {

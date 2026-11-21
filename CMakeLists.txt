@@ -8,6 +8,18 @@ set(CMAKE_C_STANDARD 11)
 
 option(UCONNECT_BUILD_TESTS  "Build the test suite"   ON)
 option(UCONNECT_BUILD_SERVER "Build the rendezvous server" ON)
+
+# The example programs and the tools are command-line executables. A phone has
+# no use for them, and an iOS build cannot even configure a plain executable
+# without a bundle identifier and signing settings, so they are off there by
+# default; an application embedding the library can switch them off anywhere.
+if (CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|watchOS|visionOS|Android)$")
+    set(_uconnect_programs OFF)
+else()
+    set(_uconnect_programs ON)
+endif()
+option(UCONNECT_BUILD_EXAMPLES "Build the example programs (uconn-demo, uconn-chat, uconn-transfer)" ${_uconnect_programs})
+option(UCONNECT_BUILD_TOOLS    "Build the tools (uconn-observe, uconn-bench)" ${_uconnect_programs})
 option(UCONNECT_STATIC_SERVER "Statically link the rendezvous executable (Linux)" OFF)
 
 # std::thread needs an explicit link on most Unix toolchains. It happens to work
@@ -84,8 +96,12 @@ add_subdirectory(src/session)
 add_subdirectory(src/io)
 add_subdirectory(src/api)
 add_subdirectory(src/capi)
-add_subdirectory(examples)
-add_subdirectory(tools)
+if (UCONNECT_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+if (UCONNECT_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
 
 # The tests need the server's libraries even when its executable is off: the
 # Node tests run a real Rendezvous in-process. UCONNECT_BUILD_SERVER gates the

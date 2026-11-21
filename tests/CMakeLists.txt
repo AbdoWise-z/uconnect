@@ -18,12 +18,12 @@ add_executable(uconnect_tests
     test_server_config.cpp
     # The server's STUN client is compiled straight in: it lives in the server
     # executable, not a library, and only its pure classification is tested.
-    ${CMAKE_SOURCE_DIR}/server/stun.cpp
+    ${PROJECT_SOURCE_DIR}/server/stun.cpp
 )
 target_link_libraries(uconnect_tests PRIVATE uconnect_wire uconnect_crypto uconnect_store uconnect_path uconnect_session uconnect uconnect_rendezvous uconnect_c)
 target_include_directories(uconnect_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # For checked-in files a test reads, such as the server's example config.
-target_compile_definitions(uconnect_tests PRIVATE UCONNECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_definitions(uconnect_tests PRIVATE UCONNECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 uconnect_bundle_runtime(uconnect_tests)
 
 # Windows finds a DLL beside the executable, not where it was built.
@@ -59,7 +59,7 @@ add_test(NAME uconn_observe_reports_unreachable_server
 if (UCONNECT_BUILD_SERVER)
     add_test(NAME uconnect_server_config
              COMMAND ${CMAKE_COMMAND} -DSERVER=$<TARGET_FILE:uconnect-rendezvous>
-                     -DEXAMPLE=${CMAKE_SOURCE_DIR}/server/rendezvous.example.yaml
+                     -DEXAMPLE=${PROJECT_SOURCE_DIR}/server/rendezvous.example.yaml
                      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/server_config
                      -P ${CMAKE_CURRENT_SOURCE_DIR}/server_config.cmake)
 endif()
@@ -71,7 +71,7 @@ endif()
 if (TARGET uconn-bench)
     add_test(NAME uconnect_bench_smoke
              COMMAND uconn-bench --nodes 2 --seconds 1 --warmup 0.3 --ladder-seconds 0.5
-                     --server-config ${CMAKE_SOURCE_DIR}/tools/uconn-bench.server.yaml)
+                     --server-config ${PROJECT_SOURCE_DIR}/tools/uconn-bench.server.yaml)
     set_tests_properties(uconnect_bench_smoke PROPERTIES TIMEOUT 240 LABELS "bench;slow")
 endif()
 
@@ -123,7 +123,7 @@ endif()
 # logic deterministically in milliseconds.
 if (_e2e)
     add_test(NAME uconnect_smoke
-             COMMAND ${UCONNECT_BASH} ${CMAKE_SOURCE_DIR}/scripts/smoke.sh)
+             COMMAND ${UCONNECT_BASH} ${PROJECT_SOURCE_DIR}/scripts/smoke.sh)
     set_tests_properties(uconnect_smoke PROPERTIES TIMEOUT 90 LABELS "e2e"
                          ENVIRONMENT "${_e2e_env}")
 endif()
@@ -147,12 +147,12 @@ endif()
 
 if (Python3_Interpreter_FOUND)
     add_test(NAME uconnect_web_observer
-             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/web/test_observer.py)
+             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/web/test_observer.py)
     execute_process(COMMAND ${Python3_EXECUTABLE} -c "import flask"
                     RESULT_VARIABLE _flask_available OUTPUT_QUIET ERROR_QUIET)
     if (_flask_available EQUAL 0)
         add_test(NAME uconnect_web_health
-                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/web/test_health.py)
+                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/web/test_health.py)
     endif()
     if (UNIX AND UCONNECT_BASH)
         add_test(NAME uconnect_deploy_web_venv
@@ -166,7 +166,7 @@ endif()
 # ctest -LE slow skips this one.
 if (_e2e)
     add_test(NAME uconnect_transfer_smoke
-             COMMAND ${UCONNECT_BASH} ${CMAKE_SOURCE_DIR}/scripts/transfer-smoke.sh)
+             COMMAND ${UCONNECT_BASH} ${PROJECT_SOURCE_DIR}/scripts/transfer-smoke.sh)
     set_tests_properties(uconnect_transfer_smoke PROPERTIES TIMEOUT 200 LABELS "e2e;slow"
                          ENVIRONMENT "${_e2e_env}")
 endif()
